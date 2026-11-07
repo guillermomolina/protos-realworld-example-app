@@ -1,0 +1,165 @@
+//! RealWorld identity metadata and public-profile integration regression.
+//!
+//! No secret/password, credential verifier, token or authentication is used.
+//! All writes below use fixture-only interfaces; none go through HTTP.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Identities: import("../app/IdentityStore.protos")
+Store: import("../app/MemoryStore.protos")
+Api: import("../app/Api.protos")
+
+identities: Identities.create()
+Assertions.require(identities.findId(1) === null)
+Assertions.require(identities.findUsername("alice") === null)
+Assertions.require(identities.findEmail("alice@example.test") === null)
+Assertions.require(identities.profileFor("alice") === null)
+
+alice: identities.addFixture("alice", "alice@example.test", "", "")
+Assertions.require(alice.ok)
+Assertions.require(alice.field === null)
+Assertions.require(alice.value.id == 1)
+Assertions.require(alice.value.username == "alice")
+Assertions.require(alice.value.bio === null)
+Assertions.require(alice.value.image === null)
+
+// Lookups and successful results must not leak mutable store aliases.
+alice.value.username = "tampered"
+alice.value.email = "tampered@example.test"
+Assertions.require(identities.findId(1).username == "alice")
+Assertions.require(identities.findEmail("alice@example.test").id == 1)
+accountCopy: identities.findUsername("alice")
+accountCopy.bio = "not retained"
+Assertions.require(identities.findUsername("alice").bio === null)
+profileCopy: identities.profileFor("alice")
+profileCopy.image = "not retained"
+Assertions.require(identities.profileFor("alice").image === null)
+
+// Duplicate rejection is field-specific and does not consume an ID.
+usernameTaken: identities.addFixture("alice", "different@example.test", null, null)
+Assertions.require(!usernameTaken.ok)
+Assertions.require(usernameTaken.field == "username")
+Assertions.require(usernameTaken.message == "has already been taken")
+Assertions.require(usernameTaken.value === null)
+emailTaken: identities.addFixture("other", "alice@example.test", null, null)
+Assertions.require(!emailTaken.ok)
+Assertions.require(emailTaken.field == "email")
+Assertions.require(emailTaken.message == "has already been taken")
+Assertions.require(identities.findUsername("other") === null)
+
+blankUsername: identities.addFixture("", "new@example.test", null, null)
+Assertions.require(!blankUsername.ok)
+Assertions.require(blankUsername.field == "username")
+blankEmail: identities.addFixture("someone", "", null, null)
+Assertions.require(!blankEmail.ok)
+Assertions.require(blankEmail.field == "email")
+
+bob: identities.addFixture("bob", "bob@example.test", "Bob", null)
+Assertions.require(bob.ok)
+Assertions.require(bob.value.id == 2)
+Assertions.require(identities.findId(1).username == "alice")
+
+// A failed update must not alter any field, or the other identity.
+collisionName: identities.updateFixture(
+    1, "bob", "new-alice@example.test", "bad change", null
+)
+Assertions.require(!collisionName.ok)
+Assertions.require(collisionName.field == "username")
+Assertions.require(identities.findId(1).username == "alice")
+Assertions.require(identities.findId(1).email == "alice@example.test")
+
+collisionEmail: identities.updateFixture(
+    1, "alice-new", "bob@example.test", "bad change", null
+)
+Assertions.require(!collisionEmail.ok)
+Assertions.require(collisionEmail.field == "email")
+Assertions.require(identities.findUsername("alice-new") === null)
+Assertions.require(identities.findId(2).email == "bob@example.test")
+
+unknownUpdate: identities.updateFixture(
+    99, "unknown", "unknown@example.test", null, null
+)
+Assertions.require(!unknownUpdate.ok)
+Assertions.require(unknownUpdate.field == "user")
+Assertions.require(unknownUpdate.message == "not found")
+
+// A successful replacement preserves the stable ID and refreshes both keys.
+renamed: identities.updateFixture(
+    1, "alice-new", "alice-new@example.test", "Updated bio", "https://example.test/a.png"
+)
+Assertions.require(renamed.ok)
+Assertions.require(renamed.value.id == 1)
+Assertions.require(identities.findUsername("alice") === null)
+Assertions.require(identities.findEmail("alice@example.test") === null)
+Assertions.require(identities.findUsername("alice-new").id == 1)
+Assertions.require(identities.findEmail("alice-new@example.test").id == 1)
+Assertions.require(identities.profileFor("alice-new").bio == "Updated bio")
+Assertions.require(identities.findId(2).username == "bob")
+
+// Identity instances are isolated, including ID allocation.
+isolated: Identities.create()
+Assertions.require(isolated.findUsername("alice-new") === null)
+firstIsolated: isolated.addFixture("alice", "alice@example.test", null, null)
+Assertions.require(firstIsolated.ok)
+Assertions.require(firstIsolated.value.id == 1)
+Assertions.require(identities.findUsername("alice") === null)
+
+// The RealWorld HTTP profile view includes no email, password, token or ID.
+appStore: Store.create()
+fixture: appStore.addIdentityFixture("dana", "dana@example.test", "", "")
+Assertions.require(fixture.ok)
+Assertions.require(fixture.value.id == 1)
+Assertions.require(appStore.identityByEmail("dana@example.test").id == 1)
+Assertions.require(appStore.identityById(1).username == "dana")
+
+handler: Api.make(appStore)
+getProfile: (username) => {
+    handler({
+        method: "GET"
+        target: Encoding.Latin1.encode("/api/profiles/" + username)
+    })
+}
+
+profileResponse: getProfile("dana")
+Assertions.require(profileResponse.status == 200)
+profile: JSON.parse(Encoding.UTF8.decode(profileResponse.body)).value["profile"].value
+Assertions.require(profile["username"].value == "dana")
+Assertions.require(profile["bio"].kind == "null")
+Assertions.require(profile["image"].kind == "null")
+Assertions.require(profile["following"].value == false)
+Assertions.require(!profile.containsKey("email"))
+Assertions.require(!profile.containsKey("password"))
+Assertions.require(!profile.containsKey("token"))
+Assertions.require(!profile.containsKey("id"))
+
+// The identity store does not authorize registration or login via HTTP.
+registerAttempt: handler({
+    method: "POST"
+    target: Encoding.Latin1.encode("/api/users")
+    body: Encoding.UTF8.encode(
+        "{\"user\":{\"username\":\"nope\",\"email\":\"nope@example.test\",\"password\":\"secretpassword\"}}"
+    )
+})
+Assertions.require(registerAttempt.status == 501)
+Assertions.require(appStore.identityByEmail("nope@example.test") === null)
+
+// A metadata-only replacement changes the public profile, but does not
+// grant any authentication or alter a different store instance.
+updatedFixture: appStore.updateIdentityFixture(
+    1, "dana-new", "dana-new@example.test", "Reader", "https://example.test/d.png"
+)
+Assertions.require(updatedFixture.ok)
+Assertions.require(updatedFixture.value.id == 1)
+Assertions.require(getProfile("dana").status == 404)
+updatedProfile: JSON.parse(
+    Encoding.UTF8.decode(getProfile("dana-new").body)
+).value["profile"].value
+Assertions.require(updatedProfile["bio"].value == "Reader")
+Assertions.require(updatedProfile["image"].value == "https://example.test/d.png")
+Assertions.require(!updatedProfile.containsKey("email"))
+
+anotherStore: Store.create()
+Assertions.require(anotherStore.findProfile("dana-new") === null)
+Assertions.require(anotherStore.identityByEmail("dana-new@example.test") === null)
+
+true

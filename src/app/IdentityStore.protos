@@ -1,0 +1,205 @@
+//! Actor-local, credential-free RealWorld identity record repository.
+//!
+//! Stable numeric IDs, exact username/email uniqueness, atomic replacement,
+//! and immutable-by-copy lookup results. Contains no password, verifier, token,
+//! signing key, login method or cryptographic substitute.
+//!
+//! Mutations are fixture-only: do not expose them as registration/update HTTP
+//! handlers until trusted credential hashing and JWT support are integrated.
+
+Arrays: import("std:collections/array")
+
+/// Never give callers an alias of an internally retained mutable record.
+snapshot: (record) => {
+    {
+        id: record.id
+        username: record.username
+        email: record.email
+        bio: record.bio
+        image: record.image
+    }
+}
+
+publicProfile: (record) => {
+    {
+        username: record.username
+        bio: record.bio
+        image: record.image
+    }
+}
+
+accepted: (record) => {
+    {
+        ok: true
+        value: snapshot(record)
+        field: null
+        message: null
+    }
+}
+
+rejected: (field, message) => {
+    {
+        ok: false
+        value: null
+        field: field
+        message: message
+    }
+}
+
+/// RealWorld nullable profile fields: an empty String is stored as null.
+nullable: (value) => {
+    answer: value
+    if(value == "") {
+        answer = null
+    }
+    answer
+}
+
+/// Each invocation creates a completely independent in-memory identity store.
+create: () => {
+    records: []
+    nextId: 1
+
+    byId: (id) => {
+        found: null
+        for(record in records) {
+            if(record.id == id) {
+                found = record
+            }
+        }
+        found
+    }
+
+    byUsername: (username) => {
+        found: null
+        for(record in records) {
+            if(record.username == username) {
+                found = record
+            }
+        }
+        found
+    }
+
+    byEmail: (email) => {
+        found: null
+        for(record in records) {
+            if(record.email == email) {
+                found = record
+            }
+        }
+        found
+    }
+
+    copyOrNull: (record) => {
+        result: null
+        if(record !== null) {
+            result = snapshot(record)
+        }
+        result
+    }
+
+    // These lookups are intended for the RootActor application store only.
+    // A public HTTP profile must use profileFor, not an account snapshot.
+    store: {
+        findId: (id) => {
+            copyOrNull(byId(id))
+        }
+
+        findUsername: (username) => {
+            copyOrNull(byUsername(username))
+        }
+
+        findEmail: (email) => {
+            copyOrNull(byEmail(email))
+        }
+
+        profileFor: (username) => {
+            record: byUsername(username)
+            result: null
+            if(record !== null) {
+                result = publicProfile(record)
+            }
+            result
+        }
+
+        /// Trusted fixture insertion, never a registration endpoint.
+        /// Uniqueness is exact/case-sensitive; email policy is not yet here.
+        addFixture: (username, email, bio, image) => {
+            outcome: null
+            if((username === null) || (username == "")) {
+                outcome = rejected("username", "can't be blank")
+            } else {
+                if((email === null) || (email == "")) {
+                    outcome = rejected("email", "can't be blank")
+                } else {
+                    if(byUsername(username) !== null) {
+                        outcome = rejected("username", "has already been taken")
+                    } else {
+                        if(byEmail(email) !== null) {
+                            outcome = rejected("email", "has already been taken")
+                        } else {
+                            record: {
+                                id: nextId
+                                username: username
+                                email: email
+                                bio: nullable(bio)
+                                image: nullable(image)
+                            }
+                            records = Arrays.append(records, record)
+                            nextId = nextId + 1
+                            outcome = accepted(record)
+                        }
+                    }
+                }
+            }
+            outcome
+        }
+
+        /// Replace one fixture record in one commit. Rejection changes no
+        /// record, field, nextId, or uniqueness index.
+        updateFixture: (id, username, email, bio, image) => {
+            existing: byId(id)
+            outcome: rejected("user", "not found")
+            if(existing !== null) {
+                if((username === null) || (username == "")) {
+                    outcome = rejected("username", "can't be blank")
+                } else {
+                    if((email === null) || (email == "")) {
+                        outcome = rejected("email", "can't be blank")
+                    } else {
+                        usernameOwner: byUsername(username)
+                        emailOwner: byEmail(email)
+                        if((usernameOwner !== null) && (usernameOwner.id != id)) {
+                            outcome = rejected("username", "has already been taken")
+                        } else {
+                            if((emailOwner !== null) && (emailOwner.id != id)) {
+                                outcome = rejected("email", "has already been taken")
+                            } else {
+                                replacement: {
+                                    id: id
+                                    username: username
+                                    email: email
+                                    bio: nullable(bio)
+                                    image: nullable(image)
+                                }
+                                nextRecords: []
+                                for(record in records) {
+                                    if(record.id == id) {
+                                        nextRecords = Arrays.append(nextRecords, replacement)
+                                    } else {
+                                        nextRecords = Arrays.append(nextRecords, record)
+                                    }
+                                }
+                                records = nextRecords
+                                outcome = accepted(replacement)
+                            }
+                        }
+                    }
+                }
+            }
+            outcome
+        }
+    }
+
+    store
+}

@@ -13,6 +13,7 @@
 - Favorites are populated through test fixtures; authenticated favorite mutations are not implemented.
 - Router and HTTP/1.1 unit tests use an in-memory duplex; the native two-Worker service has also passed real TCP requests (HTTP 200, 401, 404, 422).
 - Workers snapshot complete HTTP requests for RootActor routing: raw target Bytes, method, version, ordered headers and decoded body Bytes; `std:http/server` enforces a 1 MiB request-body cap (HTTP 413). Application handlers do not interpret credentials or mutation bodies yet.
+- Credential-free identity metadata now has its own Actor-local repository with stable IDs, exact username/email uniqueness, atomic fixture updates, copy-out lookups, and public profiles that omit email/credentials. It is not wired to registration/login mutations and does not contain password hashes or JWTs.
 - Pure JSON request validation for registration, login, article creation and comment creation: strict UTF-8, named object envelope, non-empty required strings, optional article tagList type. Registration and login now use it in the router (422 invalid, 501 valid-but-unimplemented); protected writes still return 401 before body processing.
 - `make test` passed in a previous reported local run; `make test-http` passed on Protos `0.3.452-SNAPSHOT` (2026-11-07). The official RealWorld suite has not been run.
 

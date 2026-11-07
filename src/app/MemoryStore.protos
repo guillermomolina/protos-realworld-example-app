@@ -3,11 +3,13 @@
 //! State is captured by closures created inside create(). Each store
 //! instance owns its own article, profile, comment and favorite collections.
 //! There is no database, persistence or authentication authority.
+//! An isolated identity repository holds only non-secret account metadata.
 //!
 //! Fixture insertion methods support examples and tests. They are not
 //! replacements for authenticated RealWorld mutation endpoints.
 
 Arrays: import("std:collections/array")
+Identities: import("./IdentityStore.protos")
 
 /// Create an independent in-memory store.
 create: () => {
@@ -15,16 +17,21 @@ create: () => {
     profiles: []
     comments: []
     favorites: []
+    identities: Identities.create()
 
     store: {
         // A public profile may be registered explicitly, appear as
         // an article author, or appear only as a comment author.
         findProfile: (username) => {
-            found: null
+            // Real identity metadata takes precedence over legacy
+            // author/profile fixtures when the usernames coincide.
+            found: identities.profileFor(username)
 
-            for(profile in profiles) {
-                if(profile.username == username) {
-                    found = profile
+            if(found === null) {
+                for(profile in profiles) {
+                    if(profile.username == username) {
+                        found = profile
+                    }
                 }
             }
 
@@ -45,6 +52,24 @@ create: () => {
             }
 
             found
+        }
+
+        // Credential-free identity metadata. Only trusted fixture calls may
+        // mutate this store; HTTP registration/login still return 422/501.
+        identityById: (id) => {
+            identities.findId(id)
+        }
+
+        identityByEmail: (email) => {
+            identities.findEmail(email)
+        }
+
+        addIdentityFixture: (username, email, bio, image) => {
+            identities.addFixture(username, email, bio, image)
+        }
+
+        updateIdentityFixture: (id, username, email, bio, image) => {
+            identities.updateFixture(id, username, email, bio, image)
         }
 
         addProfileFixture: (profile) => {

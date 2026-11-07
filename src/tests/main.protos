@@ -22,5 +22,8 @@ run: (report) => {
     import("./slice07-identity-routing.protos")
     report("REALWORLD_IDENTITY_ROUTING=PASS")
 
+    import("./slice08-identity-store.protos")
+    report("REALWORLD_IDENTITY_STORE=PASS")
+
     true
 }

@@ -115,6 +115,16 @@ return HTTP 401 before interpreting untrusted mutation bodies. Email
 syntax/policy, password security, and successful mutation responses remain
 unimplemented.
 
+An additional `src/app/IdentityStore.protos` keeps credential-free identity
+metadata (stable IDs, exact unique usernames/emails, nullable profile fields)
+in Actor-local memory. Its fixture-only insert/update operations reject
+collisions without partial writes and return independent snapshots; the
+public profile projection never includes email, password, token or ID.
+`MemoryStore` consults this identity repository for public profile reads,
+falling back to older article/comment fixtures. No HTTP identity write or
+authentication behavior is enabled by these internal methods. RealWorld
+email normalization and secure credentials remain future work.
+
 Public list responses omit the article body, as required by the current RealWorld contract. Public 404 responses identify the missing `article` or `profile` in a JSON `errors` envelope. Protected operations without an authenticated principal return the Conduit 401 `errors.token` envelope; this is not an implementation of token validation or authenticated mutations. The tests also cover missing resources and unauthenticated access to the feed route.
 
 All data currently comes from test fixtures. It is lost when the process ends. Public responses have not yet passed RealWorld's official Hurl test suite.
@@ -132,6 +142,7 @@ src/
     Articles.protos          Article and profile JSON responses
     Comments.protos          Comment JSON responses
     MemoryStore.protos       Actor-local in-memory repository
+    IdentityStore.protos     Credential-free identity metadata repository
     HttpWorker.protos        Worker HTTP connection service
     HttpWorkers.protos       Worker lifecycle controller
     Responses.protos         HTTP response helpers
@@ -145,6 +156,7 @@ src/
     slice04-public-errors.protos
     slice06-json-contract.protos
     slice07-identity-routing.protos
+    slice08-identity-store.protos
     native-http.protos       Running-server integration client
     native-http-lifecycle.protos  Native concurrency/drain/abort fixture
 
