@@ -1,0 +1,246 @@
+//! Trusted article/comment domain mutations, without HTTP authorization.
+//!
+//! Prove stable-ID ownership, copying, partial updates, duplicate titles,
+//! atomic rejection, comment IDs, cascading deletion and public read-through.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Store: import("../app/MemoryStore.protos")
+Queries: import("../app/ArticleQuery.protos")
+Api: import("../app/Api.protos")
+
+store: Store.create()
+alice: store.addIdentityFixture("alice", "alice@example.test", null, null)
+bob: store.addIdentityFixture("bob", "bob@example.test", "Writes", null)
+carol: store.addIdentityFixture("carol", "carol@example.test", null, null)
+Assertions.require(alice.ok && bob.ok && carol.ok)
+
+handle: Api.make(store)
+get: (target) => {
+    handle({
+        method: "GET"
+        target: Encoding.Latin1.encode(target)
+    })
+}
+read: (response) => {
+    JSON.parse(Encoding.UTF8.decode(response.body))
+}
+
+oldTime: "2026-11-01T00:00:00.000Z"
+newTime: "2026-11-02T00:00:00.000Z"
+latestTime: "2026-11-03T00:00:00.000Z"
+
+tags: ["protos", "domain"]
+unknownAuthor: store.createOwnedArticleFixture(
+    99, "nobody", "Title", "Description", "Body", [], oldTime
+)
+Assertions.require(!unknownAuthor.ok)
+Assertions.require(unknownAuthor.field == "user")
+Assertions.require(store.all().size() == 0)
+
+first: store.createOwnedArticleFixture(
+    alice.value.id, "first-post", "Same title", "First description",
+    "First body", tags, oldTime
+)
+Assertions.require(first.ok)
+Assertions.require(first.value.slug == "first-post")
+Assertions.require(first.value.author.username == "alice")
+Assertions.require(first.value.tagList.size() == 2)
+Assertions.require(first.value.favoritesCount == 0)
+
+first.value.title = "tampered"
+first.value.author.username = "tampered"
+Assertions.require(store.find("first-post").title == "Same title")
+Assertions.require(store.find("first-post").author.username == "alice")
+Assertions.require(store.find("first-post").tagList[0] == "protos")
+
+duplicateSlug: store.createOwnedArticleFixture(
+    bob.value.id, "first-post", "Other title", "Description", "Body", [], newTime
+)
+Assertions.require(!duplicateSlug.ok)
+Assertions.require(duplicateSlug.field == "slug")
+Assertions.require(store.all().size() == 1)
+
+// RealWorld permits duplicate titles: slugs must be distinct.
+second: store.createOwnedArticleFixture(
+    bob.value.id, "second-post", "Same title", "Second description",
+    "Second body", ["domain"], newTime
+)
+Assertions.require(second.ok)
+Assertions.require(store.all().size() == 2)
+Assertions.require(store.tags().size() == 2)
+Assertions.require(store.find("second-post").author.username == "bob")
+Assertions.require(get("/api/articles").status == 200)
+Assertions.require(read(get("/api/articles")).value["articlesCount"].value.coefficient == 2)
+Assertions.require(read(get("/api/articles/first-post")).value["article"].value["body"].value == "First body")
+Assertions.require(read(get("/api/articles?author=alice")).value["articlesCount"].value.coefficient == 1)
+Assertions.require(read(get("/api/articles?tag=protos")).value["articlesCount"].value.coefficient == 1)
+
+// A different existing identity cannot change or delete the article.
+notOwner: store.updateOwnedArticleFixture(
+    bob.value.id, "first-post", null, null, "hacked", null, newTime
+)
+Assertions.require(!notOwner.ok)
+Assertions.require(notOwner.field == "article")
+Assertions.require(notOwner.message == "not owned")
+Assertions.require(store.find("first-post").body == "First body")
+Assertions.require(!store.deleteOwnedArticleFixture(bob.value.id, "first-post").ok)
+Assertions.require(store.find("first-post") !== null)
+
+missingUpdate: store.updateOwnedArticleFixture(
+    alice.value.id, "unknown", null, null, "x", null, newTime
+)
+Assertions.require(!missingUpdate.ok)
+Assertions.require(missingUpdate.message == "not found")
+
+blankUpdate: store.updateOwnedArticleFixture(
+    alice.value.id, "first-post", "", null, null, null, newTime
+)
+Assertions.require(!blankUpdate.ok)
+Assertions.require(blankUpdate.field == "title")
+Assertions.require(store.find("first-post").updatedAt == oldTime)
+
+partialUpdate: store.updateOwnedArticleFixture(
+    alice.value.id, "first-post", null, null, "Updated body", null, newTime
+)
+Assertions.require(partialUpdate.ok)
+Assertions.require(partialUpdate.value.title == "Same title")
+Assertions.require(partialUpdate.value.body == "Updated body")
+Assertions.require(partialUpdate.value.tagList.size() == 2)
+Assertions.require(partialUpdate.value.createdAt == oldTime)
+Assertions.require(partialUpdate.value.updatedAt == newTime)
+Assertions.require(store.find("first-post").body == "Updated body")
+
+clearTags: store.updateOwnedArticleFixture(
+    alice.value.id, "first-post", null, null, null, [], latestTime
+)
+Assertions.require(clearTags.ok)
+Assertions.require(clearTags.value.tagList.size() == 0)
+Assertions.require(store.find("first-post").tagList.size() == 0)
+Assertions.require(store.tags().size() == 1)
+Assertions.require(read(get("/api/articles?tag=protos")).value["articlesCount"].value.coefficient == 0)
+
+// Comments are owned by their own author, not necessarily article's author.
+missingCommentArticle: store.createOwnedCommentFixture(
+    bob.value.id, "absent", "Comment", oldTime
+)
+Assertions.require(!missingCommentArticle.ok)
+Assertions.require(missingCommentArticle.field == "article")
+blankComment: store.createOwnedCommentFixture(
+    bob.value.id, "first-post", "", oldTime
+)
+Assertions.require(!blankComment.ok)
+Assertions.require(blankComment.field == "body")
+Assertions.require(store.commentsFor("first-post").size() == 0)
+
+comment1: store.createOwnedCommentFixture(
+    bob.value.id, "first-post", "Bob comment", oldTime
+)
+comment2: store.createOwnedCommentFixture(
+    alice.value.id, "first-post", "Alice comment", newTime
+)
+Assertions.require(comment1.ok && comment2.ok)
+Assertions.require(comment1.value.id == 1)
+Assertions.require(comment2.value.id == 2)
+Assertions.require(store.commentsFor("first-post").size() == 2)
+Assertions.require(read(get("/api/articles/first-post/comments")).value["comments"].value.size() == 2)
+comment1.value.body = "tampered"
+Assertions.require(store.commentsFor("first-post")[0].body == "Bob comment")
+
+wrongCommentOwner: store.deleteOwnedCommentFixture(
+    alice.value.id, "first-post", comment1.value.id
+)
+Assertions.require(!wrongCommentOwner.ok)
+Assertions.require(wrongCommentOwner.message == "not owned")
+Assertions.require(store.commentsFor("first-post").size() == 2)
+unknownComment: store.deleteOwnedCommentFixture(
+    bob.value.id, "first-post", 999
+)
+Assertions.require(!unknownComment.ok)
+Assertions.require(unknownComment.field == "comment")
+
+removedComment: store.deleteOwnedCommentFixture(
+    bob.value.id, "first-post", comment1.value.id
+)
+Assertions.require(removedComment.ok)
+Assertions.require(store.commentsFor("first-post").size() == 1)
+Assertions.require(store.commentsFor("first-post")[0].id == comment2.value.id)
+
+// Identity renames do not change existing owner permissions or comment authors.
+renameBob: store.updateIdentityFixture(
+    bob.value.id, "bob-new", "bob-new@example.test", "Writes", null
+)
+Assertions.require(renameBob.ok)
+Assertions.require(store.find("second-post").author.username == "bob-new")
+Assertions.require(read(get("/api/articles/second-post")).value["article"].value["author"].value["username"].value == "bob-new")
+
+renameAlice: store.updateIdentityFixture(
+    alice.value.id, "alice-new", "alice-new@example.test", null, null
+)
+Assertions.require(renameAlice.ok)
+Assertions.require(store.find("first-post").author.username == "alice-new")
+Assertions.require(store.commentsFor("first-post")[0].author.username == "alice-new")
+Assertions.require(store.updateOwnedArticleFixture(
+    alice.value.id, "first-post", null, "Updated description", null, null, latestTime
+).ok)
+
+// Existing follows and feed selection use stable author IDs.
+Assertions.require(store.followIdentityFixture(carol.value.id, alice.value.id).ok)
+feed: store.feedForIdentity(carol.value.id, Queries.read(null))
+Assertions.require(feed.ok)
+Assertions.require(feed.total == 1)
+Assertions.require(feed.page[0].slug == "first-post")
+
+// Favorites for managed content update counts without mutating a copy.
+store.addFavoriteFixture("bob-new", "first-post")
+store.addFavoriteFixture("bob-new", "first-post")
+Assertions.require(store.find("first-post").favoritesCount == 1)
+Assertions.require(store.favoriteSlugsFor("bob-new").size() == 1)
+
+// Article deletion is owner-checked and clears related comments/favorites.
+deleted: store.deleteOwnedArticleFixture(alice.value.id, "first-post")
+Assertions.require(deleted.ok)
+Assertions.require(store.find("first-post") === null)
+Assertions.require(store.commentsFor("first-post").size() == 0)
+Assertions.require(store.favoriteSlugsFor("bob-new").size() == 0)
+Assertions.require(get("/api/articles/first-post").status == 404)
+Assertions.require(store.feedForIdentity(carol.value.id, Queries.read(null)).total == 0)
+Assertions.require(!store.deleteOwnedArticleFixture(alice.value.id, "first-post").ok)
+Assertions.require(store.deleteOwnedCommentFixture(
+    alice.value.id, "first-post", comment2.value.id
+).field == "article")
+
+// A deleted article's comment IDs are never reused.
+nextComment: store.createOwnedCommentFixture(
+    alice.value.id, "second-post", "After deletion", latestTime
+)
+Assertions.require(nextComment.ok)
+Assertions.require(nextComment.value.id == 3)
+Assertions.require(store.tags().size() == 1)
+
+// The public HTTP API remains fail-closed: callers cannot send trusted IDs.
+Assertions.require(handle({
+    method: "POST"
+    target: Encoding.Latin1.encode("/api/articles")
+    body: Encoding.UTF8.encode("{\"article\":{\"title\":\"x\"}}")
+}).status == 401)
+Assertions.require(handle({
+    method: "DELETE"
+    target: Encoding.Latin1.encode("/api/articles/second-post")
+}).status == 401)
+Assertions.require(handle({
+    method: "POST"
+    target: Encoding.Latin1.encode("/api/articles/second-post/comments")
+    body: Encoding.UTF8.encode("{\"comment\":{\"body\":\"x\"}}")
+}).status == 401)
+Assertions.require(handle({
+    method: "DELETE"
+    target: Encoding.Latin1.encode("/api/articles/second-post/comments/3")
+}).status == 401)
+Assertions.require(get("/api/articles/feed").status == 401)
+Assertions.require(store.find("second-post") !== null)
+
+other: Store.create()
+Assertions.require(other.find("second-post") === null)
+Assertions.require(other.commentsFor("second-post").size() == 0)
+true

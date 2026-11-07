@@ -28,5 +28,8 @@ run: (report) => {
     import("./slice09-social-feed.protos")
     report("REALWORLD_SOCIAL_FEED=PASS")
 
+    import("./slice10-content-mutations.protos")
+    report("REALWORLD_CONTENT_MUTATIONS=PASS")
+
     true
 }

@@ -15,6 +15,7 @@
 - Workers snapshot complete HTTP requests for RootActor routing: raw target Bytes, method, version, ordered headers and decoded body Bytes; `std:http/server` enforces a 1 MiB request-body cap (HTTP 413). Application handlers do not interpret credentials or mutation bodies yet.
 - Credential-free identity metadata now has its own Actor-local repository with stable IDs, exact username/email uniqueness, atomic fixture updates, copy-out lookups, and public profiles that omit email/credentials. It is not wired to registration/login mutations and does not contain password hashes or JWTs.
 - Following/follower graph keyed by stable identity IDs and feed selection (latest first, count before pagination) are implemented in the RootActor-owned fixture domain. Renames retain established links. HTTP follow/unfollow and feed remain 401, pending a real authenticated viewer.
+- Fixture-only article/comment creation, partial article update and ownership-checked deletion are implemented with stable identity IDs; managed content is visible through public GETs, filters and feed. Article deletion cascades comments and removes favorite edges. Trusted callers supply unique slugs and timestamps, not untrusted HTTP clients.
 - Pure JSON request validation for registration, login, article creation and comment creation: strict UTF-8, named object envelope, non-empty required strings, optional article tagList type. Registration and login now use it in the router (422 invalid, 501 valid-but-unimplemented); protected writes still return 401 before body processing.
 - `make test` passed in a previous reported local run; `make test-http` passed on Protos `0.3.452-SNAPSHOT` (2026-11-07). The official RealWorld suite has not been run.
 
@@ -38,7 +39,7 @@ D247 is closed; D243–D246 remain open. Do not replace the missing cryptographi
 - [x] Run and record `make test-http-lifecycle` for deterministic two-Worker overlap, request-envelope transport, HTTP 413, drain and abort (reported PASS on 2026-11-07). Manual `quit` starts the RootActor-owned drain; signal-triggered shutdown and `std:http/host` application-module loading remain separate work.
 - [ ] Implement registration, login, current-user lookup, validation, and authorization.
 - [ ] Expose following/unfollowing and the feed via authenticated HTTP handlers; internal fixture graph and feed selection are implemented. Authenticated favorites remain pending.
-- [ ] Create, update, and delete articles and comments.
+- [ ] Expose article and comment writes over authenticated HTTP after secure identity integration; internal fixture-only creation/update/deletion and read integration are implemented.
 - [ ] Select and integrate durable storage; verify restarts and clean shutdown.
 - [ ] Run the official RealWorld Hurl suite and record the exact revision and results.
 - [ ] Finish startup instructions for a clean checkout.

@@ -133,9 +133,22 @@ articles of followed identities using `ArticleQuery` ordering and
 pagination. Article fixtures linked to existing identities retain a
 stable author association after username changes; old fixtures without
 a link can be matched by their author username when the identity appears.
-The public article author is still the historical fixture snapshot.
-**This does not enable HTTP follow/unfollow or `/api/articles/feed`**:
-those routes remain HTTP 401 until an authenticated principal exists.
+The public article author of legacy fixtures is still the historical
+snapshot. **This does not enable HTTP follow/unfollow or
+`/api/articles/feed`**: those routes remain HTTP 401 until an
+authenticated principal exists.
+
+`src/app/ContentStore.protos` implements fixture-only ownership checks
+and article/comment creation, partial article updates and deletion. It
+uses stable identity IDs; managed article/comment snapshots resolve
+current public author names without exposing email or credentials.
+Managed content appears in existing public GETs, tag and author filters,
+and internal followed-author feed selection. Article deletion removes
+managed comments and favorite edges. Callers supply collision-free
+slugs and canonical timestamps; title duplicates are valid with
+different slugs. Legacy fixture records remain readable, but only
+managed content participates in the new mutation operations. No
+HTTP write route is enabled.
 
 Public list responses omit the article body, as required by the current RealWorld contract. Public 404 responses identify the missing `article` or `profile` in a JSON `errors` envelope. Protected operations without an authenticated principal return the Conduit 401 `errors.token` envelope; this is not an implementation of token validation or authenticated mutations. The tests also cover missing resources and unauthenticated access to the feed route.
 
@@ -156,6 +169,7 @@ src/
     MemoryStore.protos       Actor-local in-memory repository
     IdentityStore.protos     Credential-free identity metadata repository
     FollowStore.protos       Stable-ID follow relationships (fixtures only)
+    ContentStore.protos      Owned article/comment domain mutations (fixtures only)
     HttpWorker.protos        Worker HTTP connection service
     HttpWorkers.protos       Worker lifecycle controller
     Responses.protos         HTTP response helpers
@@ -171,6 +185,7 @@ src/
     slice07-identity-routing.protos
     slice08-identity-store.protos
     slice09-social-feed.protos
+    slice10-content-mutations.protos
     native-http.protos       Running-server integration client
     native-http-lifecycle.protos  Native concurrency/drain/abort fixture
 
@@ -184,7 +199,7 @@ See [TODO.md](TODO.md) for the remaining work and upstream Protos blockers.
 ## What is not implemented yet
 
 - User registration, login, signed tokens and authenticated operations
-- Following, authenticated favorite mutations, article mutations and comment mutations
+- Authenticated HTTP following, favorites, article and comment writes
 - Durable storage
 - Signal-triggered graceful drain and optional integration with `std:http/host` (the current manual `quit` command uses native drain)
 - Official RealWorld Hurl conformance

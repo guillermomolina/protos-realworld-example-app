@@ -13,6 +13,7 @@ Arrays: import("std:collections/array")
 Identities: import("./IdentityStore.protos")
 Follows: import("./FollowStore.protos")
 ArticleQuery: import("./ArticleQuery.protos")
+Content: import("./ContentStore.protos")
 
 /// Create an independent in-memory store.
 create: () => {
@@ -22,6 +23,7 @@ create: () => {
     favorites: []
     identities: Identities.create()
     follows: Follows.create(identities)
+    content: Content.create(identities)
     // Fixture article objects are linked to their author IDs when
     // identities exist. Links survive later username changes.
     articleAuthors: []
@@ -139,6 +141,15 @@ create: () => {
                     }
                 }
 
+                // Managed article authors are already linked by stable ID.
+                for(entry in content.entries()) {
+                    if(Arrays.contains(followedIds, entry.authorId)) {
+                        selectedArticles = Arrays.append(
+                            selectedArticles, entry.article
+                        )
+                    }
+                }
+
                 selected: ArticleQuery.select(selectedArticles, options, [])
                 result = {
                     ok: true
@@ -165,7 +176,9 @@ create: () => {
                     result = Arrays.append(result, entry.comment)
                 }
             }
-
+            for(comment in content.commentsFor(slug)) {
+                result = Arrays.append(result, comment)
+            }
             result
         }
 
@@ -208,16 +221,24 @@ create: () => {
                         slug: slug
                     }
                 )
-                article.favoritesCount = article.favoritesCount + 1
+                if(content.has(slug)) {
+                    content.incrementFavoriteFixture(slug)
+                } else {
+                    article.favoritesCount = article.favoritesCount + 1
+                }
             }
 
-            article
+            store.find(slug)
         }
 
         // Return a new Array so query operations do not work directly
         // on the collection retained by the store.
         all: () => {
-            Array(...items)
+            result: Array(...items)
+            for(article in content.all()) {
+                result = Arrays.append(result, article)
+            }
+            result
         }
 
         find: (slug) => {
@@ -227,13 +248,16 @@ create: () => {
                     result = item
                 }
             }
+            if(result === null) {
+                result = content.find(slug)
+            }
             result
         }
 
         // Collect distinct tags in first-seen order across articles.
         tags: () => {
             names: []
-            for(item in items) {
+            for(item in store.all()) {
                 for(tag in item.tagList) {
                     present: false
                     for(name in names) {
@@ -247,6 +271,49 @@ create: () => {
                 }
             }
             names
+        }
+
+        // Trusted ID-bearing content fixture mutations do not authorize
+        // clients; the protected HTTP routes must remain 401.
+        // The caller provides collision-free slugs and explicit times.
+        createOwnedArticleFixture: (authorId, slug, title, description, body, tags, time) => {
+            outcome: null
+            if(store.find(slug) !== null) {
+                outcome = Content.rejected("slug", "has already been taken")
+            } else {
+                outcome = content.createArticleFixture(
+                    authorId, slug, title, description, body, tags, time
+                )
+            }
+            outcome
+        }
+
+        updateOwnedArticleFixture: (actorId, slug, title, description, body, tags, time) => {
+            content.updateArticleFixture(
+                actorId, slug, title, description, body, tags, time
+            )
+        }
+
+        deleteOwnedArticleFixture: (actorId, slug) => {
+            outcome: content.deleteArticleFixture(actorId, slug)
+            if(outcome.ok) {
+                // Prevent orphaned favorite edges and legacy comments.
+                favorites = Arrays.filter(favorites, (entry) => {
+                    entry.slug != slug
+                })
+                comments = Arrays.filter(comments, (entry) => {
+                    entry.slug != slug
+                })
+            }
+            outcome
+        }
+
+        createOwnedCommentFixture: (actorId, slug, body, time) => {
+            content.createCommentFixture(actorId, slug, body, time)
+        }
+
+        deleteOwnedCommentFixture: (actorId, slug, id) => {
+            content.deleteCommentFixture(actorId, slug, id)
         }
 
         // Fixture insertion only. Authenticated mutations arrive later.

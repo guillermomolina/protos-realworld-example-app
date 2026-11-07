@@ -1,0 +1,315 @@
+//! Credential-free article/comment mutations for trusted RootActor fixtures.
+//!
+//! All ownership is checked against stable identity IDs. No HTTP mutation or
+//! authentication capability is exposed here. Callers supply unique slugs and
+//! timestamps; secure identity, a clock, and a slug allocator remain separate.
+//!
+//! Managed articles/comments are copied on input and output. Legacy fixtures
+//! in MemoryStore remain readable but are not mutated by these operations.
+
+Arrays: import("std:collections/array")
+
+accepted: (value) => {
+    {
+        ok: true
+        value: value
+        field: null
+        message: null
+    }
+}
+
+rejected: (field, message) => {
+    {
+        ok: false
+        value: null
+        field: field
+        message: message
+    }
+}
+
+/// Return fresh public fields, resolving a changed username by stable ID.
+articleCopy: (record, identities) => {
+    author: identities.findId(record.authorId)
+    {
+        slug: record.slug
+        title: record.title
+        description: record.description
+        body: record.body
+        tagList: Array(...record.tagList)
+        createdAt: record.createdAt
+        updatedAt: record.updatedAt
+        favoritesCount: record.favoritesCount
+        author: {
+            username: author.username
+            bio: author.bio
+            image: author.image
+        }
+    }
+}
+
+commentCopy: (record, identities) => {
+    author: identities.findId(record.authorId)
+    {
+        id: record.id
+        body: record.body
+        createdAt: record.createdAt
+        updatedAt: record.updatedAt
+        author: {
+            username: author.username
+            bio: author.bio
+            image: author.image
+        }
+    }
+}
+
+create: (identities) => {
+    articles: []
+    comments: []
+    nextCommentId: 1
+
+    rawArticle: (slug) => {
+        found: null
+        for(record in articles) {
+            if(record.slug == slug) {
+                found = record
+            }
+        }
+        found
+    }
+
+    rawComment: (slug, id) => {
+        found: null
+        for(record in comments) {
+            if((record.slug == slug) && (record.id == id)) {
+                found = record
+            }
+        }
+        found
+    }
+
+    validFields: (title, description, body) => {
+        result: null
+        if(title == "") {
+            result = rejected("title", "can't be blank")
+        } else {
+            if(description == "") {
+                result = rejected("description", "can't be blank")
+            } else {
+                if(body == "") {
+                    result = rejected("body", "can't be blank")
+                }
+            }
+        }
+        result
+    }
+
+    store: {
+        has: (slug) => {
+            rawArticle(slug) !== null
+        }
+
+        find: (slug) => {
+            record: rawArticle(slug)
+            result: null
+            if(record !== null) {
+                result = articleCopy(record, identities)
+            }
+            result
+        }
+
+        all: () => {
+            result: []
+            for(record in articles) {
+                result = Arrays.append(result, articleCopy(record, identities))
+            }
+            result
+        }
+
+        /// Include the stable author ID for internal feed selection only.
+        entries: () => {
+            result: []
+            for(record in articles) {
+                result = Arrays.append(result, {
+                    authorId: record.authorId
+                    article: articleCopy(record, identities)
+                })
+            }
+            result
+        }
+
+        commentsFor: (slug) => {
+            result: []
+            for(record in comments) {
+                if(record.slug == slug) {
+                    result = Arrays.append(result, commentCopy(record, identities))
+                }
+            }
+            result
+        }
+
+        /// A trusted fixture must supply a unique slug and canonical UTC time.
+        /// Duplicate titles are supported through distinct slugs.
+        createArticleFixture: (authorId, slug, title, description, body, tags, time) => {
+            outcome: rejected("user", "not found")
+            if(identities.findId(authorId) !== null) {
+                if(slug == "") {
+                    outcome = rejected("slug", "can't be blank")
+                } else {
+                    if(rawArticle(slug) !== null) {
+                        outcome = rejected("slug", "has already been taken")
+                    } else {
+                        failure: validFields(title, description, body)
+                        if(failure !== null) {
+                            outcome = failure
+                        } else {
+                            record: {
+                                slug: slug
+                                authorId: authorId
+                                title: title
+                                description: description
+                                body: body
+                                tagList: Array(...tags)
+                                createdAt: time
+                                updatedAt: time
+                                favoritesCount: 0
+                            }
+                            articles = Arrays.append(articles, record)
+                            outcome = accepted(articleCopy(record, identities))
+                        }
+                    }
+                }
+            }
+            outcome
+        }
+
+        /// Null arguments mean unchanged; [] explicitly clears tags.
+        /// The slug and createdAt never change during an update.
+        updateArticleFixture: (actorId, slug, title, description, body, tags, time) => {
+            record: rawArticle(slug)
+            outcome: rejected("article", "not found")
+            if(record !== null) {
+                if(record.authorId != actorId) {
+                    outcome = rejected("article", "not owned")
+                } else {
+                    nextTitle: record.title
+                    nextDescription: record.description
+                    nextBody: record.body
+                    nextTags: record.tagList
+                    if(title !== null) {
+                        nextTitle = title
+                    }
+                    if(description !== null) {
+                        nextDescription = description
+                    }
+                    if(body !== null) {
+                        nextBody = body
+                    }
+                    if(tags !== null) {
+                        nextTags = tags
+                    }
+                    failure: validFields(nextTitle, nextDescription, nextBody)
+                    if(failure !== null) {
+                        outcome = failure
+                    } else {
+                        replacement: {
+                            slug: record.slug
+                            authorId: record.authorId
+                            title: nextTitle
+                            description: nextDescription
+                            body: nextBody
+                            tagList: Array(...nextTags)
+                            createdAt: record.createdAt
+                            updatedAt: time
+                            favoritesCount: record.favoritesCount
+                        }
+                        articles = Arrays.map(articles, (entry) => {
+                            answer: entry
+                            if(entry.slug == slug) {
+                                answer = replacement
+                            }
+                            answer
+                        })
+                        outcome = accepted(articleCopy(replacement, identities))
+                    }
+                }
+            }
+            outcome
+        }
+
+        /// Removing an article also removes its managed comments.
+        deleteArticleFixture: (actorId, slug) => {
+            record: rawArticle(slug)
+            outcome: rejected("article", "not found")
+            if(record !== null) {
+                if(record.authorId != actorId) {
+                    outcome = rejected("article", "not owned")
+                } else {
+                    articles = Arrays.filter(articles, (entry) => {
+                        entry.slug != slug
+                    })
+                    comments = Arrays.filter(comments, (entry) => {
+                        entry.slug != slug
+                    })
+                    outcome = accepted(true)
+                }
+            }
+            outcome
+        }
+
+        createCommentFixture: (actorId, slug, body, time) => {
+            outcome: rejected("article", "not found")
+            if(rawArticle(slug) !== null) {
+                if(identities.findId(actorId) === null) {
+                    outcome = rejected("user", "not found")
+                } else {
+                    if(body == "") {
+                        outcome = rejected("body", "can't be blank")
+                    } else {
+                        record: {
+                            id: nextCommentId
+                            slug: slug
+                            authorId: actorId
+                            body: body
+                            createdAt: time
+                            updatedAt: time
+                        }
+                        comments = Arrays.append(comments, record)
+                        nextCommentId = nextCommentId + 1
+                        outcome = accepted(commentCopy(record, identities))
+                    }
+                }
+            }
+            outcome
+        }
+
+        deleteCommentFixture: (actorId, slug, id) => {
+            outcome: rejected("article", "not found")
+            if(rawArticle(slug) !== null) {
+                record: rawComment(slug, id)
+                outcome = rejected("comment", "not found")
+                if(record !== null) {
+                    if(record.authorId != actorId) {
+                        outcome = rejected("comment", "not owned")
+                    } else {
+                        comments = Arrays.filter(comments, (entry) => {
+                            !((entry.slug == slug) && (entry.id == id))
+                        })
+                        outcome = accepted(true)
+                    }
+                }
+            }
+            outcome
+        }
+
+        /// Fixture favorite counts are kept alongside existing favorite edges.
+        incrementFavoriteFixture: (slug) => {
+            record: rawArticle(slug)
+            if(record !== null) {
+                record.favoritesCount = record.favoritesCount + 1
+            }
+            true
+        }
+    }
+
+    store
+}
