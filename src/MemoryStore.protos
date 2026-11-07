@@ -1,0 +1,100 @@
+// Actor-local, temporary storage for the first HTTP/JSON slice.
+// Not a durable database and not an authentication authority.
+
+Arrays: import("std:collections/array")
+
+create: () => {
+    items: []
+    profiles: []
+    comments: []
+
+    store: {
+        findProfile: (username) => {
+            found: null
+
+            for(profile in profiles) {
+                if(profile.username == username) {
+                    found = profile
+                }
+            }
+
+            if(found === null) {
+                for(article in items) {
+                    if(article.author.username == username) {
+                        found = article.author
+                    }
+                }
+            }
+
+            found
+        }
+
+        addProfileFixture: (profile) => {
+            profiles = Arrays.append(profiles, profile)
+            profile
+        }
+
+        commentsFor: (slug) => {
+            result: []
+
+            for(entry in comments) {
+                if(entry.slug == slug) {
+                    result = Arrays.append(result, entry.comment)
+                }
+            }
+
+            result
+        }
+
+        addCommentFixture: (slug, value) => {
+            comments = Arrays.append(
+                comments,
+                {
+                    slug: slug
+                    comment: value
+                }
+            )
+            value
+        }
+
+        all: () => {
+            Array(...items)
+        }
+
+        find: (slug) => {
+            result: null
+            for(item in items) {
+                if(item.slug == slug) {
+                    result = item
+                }
+            }
+            result
+        }
+
+        tags: () => {
+            names: []
+            for(item in items) {
+                for(tag in item.tagList) {
+                    present: false
+                    for(name in names) {
+                        if(name == tag) {
+                            present = true
+                        }
+                    }
+                    if(!present) {
+                        names = Arrays.append(names, tag)
+                    }
+                }
+            }
+            names
+        }
+
+        // Fixture insertion only. Authenticated mutations arrive later.
+        addFixture: (article) => {
+            items = Arrays.append(items, article)
+            article
+        }
+    }
+
+    store
+}

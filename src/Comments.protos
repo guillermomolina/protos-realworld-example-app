@@ -1,0 +1,23 @@
+// JSON representation of public article comments.
+
+JSON: import("std:json/json")
+Arrays: import("std:collections/array")
+Articles: import("./Articles.protos")
+
+comment: (value) => {
+    JSON.object(
+        "id", JSON.number(value.id, 0),
+        "createdAt", JSON.string(value.createdAt),
+        "updatedAt", JSON.string(value.updatedAt),
+        "body", JSON.string(value.body),
+        "author", Articles.profile(value.author)
+    )
+}
+
+list: (values) => {
+    nodes: Arrays.map(values, (value) => {
+        comment(value)
+    })
+
+    JSON.object("comments", JSON.array(...nodes))
+}

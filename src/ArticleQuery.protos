@@ -1,0 +1,213 @@
+// Query parameters and article listing for the RealWorld API.
+
+Arrays: import("std:collections/array")
+
+hexValue: (octet) => {
+    value: -1
+    if((octet >= 48) && (octet <= 57)) {
+        value = octet - 48
+    }
+    if((octet >= 65) && (octet <= 70)) {
+        value = octet - 55
+    }
+    if((octet >= 97) && (octet <= 102)) {
+        value = octet - 87
+    }
+    value
+}
+
+decodeComponent: (source) => {
+    output: Encoding.UTF8.encode("")
+    index: 0
+
+    while(index < source.size()) {
+        octet: source[index]
+
+        if(octet == 37) {
+            if(index + 2 >= source.size()) {
+                Error().signal()
+            }
+
+            high: hexValue(source[index + 1])
+            low: hexValue(source[index + 2])
+
+            if((high < 0) || (low < 0)) {
+                Error().signal()
+            }
+
+            output.add(high * 16 + low)
+            index = index + 3
+        } else {
+            if(octet == 43) {
+                output.add(32)
+            } else {
+                output.add(octet)
+            }
+            index = index + 1
+        }
+    }
+
+    Encoding.UTF8.decode(output)
+}
+
+parse: (query) => {
+    parameters: Map()
+
+    if(query !== null) {
+        source: Encoding.UTF8.encode(query)
+        nameBytes: Encoding.UTF8.encode("")
+        valueBytes: Encoding.UTF8.encode("")
+        inValue: false
+
+        finishParameter: () => {
+            if(nameBytes.size() > 0) {
+                name: decodeComponent(nameBytes)
+                value: decodeComponent(valueBytes)
+                parameters[name] = value
+            }
+
+            nameBytes = Encoding.UTF8.encode("")
+            valueBytes = Encoding.UTF8.encode("")
+            inValue = false
+        }
+
+        for(octet in source) {
+            if(octet == 38) {
+                finishParameter()
+            } else {
+                if((octet == 61) && !inValue) {
+                    inValue = true
+                } else {
+                    if(inValue) {
+                        valueBytes.add(octet)
+                    } else {
+                        nameBytes.add(octet)
+                    }
+                }
+            }
+        }
+
+        finishParameter()
+    }
+
+    parameters
+}
+
+nonNegativeInteger: (text, minimum) => {
+    digits: Encoding.UTF8.encode(text)
+
+    if(digits.size() == 0) {
+        Error().signal()
+    }
+
+    result: 0
+
+    for(octet in digits) {
+        if((octet < 48) || (octet > 57)) {
+            Error().signal()
+        }
+        result = result * 10 + octet - 48
+    }
+
+    if(result < minimum) {
+        Error().signal()
+    }
+
+    result
+}
+
+read: (query) => {
+    parameters: parse(query)
+    limit: 20
+    offset: 0
+
+    if(parameters.containsKey("limit")) {
+        limit = nonNegativeInteger(parameters["limit"], 1)
+    }
+
+    if(parameters.containsKey("offset")) {
+        offset = nonNegativeInteger(parameters["offset"], 0)
+    }
+
+    {
+        parameters: parameters
+        limit: limit
+        offset: offset
+    }
+}
+
+// Compare normalized UTC timestamps, newest first.
+laterThan: (left, right) => {
+    a: Encoding.UTF8.encode(left)
+    b: Encoding.UTF8.encode(right)
+
+    count: a.size()
+    if(b.size() < count) {
+        count = b.size()
+    }
+
+    index: 0
+    decided: false
+    later: false
+
+    while((index < count) && !decided) {
+        if(a[index] != b[index]) {
+            later = a[index] > b[index]
+            decided = true
+        }
+        index = index + 1
+    }
+
+    if(!decided) {
+        later = a.size() > b.size()
+    }
+
+    later
+}
+
+select: (articles, options) => {
+    parameters: options.parameters
+
+    filtered: Arrays.filter(articles, (article) => {
+        included: true
+
+        if(parameters.containsKey("tag")) {
+            included = included &&
+                Arrays.contains(article.tagList, parameters["tag"])
+        }
+
+        if(parameters.containsKey("author")) {
+            included = included &&
+                (article.author.username == parameters["author"])
+        }
+
+        // No fixture has user favorites in the temporary store.
+        if(parameters.containsKey("favorited")) {
+            included = false
+        }
+
+        included
+    })
+
+    ordered: Arrays.sort(filtered, (left, right) => {
+        laterThan(left.createdAt, right.createdAt)
+    })
+
+    total: ordered.size()
+    start: options.offset
+
+    if(start > total) {
+        start = total
+    }
+
+    end: start + options.limit
+
+    if(end > total) {
+        end = total
+    }
+
+    {
+        page: Arrays.slice(ordered, start, end)
+        total: total
+    }
+}

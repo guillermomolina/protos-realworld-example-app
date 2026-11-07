@@ -1,0 +1,149 @@
+// Public profile and comment API tests.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Store: import("../src/MemoryStore.protos")
+Api: import("../src/Api.protos")
+
+requestOf: (target) => {
+    {
+        method: "GET"
+        target: Encoding.Latin1.encode(target)
+    }
+}
+
+read: (response) => {
+    JSON.parse(Encoding.UTF8.decode(response.body))
+}
+
+store: Store.create()
+
+alice: {
+    username: "alice"
+    bio: "Writes about Protos"
+    image: null
+}
+
+bob: {
+    username: "bob"
+    bio: null
+    image: null
+}
+
+carol: {
+    username: "carol"
+    bio: "Reader"
+    image: null
+}
+
+articleFixture: (slug, author) => {
+    {
+        slug: slug
+        title: slug
+        description: "Example article"
+        body: "Article contents"
+        tagList: ["protos"]
+        createdAt: "2026-11-01T10:00:00.000Z"
+        updatedAt: "2026-11-01T10:00:00.000Z"
+        author: author
+    }
+}
+
+store.addFixture(articleFixture("first-article", alice))
+store.addFixture(articleFixture("second-article", bob))
+store.addProfileFixture(carol)
+
+commentFixture: (id, body, author) => {
+    {
+        id: id
+        body: body
+        createdAt: "2026-11-02T10:00:00.000Z"
+        updatedAt: "2026-11-02T10:00:00.000Z"
+        author: author
+    }
+}
+
+store.addCommentFixture(
+    "first-article",
+    commentFixture(1, "First comment", bob)
+)
+
+store.addCommentFixture(
+    "first-article",
+    commentFixture(2, "Second comment", alice)
+)
+
+handle: Api.make(store)
+
+aliceResponse: handle(requestOf("/api/profiles/alice"))
+aliceNode: read(aliceResponse)
+
+Assertions.require(aliceResponse.status == 200)
+Assertions.require(
+    aliceNode.value["profile"].value["username"].value == "alice"
+)
+Assertions.require(
+    aliceNode.value["profile"].value["bio"].value ==
+        "Writes about Protos"
+)
+Assertions.require(
+    aliceNode.value["profile"].value["following"].value == false
+)
+
+carolResponse: handle(requestOf("/api/profiles/carol"))
+carolNode: read(carolResponse)
+
+Assertions.require(carolResponse.status == 200)
+Assertions.require(
+    carolNode.value["profile"].value["username"].value == "carol"
+)
+
+unknownProfile: handle(requestOf("/api/profiles/unknown"))
+Assertions.require(unknownProfile.status == 404)
+
+commentsResponse: handle(
+    requestOf("/api/articles/first-article/comments")
+)
+commentsNode: read(commentsResponse)
+comments: commentsNode.value["comments"].value
+
+Assertions.require(commentsResponse.status == 200)
+Assertions.require(comments.size() == 2)
+
+Assertions.require(
+    comments[0].value["id"].value.coefficient == 1
+)
+Assertions.require(
+    comments[0].value["body"].value == "First comment"
+)
+Assertions.require(
+    comments[0].value["author"].value["username"].value == "bob"
+)
+
+Assertions.require(
+    comments[1].value["id"].value.coefficient == 2
+)
+Assertions.require(
+    comments[1].value["body"].value == "Second comment"
+)
+Assertions.require(
+    comments[1].value["author"].value["username"].value == "alice"
+)
+
+emptyResponse: handle(
+    requestOf("/api/articles/second-article/comments")
+)
+emptyNode: read(emptyResponse)
+
+Assertions.require(emptyResponse.status == 200)
+Assertions.require(
+    emptyNode.value["comments"].value.size() == 0
+)
+
+unknownArticle: handle(
+    requestOf("/api/articles/unknown/comments")
+)
+
+Assertions.require(unknownArticle.status == 404)
+
+true

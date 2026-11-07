@@ -1,0 +1,71 @@
+// RealWorld JSON presentation. No HTTP or storage authority.
+
+JSON: import("std:json/json")
+Arrays: import("std:collections/array")
+
+nullableText: (value) => {
+    answer: JSON.nullValue()
+    if(value !== null) {
+        answer = JSON.string(value)
+    }
+    answer
+}
+
+profile: (author) => {
+    JSON.object(
+        "username", JSON.string(author.username),
+        "bio", nullableText(author.bio),
+        "image", nullableText(author.image),
+        "following", JSON.boolean(false)
+    )
+}
+
+article: (value, detailed) => {
+    tags: []
+    for(tag in value.tagList) {
+        tags = Arrays.append(tags, JSON.string(tag))
+    }
+
+    fields: [
+        "slug", JSON.string(value.slug),
+        "title", JSON.string(value.title),
+        "description", JSON.string(value.description),
+        "tagList", JSON.array(...tags),
+        "createdAt", JSON.string(value.createdAt),
+        "updatedAt", JSON.string(value.updatedAt),
+        "favorited", JSON.boolean(false),
+        "favoritesCount", JSON.number(value.favoritesCount, 0),
+        "author", profile(value.author)
+    ]
+
+    if(detailed) {
+        fields = Arrays.append(fields, "body")
+        fields = Arrays.append(fields, JSON.string(value.body))
+    }
+
+    JSON.object(...fields)
+}
+
+list: (values, total) => {
+    nodes: []
+    for(value in values) {
+        nodes = Arrays.append(nodes, article(value, false))
+    }
+
+    JSON.object(
+        "articles", JSON.array(...nodes),
+        "articlesCount", JSON.number(total, 0)
+    )
+}
+
+tags: (values) => {
+    nodes: []
+    for(value in values) {
+        nodes = Arrays.append(nodes, JSON.string(value))
+    }
+    JSON.object("tags", JSON.array(...nodes))
+}
+
+single: (value) => {
+    JSON.object("article", article(value, true))
+}

@@ -1,0 +1,108 @@
+// First RealWorld read-only HTTP routes.
+// The supplied store is Actor-local and has no ambient capabilities.
+
+Router: import("std:http/router").Router
+Articles: import("./Articles.protos")
+Comments: import("./Comments.protos")
+JSON: import("std:json/json")
+ArticleQuery: import("./ArticleQuery.protos")
+Responses: import("./Responses.protos")
+
+make: (store) => {
+    Router.compile([
+        {
+            method: "GET"
+            path: "/api/profiles/{username}"
+            handle: (request, match) => {
+                profile: store.findProfile(match.params["username"])
+
+                if(profile === null) {
+                    Responses.notFound()
+                } else {
+                    Responses.json(
+                        200,
+                        JSON.object("profile", Articles.profile(profile))
+                    )
+                }
+            }
+        },
+        {
+            method: "GET"
+            path: "/api/articles/{slug}/comments"
+            handle: (request, match) => {
+                slug: match.params["slug"]
+                article: store.find(slug)
+
+                if(article === null) {
+                    Responses.notFound()
+                } else {
+                    Responses.json(
+                        200,
+                        Comments.list(store.commentsFor(slug))
+                    )
+                }
+            }
+        },
+        {
+            method: "GET"
+            path: "/api/tags"
+            handle: (request, match) => {
+                Responses.json(200, Articles.tags(store.tags()))
+            }
+        },
+        {
+            method: "GET"
+            path: "/api/articles"
+            handle: (request, match) => {
+                options: null
+                invalid: false
+
+                Error.handle(
+                    () => {
+                        options = ArticleQuery.read(match.query)
+                    },
+                    (error) => {
+                        invalid = true
+                        error
+                    }
+                )
+
+                answer: null
+
+                if(invalid) {
+                    answer = Responses.invalidQuery()
+                } else {
+                    selected: ArticleQuery.select(store.all(), options)
+                    answer = Responses.json(
+                        200,
+                        Articles.list(selected.page, selected.total)
+                    )
+                }
+
+                answer
+            }
+        },
+        {
+            method: "GET"
+            path: "/api/articles/feed"
+            handle: (request, match) => {
+                // No authenticated principal is available in this slice.
+                Responses.unauthorized()
+            }
+        },
+        {
+            method: "GET"
+            path: "/api/articles/{slug}"
+            handle: (request, match) => {
+                found: store.find(match.params["slug"])
+                answer: null
+                if(found === null) {
+                    answer = Responses.notFound()
+                } else {
+                    answer = Responses.json(200, Articles.single(found))
+                }
+                answer
+            }
+        }
+    ])
+}

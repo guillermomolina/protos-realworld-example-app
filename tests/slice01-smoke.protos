@@ -1,0 +1,101 @@
+// focal assertions for the first RealWorld read API slice.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Store: import("../src/MemoryStore.protos")
+Api: import("../src/Api.protos")
+
+requestOf: (method, path) => {
+    {
+        method: method
+        target: Encoding.Latin1.encode(path)
+    }
+}
+
+decode: (response) => {
+    JSON.parse(Encoding.UTF8.decode(response.body))
+}
+
+store: Store.create()
+handle: Api.make(store)
+
+emptyTags: handle(requestOf("GET", "/api/tags"))
+Assertions.require(emptyTags.status == 200)
+Assertions.require(decode(emptyTags).value["tags"].value.size() == 0)
+
+emptyArticles: handle(requestOf("GET", "/api/articles"))
+Assertions.require(emptyArticles.status == 200)
+Assertions.require(decode(emptyArticles).value["articles"].value.size() == 0)
+Assertions.require(
+    decode(emptyArticles).value["articlesCount"].value.coefficient == 0
+)
+
+author: {
+    username: "reader"
+    bio: null
+    image: null
+}
+
+store.addFixture({
+    slug: "hello-protos"
+    title: "Hello Protos"
+    description: "A RealWorld backend"
+    body: "Article body in Protos"
+    tagList: ["protos", "realworld"]
+    createdAt: "2026-11-06T00:00:00.000Z"
+    updatedAt: "2026-11-06T00:00:00.000Z"
+    favoritesCount: 0
+    author: author
+})
+
+store.addFixture({
+    slug: "second-article"
+    title: "Second article"
+    description: "Another example"
+    body: "Another body"
+    tagList: ["protos", "graalvm"]
+    createdAt: "2026-11-06T00:00:01.000Z"
+    updatedAt: "2026-11-06T00:00:01.000Z"
+    favoritesCount: 0
+    author: author
+})
+
+tagResponse: handle(requestOf("GET", "/api/tags"))
+tagValues: decode(tagResponse).value["tags"].value
+Assertions.require(tagResponse.status == 200)
+Assertions.require(tagValues.size() == 3)
+Assertions.require(tagValues[0].value == "protos")
+Assertions.require(tagValues[1].value == "realworld")
+Assertions.require(tagValues[2].value == "graalvm")
+
+listResponse: handle(requestOf("GET", "/api/articles"))
+listNode: decode(listResponse)
+listed: listNode.value["articles"].value
+
+Assertions.require(listResponse.status == 200)
+Assertions.require(listNode.value["articlesCount"].value.coefficient == 2)
+Assertions.require(listed.size() == 2)
+Assertions.require(listed[0].value["slug"].value == "second-article")
+Assertions.require(listed[1].value["slug"].value == "hello-protos")
+Assertions.require(!listed[0].value.containsKey("body"))
+
+singleResponse: handle(requestOf("GET", "/api/articles/hello-protos"))
+singleNode: decode(singleResponse).value["article"].value
+Assertions.require(singleResponse.status == 200)
+Assertions.require(singleNode["body"].value == "Article body in Protos")
+Assertions.require(singleNode["author"].value["username"].value == "reader")
+Assertions.require(singleNode["favoritesCount"].value.coefficient == 0)
+
+missingResponse: handle(requestOf("GET", "/api/articles/unknown"))
+Assertions.require(missingResponse.status == 404)
+
+feedResponse: handle(requestOf("GET", "/api/articles/feed"))
+Assertions.require(feedResponse.status == 401)
+
+methodResponse: handle(requestOf("POST", "/api/articles"))
+Assertions.require(methodResponse.status == 405)
+
+unknownResponse: handle(requestOf("GET", "/api/unknown"))
+Assertions.require(unknownResponse.status == 404)
+
+true

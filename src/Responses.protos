@@ -1,0 +1,47 @@
+// HTTP responses in the format expected by RealWorld.
+
+JSON: import("std:json/json")
+
+json: (status, node) => {
+    {
+        status: status
+        headers: [
+            [
+                "Content-Type",
+                Encoding.Latin1.encode("application/json; charset=utf-8")
+            ]
+        ]
+        body: Encoding.UTF8.encode(JSON.encode(node))
+    }
+}
+
+notFound: () => {
+    {
+        status: 404
+        headers: []
+        body: null
+    }
+}
+
+unauthorized: () => {
+    {
+        status: 401
+        headers: []
+        body: null
+    }
+}
+
+
+// Validation errors use the RealWorld errors envelope.
+invalidQuery: () => {
+    json(
+        422,
+        JSON.object(
+            "errors",
+            JSON.object(
+                "body",
+                JSON.array(JSON.string("invalid query parameters"))
+            )
+        )
+    )
+}

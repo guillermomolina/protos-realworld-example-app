@@ -1,0 +1,155 @@
+// Article query and pagination regression tests.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Store: import("../src/MemoryStore.protos")
+Api: import("../src/Api.protos")
+
+requestOf: (target) => {
+    {
+        method: "GET"
+        target: Encoding.Latin1.encode(target)
+    }
+}
+
+read: (response) => {
+    JSON.parse(Encoding.UTF8.decode(response.body))
+}
+
+store: Store.create()
+
+author: (username) => {
+    {
+        username: username
+        bio: null
+        image: null
+    }
+}
+
+fixture: (slug, username, timestamp, tags) => {
+    {
+        slug: slug
+        title: slug
+        description: "Article description"
+        body: "Article body"
+        tagList: tags
+        createdAt: timestamp
+        updatedAt: timestamp
+        favoritesCount: 0
+        author: author(username)
+    }
+}
+
+store.addFixture(
+    fixture(
+        "old",
+        "alice",
+        "2026-11-01T00:00:00.000Z",
+        ["protos", "learning"]
+    )
+)
+
+store.addFixture(
+    fixture(
+        "new",
+        "bob",
+        "2026-11-03T00:00:00.000Z",
+        ["protos & more"]
+    )
+)
+
+store.addFixture(
+    fixture(
+        "middle",
+        "alice",
+        "2026-11-02T00:00:00.000Z",
+        ["protos"]
+    )
+)
+
+handle: Api.make(store)
+
+allResponse: handle(requestOf("/api/articles"))
+allNode: read(allResponse)
+
+Assertions.require(allResponse.status == 200)
+Assertions.require(allNode.value["articlesCount"].value.coefficient == 3)
+Assertions.require(
+    allNode.value["articles"].value[0].value["slug"].value == "new"
+)
+Assertions.require(
+    allNode.value["articles"].value[1].value["slug"].value == "middle"
+)
+Assertions.require(
+    allNode.value["articles"].value[2].value["slug"].value == "old"
+)
+
+pageResponse: handle(requestOf("/api/articles?limit=1&offset=1"))
+pageNode: read(pageResponse)
+
+Assertions.require(pageResponse.status == 200)
+Assertions.require(pageNode.value["articlesCount"].value.coefficient == 3)
+Assertions.require(pageNode.value["articles"].value.size() == 1)
+Assertions.require(
+    pageNode.value["articles"].value[0].value["slug"].value == "middle"
+)
+
+tagResponse: handle(requestOf("/api/articles?tag=protos"))
+tagNode: read(tagResponse)
+
+Assertions.require(tagNode.value["articlesCount"].value.coefficient == 2)
+Assertions.require(tagNode.value["articles"].value.size() == 2)
+
+authorResponse: handle(requestOf("/api/articles?author=alice"))
+authorNode: read(authorResponse)
+
+Assertions.require(authorNode.value["articlesCount"].value.coefficient == 2)
+Assertions.require(
+    authorNode.value["articles"].value[0].value["slug"].value == "middle"
+)
+
+encodedResponse: handle(
+    requestOf("/api/articles?tag=protos+%26+more")
+)
+encodedNode: read(encodedResponse)
+
+Assertions.require(encodedNode.value["articlesCount"].value.coefficient == 1)
+Assertions.require(
+    encodedNode.value["articles"].value[0].value["slug"].value == "new"
+)
+
+combinedResponse: handle(
+    requestOf("/api/articles?tag=protos&author=alice&limit=1")
+)
+combinedNode: read(combinedResponse)
+
+Assertions.require(combinedNode.value["articlesCount"].value.coefficient == 2)
+Assertions.require(combinedNode.value["articles"].value.size() == 1)
+Assertions.require(
+    combinedNode.value["articles"].value[0].value["slug"].value == "middle"
+)
+
+emptyPage: read(handle(requestOf("/api/articles?offset=100")))
+
+Assertions.require(emptyPage.value["articlesCount"].value.coefficient == 3)
+Assertions.require(emptyPage.value["articles"].value.size() == 0)
+
+favorites: read(handle(requestOf("/api/articles?favorited=alice")))
+
+Assertions.require(favorites.value["articlesCount"].value.coefficient == 0)
+Assertions.require(favorites.value["articles"].value.size() == 0)
+
+invalidLimit: handle(requestOf("/api/articles?limit=0"))
+invalidOffset: handle(requestOf("/api/articles?offset=-1"))
+invalidLimitText: handle(requestOf("/api/articles?limit=invalid"))
+
+Assertions.require(invalidLimit.status == 422)
+Assertions.require(invalidOffset.status == 422)
+Assertions.require(invalidLimitText.status == 422)
+
+errorNode: read(invalidLimit)
+Assertions.require(
+    errorNode.value["errors"].value["body"].value.size() == 1
+)
+
+true

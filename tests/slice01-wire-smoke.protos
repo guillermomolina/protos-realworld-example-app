@@ -1,0 +1,95 @@
+// focal HTTP/1.1 wire test without network authority.
+
+Assertions: import("std:test/assertions")
+Server: import("std:http/server").Server
+Store: import("../src/MemoryStore.protos")
+Api: import("../src/Api.protos")
+
+duplexOf: (requestText) => {
+    source: Encoding.Latin1.encode(requestText)
+    output: Encoding.Latin1.encode("")
+    offset: 0
+    closed: false
+    duplex: null
+
+    success: (value) => {
+        (() => { value }).future()
+    }
+
+    duplex = {
+        read: (maxBytes) => {
+            chunk: null
+
+            if(offset < source.size()) {
+                chunk = Encoding.Latin1.encode("")
+                while(
+                    (offset < source.size()) &&
+                    (chunk.size() < maxBytes)
+                ) {
+                    chunk.add(source[offset])
+                    offset = offset + 1
+                }
+            }
+
+            success(chunk)
+        }
+
+        write: (bytes) => {
+            for(octet in bytes) {
+                output.add(octet)
+            }
+            success(duplex)
+        }
+
+        close: () => {
+            closed = true
+            success(duplex)
+        }
+
+        writtenBytes: () => {
+            output
+        }
+
+        isClosed: () => {
+            closed
+        }
+    }
+
+    duplex
+}
+
+store: Store.create()
+handle: Api.make(store)
+
+connection: duplexOf(
+    "GET /api/tags HTTP/1.1\r\n" +
+    "Host: localhost\r\n" +
+    "\r\n"
+)
+
+Server.serveOne.owning(connection, handle, null).value()
+
+written: connection.writtenBytes()
+expectedBody: Encoding.UTF8.encode("{\"tags\":[]}")
+
+Assertions.require(connection.isClosed())
+Assertions.require(written.size() >= 12 + expectedBody.size())
+
+// HTTP/1.1 200 ...: verify the numeric status on the wire.
+Assertions.require(written[9] == 50)
+Assertions.require(written[10] == 48)
+Assertions.require(written[11] == 48)
+
+// The response body must end in the encoded RealWorld JSON object.
+bodyStart: written.size() - expectedBody.size()
+matches: true
+
+for(i, 0, expectedBody.size()) {
+    if(written[bodyStart + i] != expectedBody[i]) {
+        matches = false
+    }
+}
+
+Assertions.require(matches)
+
+true
