@@ -2,8 +2,8 @@
 
 Assertions: import("std:test/assertions")
 JSON: import("std:json/json")
-Store: import("../src/MemoryStore.protos")
-Api: import("../src/Api.protos")
+Store: import("../app/MemoryStore.protos")
+Api: import("../app/Api.protos")
 
 requestOf: (target) => {
     {

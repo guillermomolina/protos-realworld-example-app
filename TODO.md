@@ -2,6 +2,11 @@
 
 ## Current validated state
 
+- Source layout: `src/main.protos` serves the app, `src/app/` holds its
+  modules, and `src/tests/` holds the test corpus. `src/test-main.protos`
+  and `src/lifecycle-main.protos` keep cross-directory imports inside the
+  direct-file SOURCE root; no `.protos` files remain at repository root.
+
 - Public routes: tags, article listing and details, profiles, and comments.
 - Conduit-compatible JSON errors for missing profiles/articles (404) and unauthed protected routes (401); token validation and write operations remain unimplemented.
 - Public article filtering by `tag`, `author`, and `favorited`, including sorting and pagination.

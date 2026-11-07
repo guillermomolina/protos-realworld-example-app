@@ -1,8 +1,8 @@
-//! Root-level entry for the native HTTP lifecycle integration.
+//! SOURCE-root entry for native HTTP lifecycle integration.
 //!
 //! The direct-file resolver confines local SOURCE imports to the entry's
-//! containing directory. Keeping this entry at the repository root permits
-//! imports from tests/ to ../src/ without escaping that root.
+//! directory. Keeping this entry in src/ allows src/tests/ to import
+//! ../app/ modules without escaping the selected local SOURCE root.
 //!
 //! Only the CLI entry receives Network authority. Pass it explicitly to the
 //! same-Actor fixture; do not grant it to HTTP Worker Actors.

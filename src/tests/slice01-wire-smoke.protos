@@ -2,8 +2,8 @@
 
 Assertions: import("std:test/assertions")
 Server: import("std:http/server").Server
-Store: import("../src/MemoryStore.protos")
-Api: import("../src/Api.protos")
+Store: import("../app/MemoryStore.protos")
+Api: import("../app/Api.protos")
 
 duplexOf: (requestText) => {
     source: Encoding.Latin1.encode(requestText)

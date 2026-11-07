@@ -9,6 +9,15 @@ This project is **in development**. It is an example of composing ordinary Proto
 - Protos `0.3.452-SNAPSHOT` (includes the standard `Bytes` Actor-transfer fix required by the Worker server)
 - `make`
 
+## Source-tree layout
+
+All `.protos` files live below `src/`. Application modules are in `src/app/`,
+and test cases in `src/tests/`; `src/` also holds CLI entrypoints.
+Protos direct-file imports are confined to the entry file's directory: the
+test and lifecycle wrappers in `src/` allow tests to import `../app/`
+without escaping the authorized SOURCE root. Run the documented `make`
+targets rather than executing `src/tests/main.protos` directly.
+
 ## Run the tests
 
 ```sh
@@ -18,7 +27,7 @@ make test
 The Makefile invokes:
 
 ```sh
-protos -Dpolyglot.engine.WarnInterpreterOnly=false run-tests.protos
+protos -Dpolyglot.engine.WarnInterpreterOnly=false src/test-main.protos
 ```
 
 The Truffle option hides the interpreter-only diagnostic; it does not enable a compiler or suppress test failures. If using a different launcher, override `PROTOS` or `PROTOS_ARGS` on the `make` command line.
@@ -33,7 +42,7 @@ The native Protos CLI can grant explicit TCP authority to the initial RootActor.
 make serve
 ```
 
-This runs `protos --allow-network --service=service server.protos` with the Makefile's configurable `PROTOS` and `PROTOS_ARGS`.
+This runs `protos --allow-network --service=service src/main.protos` with the Makefile's configurable `PROTOS` and `PROTOS_ARGS`.
 
 After the listener has opened, the application prints `REALWORLD_HTTP_READY=127.0.0.1:3000`. In another terminal, try:
 
@@ -58,7 +67,7 @@ make test-http-lifecycle
 ```
 
 The native Protos fixture uses an ephemeral loopback listener and the **same**
-`src/HttpWorker.protos` used by the server. It holds a request header incomplete
+`src/app/HttpWorker.protos` used by the server. It holds a request header incomplete
 until a Worker acknowledges accepting it, verifies a second Worker completes a
 real HTTP request meanwhile, then initiates drain **before** completing the
 first request. It also verifies cross-Actor HTTP headers and body transport, chunked body
@@ -90,7 +99,7 @@ are rejected with HTTP 413. Only transferable data crosses the Actor boundary:
 no TCP connection, stream or mutable application store is transferred.
 Authentication and mutation handlers do not consume these fields yet.
 
-`src/RequestJson.protos` separately validates UTF-8 JSON `user`, `article` and
+`src/app/RequestJson.protos` separately validates UTF-8 JSON `user`, `article` and
 `comment` envelopes, required non-empty string fields, and optional article
 `tagList` arrays. It returns structured validation results that existing
 `Responses.error` can render as Conduit-style 422 errors. These pure helpers
@@ -106,29 +115,31 @@ All data currently comes from test fixtures. It is lost when the process ends. P
 
 ```text
 src/
-  Api.protos           HTTP route composition
-  ArticleQuery.protos  Public article query selection
-  Articles.protos      Article and profile JSON responses
-  Comments.protos      Comment JSON responses
-  MemoryStore.protos   Temporary in-memory repository
-  HttpWorker.protos    Worker Actor HTTP connection service
-  HttpWorkers.protos   RootActor-local Worker lifecycle controller
-  Responses.protos     HTTP response helpers
-  RequestJson.protos   Pure JSON envelope/field validation for future mutations
+  main.protos                Native HTTP server entry
+  test-main.protos           Focused test suite entry
+  lifecycle-main.protos      Network-capable lifecycle test bootstrap
+  app/
+    Api.protos               HTTP route composition
+    ArticleQuery.protos      Public article query selection
+    Articles.protos          Article and profile JSON responses
+    Comments.protos          Comment JSON responses
+    MemoryStore.protos       Actor-local in-memory repository
+    HttpWorker.protos        Worker HTTP connection service
+    HttpWorkers.protos       Worker lifecycle controller
+    Responses.protos         HTTP response helpers
+    RequestJson.protos       Pure JSON envelope validation
+  tests/
+    main.protos              Imports focused test cases
+    slice01-smoke.protos
+    slice01-wire-smoke.protos
+    slice02-articles-query.protos
+    slice03-public-content.protos
+    slice04-public-errors.protos
+    slice06-json-contract.protos
+    native-http.protos       Running-server integration client
+    native-http-lifecycle.protos  Native concurrency/drain/abort fixture
 
-tests/
-  slice01-smoke.protos
-  slice01-wire-smoke.protos
-  slice02-articles-query.protos
-  slice03-public-content.protos
-  slice06-json-contract.protos  Pure JSON mutation-payload contract tests
-  native-http.protos  Native HTTP integration client (Protos)
-  native-http-lifecycle.protos  Native concurrency, drain and abort fixture
-
-server.protos        RootActor service and Worker bootstrap
-native-http-lifecycle.protos  Test entry: explicitly passes Network to the fixture
-run-tests.protos     Focused test entry point
-Makefile             test, serve, test-http, and lifecycle checks
+Makefile                    Stable test, serve and integration commands
 ```
 
 The application uses existing Protos facilities such as `std:http/router`, `std:http/server`, `std:json/json` and `std:collections/array`; it does not implement private replacements for those libraries.

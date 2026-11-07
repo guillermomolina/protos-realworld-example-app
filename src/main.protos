@@ -1,7 +1,7 @@
 //! Native HTTP entry point for the RealWorld learning application.
 //!
 //! Run with:
-//!   protos --allow-network --service=service server.protos
+//!   protos --allow-network --service=service src/main.protos
 //!
 //! The RootActor owns Network authority and the single mutable MemoryStore.
 //! Two Worker Actors accept connections through explicitly delegated
@@ -17,9 +17,9 @@ Logger: import("std:logging/logger")
 TextSink: import("std:logging/text_sink")
 ColorMode: import("std:text/color_mode")
 ColoredFormatter: import("std:logging/colored_formatter")
-Store: import("./src/MemoryStore.protos")
-Api: import("./src/Api.protos")
-HttpWorkers: import("./src/HttpWorkers.protos")
+Store: import("./app/MemoryStore.protos")
+Api: import("./app/Api.protos")
+HttpWorkers: import("./app/HttpWorkers.protos")
 
 /// Install the application service behavior on the RootActor.
 /// The bootstrap schedules startup after READY, so listener acquisition

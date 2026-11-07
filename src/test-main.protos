@@ -1,0 +1,6 @@
+//! Run focused RealWorld tests from the shared src/ SOURCE root.
+//! src/tests/ may import sibling ../app/ modules through this entry.
+
+Suite: import("./tests/main.protos")
+Suite.run(print)
+true

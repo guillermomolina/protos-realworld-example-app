@@ -9,9 +9,9 @@ Assertions: import("std:test/assertions")
 Client: import("std:http/client").Client
 IpAddress: import("std:network/ip_addresses").IpAddress
 IpEndpoint: import("std:network/ip_endpoints").IpEndpoint
-HttpWorkers: import("../src/HttpWorkers.protos")
-Store: import("../src/MemoryStore.protos")
-Api: import("../src/Api.protos")
+HttpWorkers: import("../app/HttpWorkers.protos")
+Store: import("../app/MemoryStore.protos")
+Api: import("../app/Api.protos")
 
 loopback: IpAddress(4, 2130706433)
 

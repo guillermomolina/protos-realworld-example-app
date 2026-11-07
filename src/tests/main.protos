@@ -1,0 +1,23 @@
+//! RealWorld test suite; reporting is supplied by the CLI entry.
+
+run: (report) => {
+    import("./slice01-smoke.protos")
+    report("SLICE01_SMOKE=PASS")
+
+    import("./slice01-wire-smoke.protos")
+    report("SLICE01_WIRE=PASS")
+
+    import("./slice02-articles-query.protos")
+    report("SLICE02_ARTICLES_QUERY=PASS")
+
+    import("./slice03-public-content.protos")
+    report("SLICE03_PUBLIC_CONTENT=PASS")
+
+    import("./slice04-public-errors.protos")
+    report("SLICE04_PUBLIC_ERRORS=PASS")
+
+    import("./slice06-json-contract.protos")
+    report("REALWORLD_JSON_CONTRACT=PASS")
+
+    true
+}

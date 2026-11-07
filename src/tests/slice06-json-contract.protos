@@ -5,8 +5,8 @@
 
 Assertions: import("std:test/assertions")
 JSON: import("std:json/json")
-RequestJson: import("../src/RequestJson.protos")
-Responses: import("../src/Responses.protos")
+RequestJson: import("../app/RequestJson.protos")
+Responses: import("../app/Responses.protos")
 
 bytes: (text) => {
     Encoding.UTF8.encode(text)
