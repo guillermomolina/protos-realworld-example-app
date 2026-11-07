@@ -31,5 +31,8 @@ run: (report) => {
     import("./slice10-content-mutations.protos")
     report("REALWORLD_CONTENT_MUTATIONS=PASS")
 
+    import("./slice11-favorites.protos")
+    report("REALWORLD_IDENTITY_FAVORITES=PASS")
+
     true
 }

@@ -1,0 +1,191 @@
+//! Fixture-only stable-ID favorites, public filters and lifecycle invariants.
+//!
+//! No supplied identity ID is accepted from HTTP. Article favorite endpoints
+//! remain unauthorized until validated tokens establish a principal.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Queries: import("../app/ArticleQuery.protos")
+Store: import("../app/MemoryStore.protos")
+Api: import("../app/Api.protos")
+
+store: Store.create()
+alice: store.addIdentityFixture("alice", "alice@example.test", null, null)
+bob: store.addIdentityFixture("bob", "bob@example.test", null, null)
+carol: store.addIdentityFixture("carol", "carol@example.test", null, null)
+Assertions.require(alice.ok && bob.ok && carol.ok)
+
+oldTime: "2026-11-01T00:00:00.000Z"
+newTime: "2026-11-02T00:00:00.000Z"
+first: store.createOwnedArticleFixture(
+    bob.value.id, "first", "First", "Description", "Body", ["news"], oldTime
+)
+second: store.createOwnedArticleFixture(
+    bob.value.id, "second", "Second", "Description", "Body", ["news"], newTime
+)
+Assertions.require(first.ok && second.ok)
+
+handle: Api.make(store)
+get: (target) => {
+    handle({
+        method: "GET"
+        target: Encoding.Latin1.encode(target)
+    })
+}
+read: (response) => {
+    JSON.parse(Encoding.UTF8.decode(response.body))
+}
+
+// Rejected writes have no effect on counts, edges or queries.
+unknownUser: store.favoriteIdentityFixture(999, "first")
+Assertions.require(!unknownUser.ok)
+Assertions.require(unknownUser.field == "user")
+Assertions.require(unknownUser.message == "not found")
+unknownArticle: store.favoriteIdentityFixture(alice.value.id, "missing")
+Assertions.require(!unknownArticle.ok)
+Assertions.require(unknownArticle.field == "article")
+Assertions.require(store.find("first").favoritesCount == 0)
+Assertions.require(store.favoriteSlugsForIdentity(alice.value.id).size() == 0)
+Assertions.require(!store.unfavoriteIdentityFixture(999, "first").ok)
+Assertions.require(!store.unfavoriteIdentityFixture(alice.value.id, "missing").ok)
+
+// Duplicated requests are idempotent, and two identities count separately.
+added: store.favoriteIdentityFixture(alice.value.id, "first")
+Assertions.require(added.ok && added.changed)
+again: store.favoriteIdentityFixture(alice.value.id, "first")
+Assertions.require(again.ok && !again.changed)
+Assertions.require(store.find("first").favoritesCount == 1)
+Assertions.require(store.favoriteIdentityFixture(bob.value.id, "first").changed)
+Assertions.require(store.favoriteIdentityFixture(alice.value.id, "second").changed)
+Assertions.require(store.find("first").favoritesCount == 2)
+Assertions.require(store.find("second").favoritesCount == 1)
+Assertions.require(store.isFavoritedByIdentity(alice.value.id, "first"))
+Assertions.require(!store.isFavoritedByIdentity(carol.value.id, "first"))
+Assertions.require(store.favoriteSlugsForIdentity(alice.value.id).size() == 2)
+
+// Public filtering selects the named user's favorites, not a viewer identity.
+aliceFiltered: read(get("/api/articles?favorited=alice"))
+Assertions.require(aliceFiltered.value["articlesCount"].value.coefficient == 2)
+Assertions.require(aliceFiltered.value["articles"].value[0].value["slug"].value == "second")
+Assertions.require(aliceFiltered.value["articles"].value[1].value["slug"].value == "first")
+Assertions.require(aliceFiltered.value["articles"].value[0].value["favorited"].value == false)
+page: read(get("/api/articles?favorited=alice&limit=1&offset=1"))
+Assertions.require(page.value["articlesCount"].value.coefficient == 2)
+Assertions.require(page.value["articles"].value.size() == 1)
+Assertions.require(page.value["articles"].value[0].value["slug"].value == "first")
+
+// Changing identity usernames does not break the stable favorite edge.
+renamedAlice: store.updateIdentityFixture(
+    alice.value.id, "alice-new", "alice-new@example.test", null, null
+)
+Assertions.require(renamedAlice.ok)
+Assertions.require(store.favoriteSlugsFor("alice").size() == 0)
+Assertions.require(store.favoriteSlugsFor("alice-new").size() == 2)
+Assertions.require(read(get("/api/articles?favorited=alice-new")).value["articlesCount"].value.coefficient == 2)
+Assertions.require(read(get("/api/articles?favorited=alice")).value["articlesCount"].value.coefficient == 0)
+
+// Existing name-based test fixtures route through identity IDs when possible.
+store.addFavoriteFixture("alice-new", "first")
+Assertions.require(store.find("first").favoritesCount == 2)
+Assertions.require(store.favoriteSlugsForIdentity(alice.value.id).size() == 2)
+
+removed: store.unfavoriteIdentityFixture(alice.value.id, "first")
+Assertions.require(removed.ok && removed.changed)
+removedAgain: store.unfavoriteIdentityFixture(alice.value.id, "first")
+Assertions.require(removedAgain.ok && !removedAgain.changed)
+Assertions.require(store.find("first").favoritesCount == 1)
+Assertions.require(!store.isFavoritedByIdentity(alice.value.id, "first"))
+Assertions.require(store.favoriteSlugsForIdentity(alice.value.id).size() == 1)
+Assertions.require(store.favoriteIdentityFixture(alice.value.id, "first").changed)
+Assertions.require(store.find("first").favoritesCount == 2)
+
+// Pre-identity legacy favorites migrate without changing their counters.
+store.addFavoriteFixture("visitor", "second")
+Assertions.require(store.find("second").favoritesCount == 2)
+visitor: store.addIdentityFixture("visitor", "visitor@example.test", null, null)
+Assertions.require(visitor.ok)
+Assertions.require(store.isFavoritedByIdentity(visitor.value.id, "second"))
+Assertions.require(store.favoriteSlugsForIdentity(visitor.value.id).size() == 1)
+Assertions.require(store.find("second").favoritesCount == 2)
+renamedVisitor: store.updateIdentityFixture(
+    visitor.value.id, "visitor-new", "visitor-new@example.test", null, null
+)
+Assertions.require(renamedVisitor.ok)
+Assertions.require(store.favoriteSlugsFor("visitor").size() == 0)
+Assertions.require(store.favoriteSlugsFor("visitor-new").size() == 1)
+Assertions.require(store.unfavoriteIdentityFixture(visitor.value.id, "second").changed)
+Assertions.require(store.find("second").favoritesCount == 1)
+
+// An identity rename also adopts legacy favorites under its new username.
+store.addFavoriteFixture("candidate", "second")
+Assertions.require(store.find("second").favoritesCount == 2)
+renamedCarol: store.updateIdentityFixture(
+    carol.value.id, "candidate", "candidate@example.test", null, null
+)
+Assertions.require(renamedCarol.ok)
+Assertions.require(store.favoriteSlugsForIdentity(carol.value.id).size() == 1)
+Assertions.require(store.find("second").favoritesCount == 2)
+Assertions.require(store.unfavoriteIdentityFixture(carol.value.id, "second").changed)
+Assertions.require(store.find("second").favoritesCount == 1)
+
+// Owned content is present in feed regardless of favorite state.
+Assertions.require(store.followIdentityFixture(alice.value.id, bob.value.id).ok)
+feed: store.feedForIdentity(alice.value.id, Queries.read(null))
+Assertions.require(feed.ok)
+Assertions.require(feed.total == 2)
+Assertions.require(feed.page[0].slug == "second")
+Assertions.require(feed.page[1].slug == "first")
+
+// Legacy article fixtures use the same stable-ID favorite operations.
+store.addFixture({
+    slug: "legacy"
+    title: "Legacy"
+    description: "Fixture"
+    body: "Legacy body"
+    tagList: []
+    createdAt: oldTime
+    updatedAt: oldTime
+    favoritesCount: 0
+    author: {
+        username: "bob"
+        bio: null
+        image: null
+    }
+})
+Assertions.require(store.favoriteIdentityFixture(alice.value.id, "legacy").changed)
+Assertions.require(store.find("legacy").favoritesCount == 1)
+Assertions.require(store.unfavoriteIdentityFixture(alice.value.id, "legacy").changed)
+Assertions.require(store.find("legacy").favoritesCount == 0)
+Assertions.require(!store.unfavoriteIdentityFixture(alice.value.id, "legacy").changed)
+
+// Deleting managed content purges stable edges and stale public filters.
+deleted: store.deleteOwnedArticleFixture(bob.value.id, "first")
+Assertions.require(deleted.ok)
+Assertions.require(store.find("first") === null)
+Assertions.require(!store.isFavoritedByIdentity(alice.value.id, "first"))
+Assertions.require(!store.isFavoritedByIdentity(bob.value.id, "first"))
+Assertions.require(store.favoriteSlugsForIdentity(alice.value.id).size() == 1)
+Assertions.require(store.favoriteSlugsForIdentity(bob.value.id).size() == 0)
+Assertions.require(store.unfavoriteIdentityFixture(alice.value.id, "first").field == "article")
+Assertions.require(read(get("/api/articles?favorited=alice-new")).value["articlesCount"].value.coefficient == 1)
+Assertions.require(store.find("second").favoritesCount == 1)
+
+// Unauthenticated requests cannot toggle a favorite or forge a viewer ID.
+Assertions.require(handle({
+    method: "POST"
+    target: Encoding.Latin1.encode("/api/articles/second/favorite")
+}).status == 401)
+Assertions.require(handle({
+    method: "DELETE"
+    target: Encoding.Latin1.encode("/api/articles/second/favorite")
+}).status == 401)
+Assertions.require(get("/api/articles/feed").status == 401)
+Assertions.require(store.find("second").favoritesCount == 1)
+
+// Each store owns independent favorite state, even when IDs are reused.
+other: Store.create()
+otherAlice: other.addIdentityFixture("alice", "alice@example.test", null, null)
+Assertions.require(otherAlice.ok)
+Assertions.require(!other.isFavoritedByIdentity(otherAlice.value.id, "second"))
+Assertions.require(other.favoriteSlugsForIdentity(otherAlice.value.id).size() == 0)
+true

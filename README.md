@@ -150,6 +150,15 @@ different slugs. Legacy fixture records remain readable, but only
 managed content participates in the new mutation operations. No
 HTTP write route is enabled.
 
+`src/app/FavoriteStore.protos` retains fixture-only favorite edges by stable
+identity ID and provides idempotent favorite/unfavorite operations for both
+managed and legacy article fixtures. `MemoryStore` adjusts counters only when
+edges change, resolves the public `?favorited=username` filter through current
+identity metadata, migrates pre-identity legacy fixtures without double-counting,
+and removes both edge representations when an article is deleted. Identity
+renames preserve favorites. Public JSON still reports `favorited: false`
+without an authenticated viewer, and the HTTP favorite routes still return 401.
+
 Public list responses omit the article body, as required by the current RealWorld contract. Public 404 responses identify the missing `article` or `profile` in a JSON `errors` envelope. Protected operations without an authenticated principal return the Conduit 401 `errors.token` envelope; this is not an implementation of token validation or authenticated mutations. The tests also cover missing resources and unauthenticated access to the feed route.
 
 All data currently comes from test fixtures. It is lost when the process ends. Public responses have not yet passed RealWorld's official Hurl test suite.
@@ -170,6 +179,7 @@ src/
     IdentityStore.protos     Credential-free identity metadata repository
     FollowStore.protos       Stable-ID follow relationships (fixtures only)
     ContentStore.protos      Owned article/comment domain mutations (fixtures only)
+    FavoriteStore.protos     Stable-ID favorite edges (fixtures only)
     HttpWorker.protos        Worker HTTP connection service
     HttpWorkers.protos       Worker lifecycle controller
     Responses.protos         HTTP response helpers
@@ -186,6 +196,7 @@ src/
     slice08-identity-store.protos
     slice09-social-feed.protos
     slice10-content-mutations.protos
+    slice11-favorites.protos
     native-http.protos       Running-server integration client
     native-http-lifecycle.protos  Native concurrency/drain/abort fixture
 

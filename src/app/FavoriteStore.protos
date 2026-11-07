@@ -1,0 +1,113 @@
+//! Actor-local RealWorld favorite edges keyed by stable identity IDs.
+//!
+//! Fixture-only operations: the supplied user ID is not an HTTP principal.
+//! The caller provides identity lookup and article existence; no credentials,
+//! networking, or authorization are supplied by this module.
+//!
+//! Edges are unique per identity/article. Counts remain owned by MemoryStore,
+//! which adjusts them only when a new edge is inserted or removed.
+
+Arrays: import("std:collections/array")
+
+accepted: (changed) => {
+    {
+        ok: true
+        changed: changed
+        field: null
+        message: null
+    }
+}
+
+rejected: (field, message) => {
+    {
+        ok: false
+        changed: false
+        field: field
+        message: message
+    }
+}
+
+create: (identities, articleExists) => {
+    edges: []
+
+    contains: (actorId, slug) => {
+        found: false
+        for(edge in edges) {
+            if((edge.actorId == actorId) && (edge.slug == slug)) {
+                found = true
+            }
+        }
+        found
+    }
+
+    store: {
+        isFavorited: (actorId, slug) => {
+            contains(actorId, slug)
+        }
+
+        // Return an independent Array. The caller cannot mutate retained edges.
+        slugsFor: (actorId) => {
+            slugs: []
+            for(edge in edges) {
+                if(edge.actorId == actorId) {
+                    slugs = Arrays.append(slugs, edge.slug)
+                }
+            }
+            slugs
+        }
+
+        favoriteFixture: (actorId, slug) => {
+            outcome: null
+            if(identities.findId(actorId) === null) {
+                outcome = rejected("user", "not found")
+            } else {
+                if(!articleExists(slug)) {
+                    outcome = rejected("article", "not found")
+                } else {
+                    if(contains(actorId, slug)) {
+                        outcome = accepted(false)
+                    } else {
+                        edges = Arrays.append(edges, {
+                            actorId: actorId
+                            slug: slug
+                        })
+                        outcome = accepted(true)
+                    }
+                }
+            }
+            outcome
+        }
+
+        unfavoriteFixture: (actorId, slug) => {
+            outcome: null
+            if(identities.findId(actorId) === null) {
+                outcome = rejected("user", "not found")
+            } else {
+                if(!articleExists(slug)) {
+                    outcome = rejected("article", "not found")
+                } else {
+                    if(contains(actorId, slug)) {
+                        edges = Arrays.filter(edges, (edge) => {
+                            !((edge.actorId == actorId) && (edge.slug == slug))
+                        })
+                        outcome = accepted(true)
+                    } else {
+                        outcome = accepted(false)
+                    }
+                }
+            }
+            outcome
+        }
+
+        // The owning article is already deleted by this point. No count
+        // adjustment is needed; the article and its counter no longer exist.
+        removeArticleFixture: (slug) => {
+            edges = Arrays.filter(edges, (edge) => {
+                edge.slug != slug
+            })
+            true
+        }
+    }
+
+    store
+}

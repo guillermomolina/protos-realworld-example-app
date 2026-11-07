@@ -14,6 +14,7 @@ Identities: import("./IdentityStore.protos")
 Follows: import("./FollowStore.protos")
 ArticleQuery: import("./ArticleQuery.protos")
 Content: import("./ContentStore.protos")
+Favorites: import("./FavoriteStore.protos")
 
 /// Create an independent in-memory store.
 create: () => {
@@ -27,6 +28,62 @@ create: () => {
     // Fixture article objects are linked to their author IDs when
     // identities exist. Links survive later username changes.
     articleAuthors: []
+
+    articleExists: (slug) => {
+        found: content.has(slug)
+        if(!found) {
+            for(item in items) {
+                if(item.slug == slug) {
+                    found = true
+                }
+            }
+        }
+        found
+    }
+
+    favoritesById: Favorites.create(identities, articleExists)
+
+    // Only a new/deleted favorite edge changes the stored counter.
+    // For managed content, copies returned by ContentStore are never mutated.
+    changeFavoriteCount: (slug, delta) => {
+        if(content.has(slug)) {
+            if(delta > 0) {
+                content.incrementFavoriteFixture(slug)
+            } else {
+                content.decrementFavoriteFixture(slug)
+            }
+        } else {
+            for(article in items) {
+                if(article.slug == slug) {
+                    article.favoritesCount = article.favoritesCount + delta
+                }
+            }
+        }
+        true
+    }
+
+    // Convert a previously unknown username's favorite fixtures to stable
+    // identity IDs without incrementing the counts a second time.
+    migrateLegacyFavorites: (actorId, username) => {
+        remaining: []
+        for(entry in favorites) {
+            if(entry.username == username) {
+                migrated: favoritesById.favoriteFixture(actorId, entry.slug)
+                if(migrated.ok) {
+                    if(!migrated.changed) {
+                        // Both representations counted the same user/article.
+                        changeFavoriteCount(entry.slug, -1)
+                    }
+                } else {
+                    remaining = Arrays.append(remaining, entry)
+                }
+            } else {
+                remaining = Arrays.append(remaining, entry)
+            }
+        }
+        favorites = remaining
+        true
+    }
 
     store: {
         // A public profile may be registered explicitly, appear as
@@ -74,11 +131,23 @@ create: () => {
         }
 
         addIdentityFixture: (username, email, bio, image) => {
-            identities.addFixture(username, email, bio, image)
+            result: identities.addFixture(username, email, bio, image)
+            if(result.ok) {
+                migrateLegacyFavorites(result.value.id, username)
+            }
+            result
         }
 
         updateIdentityFixture: (id, username, email, bio, image) => {
-            identities.updateFixture(id, username, email, bio, image)
+            previous: identities.findId(id)
+            result: identities.updateFixture(id, username, email, bio, image)
+            if(result.ok) {
+                migrateLegacyFavorites(id, previous.username)
+                if(username != previous.username) {
+                    migrateLegacyFavorites(id, username)
+                }
+            }
+            result
         }
 
         // Fixture-only social operations: they do not authenticate a caller.
@@ -193,41 +262,71 @@ create: () => {
             value
         }
 
-        // Favorites supplied by test fixtures, not HTTP authentication.
+        // Stable-ID favorite operations are internal trusted fixtures.
+        // These IDs cannot be supplied by an unauthenticated HTTP request.
+        favoriteIdentityFixture: (actorId, slug) => {
+            result: favoritesById.favoriteFixture(actorId, slug)
+            if(result.ok && result.changed) {
+                changeFavoriteCount(slug, 1)
+            }
+            result
+        }
+
+        unfavoriteIdentityFixture: (actorId, slug) => {
+            result: favoritesById.unfavoriteFixture(actorId, slug)
+            if(result.ok && result.changed) {
+                changeFavoriteCount(slug, -1)
+            }
+            result
+        }
+
+        isFavoritedByIdentity: (actorId, slug) => {
+            favoritesById.isFavorited(actorId, slug)
+        }
+
+        favoriteSlugsForIdentity: (actorId) => {
+            favoritesById.slugsFor(actorId)
+        }
+
+        // Public ?favorited=username resolves the current identity, so
+        // changing a username does not break its favorite edges.
         favoriteSlugsFor: (username) => {
             slugs: []
+            actor: identities.findUsername(username)
+            if(actor !== null) {
+                slugs = favoritesById.slugsFor(actor.id)
+            }
+            // Keep pre-identity legacy fixtures working, without duplicates.
             for(entry in favorites) {
-                if(entry.username == username) {
+                if((entry.username == username) &&
+                   !Arrays.contains(slugs, entry.slug)) {
                     slugs = Arrays.append(slugs, entry.slug)
                 }
             }
             slugs
         }
 
-        // Repeated favorites from the same user are ignored.
-        // This keeps favoritesCount consistent with unique user/article pairs.
+        // Legacy fixture API remains available. Known identities are routed
+        // through the stable-ID graph; unknown usernames remain string edges.
         addFavoriteFixture: (username, slug) => {
             article: store.find(slug)
             if(article === null) {
                 Error().signal()
             }
 
-            already: Arrays.contains(store.favoriteSlugsFor(username), slug)
-            if(!already) {
-                favorites = Arrays.append(
-                    favorites,
-                    {
+            actor: identities.findUsername(username)
+            if(actor !== null) {
+                store.favoriteIdentityFixture(actor.id, slug)
+            } else {
+                present: Arrays.contains(store.favoriteSlugsFor(username), slug)
+                if(!present) {
+                    favorites = Arrays.append(favorites, {
                         username: username
                         slug: slug
-                    }
-                )
-                if(content.has(slug)) {
-                    content.incrementFavoriteFixture(slug)
-                } else {
-                    article.favoritesCount = article.favoritesCount + 1
+                    })
+                    changeFavoriteCount(slug, 1)
                 }
             }
-
             store.find(slug)
         }
 
@@ -297,7 +396,9 @@ create: () => {
         deleteOwnedArticleFixture: (actorId, slug) => {
             outcome: content.deleteArticleFixture(actorId, slug)
             if(outcome.ok) {
-                // Prevent orphaned favorite edges and legacy comments.
+                // Remove both stable-ID and legacy edges when content is gone.
+                // The deleted article's counter is removed with the article.
+                favoritesById.removeArticleFixture(slug)
                 favorites = Arrays.filter(favorites, (entry) => {
                     entry.slug != slug
                 })

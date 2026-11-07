@@ -309,6 +309,15 @@ create: (identities) => {
             }
             true
         }
+
+        // Only MemoryStore may call this after deleting a real edge.
+        decrementFavoriteFixture: (slug) => {
+            record: rawArticle(slug)
+            if((record !== null) && (record.favoritesCount > 0)) {
+                record.favoritesCount = record.favoritesCount - 1
+            }
+            true
+        }
     }
 
     store

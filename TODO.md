@@ -10,7 +10,7 @@
 - Public routes: tags, article listing and details, profiles, and comments.
 - Conduit-compatible JSON errors for missing profiles/articles (404) and unauthed protected routes (401); token validation and write operations remain unimplemented.
 - Public article filtering by `tag`, `author`, and `favorited`, including sorting and pagination.
-- Favorites are populated through test fixtures; authenticated favorite mutations are not implemented.
+- Favorites support stable-ID fixture add/remove operations, exact edge uniqueness, idempotency, count maintenance, legacy username-to-ID migration and public `favorited` filtering after identity renames. HTTP favorite mutations remain unauthorized.
 - Router and HTTP/1.1 unit tests use an in-memory duplex; the native two-Worker service has also passed real TCP requests (HTTP 200, 401, 404, 422).
 - Workers snapshot complete HTTP requests for RootActor routing: raw target Bytes, method, version, ordered headers and decoded body Bytes; `std:http/server` enforces a 1 MiB request-body cap (HTTP 413). Application handlers do not interpret credentials or mutation bodies yet.
 - Credential-free identity metadata now has its own Actor-local repository with stable IDs, exact username/email uniqueness, atomic fixture updates, copy-out lookups, and public profiles that omit email/credentials. It is not wired to registration/login mutations and does not contain password hashes or JWTs.
@@ -38,7 +38,7 @@ D247 is closed; D243–D246 remain open. Do not replace the missing cryptographi
 - [x] Add two TCP-accepting Worker Actors while retaining one RootActor-owned application store; validate native HTTP with Protos.
 - [x] Run and record `make test-http-lifecycle` for deterministic two-Worker overlap, request-envelope transport, HTTP 413, drain and abort (reported PASS on 2026-11-07). Manual `quit` starts the RootActor-owned drain; signal-triggered shutdown and `std:http/host` application-module loading remain separate work.
 - [ ] Implement registration, login, current-user lookup, validation, and authorization.
-- [ ] Expose following/unfollowing and the feed via authenticated HTTP handlers; internal fixture graph and feed selection are implemented. Authenticated favorites remain pending.
+- [ ] Expose following/unfollowing, the feed and favorite/unfavorite via authenticated HTTP handlers; their internal stable-ID fixture domains and read integrations are implemented.
 - [ ] Expose article and comment writes over authenticated HTTP after secure identity integration; internal fixture-only creation/update/deletion and read integration are implemented.
 - [ ] Select and integrate durable storage; verify restarts and clean shutdown.
 - [ ] Run the official RealWorld Hurl suite and record the exact revision and results.
