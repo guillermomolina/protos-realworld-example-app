@@ -146,4 +146,35 @@ unknownArticle: handle(
 
 Assertions.require(unknownArticle.status == 404)
 
+// An author who only comments still has a public profile.
+dana: {
+    username: "dana"
+    bio: "I only write comments"
+    image: null
+}
+
+store.addCommentFixture(
+    "second-article",
+    commentFixture(3, "Hello from Dana", dana)
+)
+
+danaResponse: handle(requestOf("/api/profiles/dana"))
+danaProfile: read(danaResponse).value["profile"].value
+
+Assertions.require(danaResponse.status == 200)
+Assertions.require(danaProfile["username"].value == "dana")
+Assertions.require(
+    danaProfile["bio"].value == "I only write comments"
+)
+Assertions.require(danaProfile["following"].value == false)
+
+danaComments: read(
+    handle(requestOf("/api/articles/second-article/comments"))
+).value["comments"].value
+
+Assertions.require(danaComments.size() == 1)
+Assertions.require(
+    danaComments[0].value["author"].value["username"].value == "dana"
+)
+
 true

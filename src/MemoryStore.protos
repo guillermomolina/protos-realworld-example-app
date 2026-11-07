@@ -26,6 +26,14 @@ create: () => {
                 }
             }
 
+            if(found === null) {
+                for(entry in comments) {
+                    if(entry.comment.author.username == username) {
+                        found = entry.comment.author
+                    }
+                }
+            }
+
             found
         }
 
