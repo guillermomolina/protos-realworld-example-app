@@ -6,7 +6,7 @@ This project is **in development**. It is an example of composing ordinary Proto
 
 ## Requirements
 
-- Protos `0.3.451-SNAPSHOT` (required for the native HTTP service entry point)
+- Protos `0.3.452-SNAPSHOT` (includes the standard `Bytes` Actor-transfer fix required by the Worker server)
 - `make`
 
 ## Run the tests
@@ -23,15 +23,17 @@ protos -Dpolyglot.engine.WarnInterpreterOnly=false run-tests.protos
 
 The Truffle option hides the interpreter-only diagnostic; it does not enable a compiler or suppress test failures. If using a different launcher, override `PROTOS` or `PROTOS_ARGS` on the `make` command line.
 
-The tests call the HTTP router directly, and also exercise one HTTP/1.1 exchange over an **in-memory** duplex. They do not start a TCP listener.
+These tests call the HTTP router directly and exercise one HTTP/1.1 exchange over an **in-memory** duplex. They do not start a TCP listener. The separate `make test-http` command tests the running native server over real loopback TCP, using a client written in Protos.
 
 ## Run the native HTTP server
 
 The native Protos CLI can grant explicit TCP authority to the initial RootActor. From the repository root, start the learning server without a Java bootstrap:
 
 ```sh
-protos --allow-network --service=service server.protos
+make serve
 ```
+
+This runs `protos --allow-network --service=service server.protos` with the Makefile's configurable `PROTOS` and `PROTOS_ARGS`.
 
 After the listener has opened, the application prints `REALWORLD_HTTP_READY=127.0.0.1:3000`. In another terminal, try:
 
@@ -42,7 +44,13 @@ curl -i http://127.0.0.1:3000/api/profiles/unknown
 curl -i 'http://127.0.0.1:3000/api/articles?limit=0'
 ```
 
-These four native loopback requests were verified with HTTP statuses 200, 200, 404 and 422 respectively. The in-memory store starts empty, so articles and tags are empty until populated. The server listens only on `127.0.0.1:3000` and handles one HTTP/1.1 request per connection **sequentially** through `std:http/server`. This is a learning entry point, not a concurrent production host. Ctrl-C ends the process; graceful drain/shutdown is not implemented.
+With `make serve` still running, run the focused Protos HTTP integration test from a second terminal:
+
+```sh
+make test-http
+```
+
+On Protos `0.3.452-SNAPSHOT`, this test passed for four native loopback requests with statuses 200, 200, 404 and 422. The in-memory store starts empty, so articles and tags are empty until populated. The server listens only on `127.0.0.1:3000`. Two Worker Actors accept connections through delegated `TcpAcceptor` capabilities and run `std:http/server` for one HTTP/1.1 exchange per connection. Each Worker requests its response from the RootActor through a `GroupRef`; the RootActor exclusively owns the mutable `MemoryStore`. This is a bounded learning server, not a production HTTP host. Ctrl-C ends the process; graceful drain/shutdown is not implemented. The current test confirms HTTP correctness, not simultaneous-request throughput or official RealWorld conformance.
 
 `--allow-network` is explicit and applies only to the initial RootActor; it does not grant filesystem access, DNS resolution or Network authority to imported modules and child Actors. Running without the flag does not authorize TCP listening.
 
@@ -69,6 +77,7 @@ src/
   Articles.protos      Article and profile JSON responses
   Comments.protos      Comment JSON responses
   MemoryStore.protos   Temporary in-memory repository
+  HttpWorker.protos    Worker Actor HTTP connection service
   Responses.protos     HTTP response helpers
 
 tests/
@@ -76,10 +85,11 @@ tests/
   slice01-wire-smoke.protos
   slice02-articles-query.protos
   slice03-public-content.protos
+  native-http.protos  Native HTTP integration client (Protos)
 
-server.protos        Native HTTP/1.1 service entry point
+server.protos        RootActor service and Worker bootstrap
 run-tests.protos     Focused test entry point
-Makefile             Test command
+Makefile             test, serve, and test-http commands
 ```
 
 The application uses existing Protos facilities such as `std:http/router`, `std:http/server`, `std:json/json` and `std:collections/array`; it does not implement private replacements for those libraries.
@@ -91,10 +101,10 @@ See [TODO.md](TODO.md) for the remaining work and upstream Protos blockers.
 - User registration, login, signed tokens and authenticated operations
 - Following, authenticated favorite mutations, article mutations and comment mutations
 - Durable storage
-- Concurrent hosting and graceful shutdown (for example with `std:http/host`)
+- Graceful drain/shutdown and optional integration with `std:http/host`
 - Official RealWorld Hurl conformance
 
-The native CLI now supports explicit TCP authority with `--allow-network` and the long-lived RootActor service entry with `--service=service` ([D247](https://github.com/guillermomolina/protos/issues/1073)). It does not grant Filesystem access; durable storage is still pending. `std:http/host` is available for bounded concurrent hosting, but this first application entry point intentionally uses a sequential accept-and-serve loop.
+The native CLI now supports explicit TCP authority with `--allow-network` and the long-lived RootActor service entry with `--service=service` ([D247](https://github.com/guillermomolina/protos/issues/1073)). It does not grant Filesystem access; durable storage is still pending. The app currently composes delegated `TcpAcceptor` capabilities, two Worker Actors and `std:http/server` directly. It does not use `std:http/host`, whose Worker handler import contract is not wired to this standalone CLI application. Standard `Bytes` can cross the Actor boundary in the validated Protos version ([BUG035](https://github.com/guillermomolina/protos/issues/1081)).
 
 The authentication work is waiting for reusable, approved Protos security-library designs rather than adding application-local cryptography. See [D243](https://github.com/guillermomolina/protos/issues/1069), [D244](https://github.com/guillermomolina/protos/issues/1070), [D245](https://github.com/guillermomolina/protos/issues/1071) and [D246](https://github.com/guillermomolina/protos/issues/1072).
 

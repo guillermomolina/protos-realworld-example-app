@@ -1,0 +1,60 @@
+//! HTTP connection Worker for the native RealWorld application.
+//!
+//! This Actor receives an attenuated TcpAcceptor and a GroupRef to the
+//! application service. Neither Network nor MemoryStore is transferred.
+//!
+//! HTTP parsing and connection custody stay here; business logic and
+//! mutable application state remain in the RootActor.
+
+Server: import("std:http/server").Server
+
+/// Build the Worker behavior from explicitly delegated capabilities.
+/// This is a SOURCE bootstrap binding selected by Actor.spawn.
+start: (acceptor, application, workerId) => {
+    handleRequest: (request) => {
+        // Only HTTP metadata crosses the Actor boundary. The RootActor
+        // constructs a transferable response using its sole MemoryStore.
+        application.request(
+            "handle",
+            request.method,
+            request.target
+        ).value()
+    }
+
+    behavior: {
+        /// Initialization handshake used before acceptance begins.
+        ready: () => {
+            true
+        }
+
+        /// Serve successive connections using this Worker's acceptor.
+        /// Each connection carries one HTTP/1.1 request and response.
+        serve: () => {
+            while(true) {
+                connection: acceptor.accept().value()
+                application.send("connectionAccepted", workerId)
+
+                // A failed exchange must not terminate the entire Worker.
+                // The owning Server retires the connection on every outcome.
+                Error.handle(
+                    () => {
+                        Server.serveOne.owning(
+                            connection,
+                            handleRequest,
+                            null
+                        ).value()
+                    },
+                    (error) => {
+                        // The RootActor owns the process writer and logger.
+                        // Do not transfer the Worker-local Error object.
+                        application.send("connectionFailed", workerId)
+                        error
+                    }
+                )
+            }
+            null
+        }
+    }
+
+    behavior
+}

@@ -1,0 +1,63 @@
+//! Native TCP integration checks against an already-running RealWorld server.
+//!
+//! Start the application with `make serve` in another terminal.
+//! Run these assertions with `make test-http`.
+
+Assertions: import("std:test/assertions")
+Client: import("std:http/client").Client
+IpAddress: import("std:network/ip_addresses").IpAddress
+IpEndpoint: import("std:network/ip_endpoints").IpEndpoint
+
+loopback: IpAddress(4, 2130706433)
+
+readBody: (response) => {
+    bytes: Encoding.Latin1.encode("")
+    chunk: response.body.read(4096).value()
+
+    while(chunk !== null) {
+        for(octet in chunk) {
+            bytes.add(octet)
+        }
+        chunk = response.body.read(4096).value()
+    }
+
+    Encoding.UTF8.decode(bytes)
+}
+
+check: (target, expectedStatus, expectedBody) => {
+    connection: network.connectTcp(
+        IpEndpoint(loopback, 3000)
+    ).value()
+
+    request: {
+        method: "GET"
+        target: Encoding.Latin1.encode(target)
+        headers: [
+            ["Host", Encoding.Latin1.encode("127.0.0.1")]
+        ]
+        body: null
+    }
+
+    Client.exchangeOne.owning(
+        connection,
+        request,
+        (response) => {
+            Assertions.require(response.status == expectedStatus)
+            Assertions.require(readBody(response) == expectedBody)
+            true
+        },
+        null
+    ).value()
+}
+
+check("/api/tags", 200, "{\"tags\":[]}")
+check("/api/articles", 200, "{\"articles\":[],\"articlesCount\":0}")
+check("/api/profiles/unknown", 404, "")
+check(
+    "/api/articles?limit=0",
+    422,
+    "{\"errors\":{\"body\":[\"invalid query parameters\"]}}"
+)
+
+print("REALWORLD_NATIVE_HTTP=PASS")
+true

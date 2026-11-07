@@ -3,49 +3,119 @@
 //! Run with:
 //!   protos --allow-network --service=service server.protos
 //!
-//! The CLI grants TCP authority only to this initial RootActor module.
-//! Imported application modules remain independent of network authority.
-//! This first server handles connections sequentially on loopback.
+//! The RootActor owns Network authority and the single mutable MemoryStore.
+//! Two Worker Actors accept connections through explicitly delegated
+//! TcpAcceptor capabilities. Workers request responses from the RootActor;
+//! they cannot access its store or inherit its Network authority.
+//!
+//! Each Worker processes one HTTP connection at a time. This bounds the
+//! application's active sessions to two, without introducing shared state.
 
-Server: import("std:http/server").Server
 IpAddress: import("std:network/ip_addresses").IpAddress
+Level: import("std:logging/level")
+Logger: import("std:logging/logger")
+TextSink: import("std:logging/text_sink")
+ColorMode: import("std:text/color_mode")
+ColoredFormatter: import("std:logging/colored_formatter")
 Store: import("./src/MemoryStore.protos")
 Api: import("./src/Api.protos")
 
-/// RootActor service bootstrap.
-/// Startup I/O happens in the "serve" message, after Actor initialization.
+/// Install the application service behavior on the RootActor.
+/// The bootstrap schedules startup after READY, so listener acquisition
+/// and Worker initialization run in an ordinary Actor message turn.
 service: () => {
     writer: TextWriter(
         process.stdout(),
         process.stdoutEncoding()
     )
+    // All output authority stays with the RootActor. Workers send only data.
+    log: Logger(Level.INFO, TextSink(
+        ColoredFormatter(ColorMode.ALWAYS, false),
+        writer
+    )).with(
+        %{ "component": "realworld" }
+    )
 
     store: Store.create()
     handler: Api.make(store)
+
+    // A GroupRef grants request/reply communication with this service
+    // without granting Workers permission to stop the RootActor.
+    application: Actor.group(Actor.current())
+
+    listener: null
+    workers: []
+
     behavior: {
-        serve: () => {
-            // Bind only to 127.0.0.1:3000, not all network interfaces.
-            listener: network.listenTcp(
+        start: () => {
+            listener = network.listenTcp(
                 ipVersion: 4,
                 address: IpAddress(4, 2130706433),
                 port: 3000
             ).value()
 
-            // Listener readiness is distinct from RootActor readiness.
+            // Every Worker receives a separate Actor-local representation
+            // of acceptance authority for the same logical listener.
+            for(index, 0, 2) {
+                worker: Actor.spawn(
+                    "./src/HttpWorker.protos",
+                    "start",
+                    listener.acceptCapability(),
+                    application,
+                    index
+                )
+
+                // Confirm that the Worker initialized successfully before
+                // dispatching its long-running acceptance service.
+                worker.request("ready").value()
+                workers = Array(...workers, worker)
+            }
+
+            for(worker in workers) {
+                worker.send("serve")
+            }
+
+            // Announce readiness only after the listener exists and both
+            // Worker behaviors are initialized and scheduled to serve.
+            log.info("http listener ready", %{
+                "address": "127.0.0.1"
+                "port": 3000
+                "workers": 2
+            })
+            // Kept as a simple, stable readiness marker for CLI consumers.
             writer.writeLine(
                 "REALWORLD_HTTP_READY=127.0.0.1:3000"
             ).value()
-
-            // One HTTP request per accepted TCP connection.
-            // Server.serveOne.owning closes each connection afterward.
-            while(true) {
-                connection: listener.accept().value()
-                Server.serveOne.owning(connection, handler, null).value()
-            }
             null
         }
+
+        // Only transferable request metadata crosses the Actor boundary.
+        // TCP connections and request-body streams remain with the Worker.
+        // The current public endpoints do not consume request bodies.
+        connectionAccepted: (workerId) => {
+            log.info("tcp connection accepted", %{ "worker": workerId })
+            null
+        }
+        connectionFailed: (workerId) => {
+            log.error("http session failed", %{ "worker": workerId })
+            null
+        }
+        handle: (method, target) => {
+            response: handler({
+                method: method
+                target: target
+            })
+            // This records the generated response, not a completed TCP write.
+            // Deliberately omit target/query and headers to avoid logging secrets.
+            log.info("http response prepared", %{
+                "method": method
+                "status": response.status
+            })
+            response
+        }
+
     }
 
-    Actor.current().send("serve")
+    Actor.current().send("start")
     behavior
 }
