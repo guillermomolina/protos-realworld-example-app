@@ -93,7 +93,7 @@ feedResponse: handle(requestOf("GET", "/api/articles/feed"))
 Assertions.require(feedResponse.status == 401)
 
 methodResponse: handle(requestOf("POST", "/api/articles"))
-Assertions.require(methodResponse.status == 405)
+Assertions.require(methodResponse.status == 401)
 
 unknownResponse: handle(requestOf("GET", "/api/unknown"))
 Assertions.require(unknownResponse.status == 404)

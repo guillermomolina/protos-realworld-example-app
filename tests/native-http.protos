@@ -52,12 +52,17 @@ check: (target, expectedStatus, expectedBody) => {
 
 check("/api/tags", 200, "{\"tags\":[]}")
 check("/api/articles", 200, "{\"articles\":[],\"articlesCount\":0}")
-check("/api/profiles/unknown", 404, "")
+check("/api/profiles/unknown", 404, "{\"errors\":{\"profile\":[\"not found\"]}}")
 check(
     "/api/articles?limit=0",
     422,
     "{\"errors\":{\"body\":[\"invalid query parameters\"]}}"
 )
+
+check("/api/articles/unknown", 404, "{\"errors\":{\"article\":[\"not found\"]}}")
+check("/api/articles/unknown/comments", 404, "{\"errors\":{\"article\":[\"not found\"]}}")
+check("/api/user", 401, "{\"errors\":{\"token\":[\"is missing\"]}}")
+check("/api/articles/feed", 401, "{\"errors\":{\"token\":[\"is missing\"]}}")
 
 print("REALWORLD_NATIVE_HTTP=PASS")
 true

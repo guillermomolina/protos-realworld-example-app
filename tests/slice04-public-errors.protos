@@ -1,0 +1,54 @@
+//! Official RealWorld negative-contract regressions, without JWT support.
+//!
+//! The assertions mirror missing-token and missing-resource observations from
+//! upstream specs/api/hurl/errors_{auth,articles,profiles,comments}.hurl.
+//! Full Hurl conformance is not claimed by these focused tests.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Store: import("../src/MemoryStore.protos")
+Api: import("../src/Api.protos")
+
+handler: Api.make(Store.create())
+
+requestOf: (method, target) => {
+    {
+        method: method
+        target: Encoding.Latin1.encode(target)
+    }
+}
+
+checkError: (method, target, status, field, message) => {
+    response: handler(requestOf(method, target))
+    Assertions.require(response.status == status)
+    Assertions.require(response.body !== null)
+    Assertions.require(response.headers.size() == 1)
+    decoded: JSON.parse(Encoding.UTF8.decode(response.body))
+    errors: decoded.value["errors"].value
+    Assertions.require(errors.containsKey(field))
+    values: errors[field].value
+    Assertions.require(values.size() == 1)
+    Assertions.require(values[0].value == message)
+    true
+}
+
+// Public missing resources: 404 with the named resource in the JSON errors map.
+checkError("GET", "/api/profiles/unknown", 404, "profile", "not found")
+checkError("GET", "/api/articles/unknown", 404, "article", "not found")
+checkError("GET", "/api/articles/unknown/comments", 404, "article", "not found")
+
+// Protected operations: no valid authentication is available in this slice.
+checkError("GET", "/api/user", 401, "token", "is missing")
+checkError("PUT", "/api/user", 401, "token", "is missing")
+checkError("GET", "/api/articles/feed", 401, "token", "is missing")
+checkError("POST", "/api/articles", 401, "token", "is missing")
+checkError("PUT", "/api/articles/some-slug", 401, "token", "is missing")
+checkError("DELETE", "/api/articles/some-slug", 401, "token", "is missing")
+checkError("POST", "/api/articles/some-slug/favorite", 401, "token", "is missing")
+checkError("DELETE", "/api/articles/some-slug/favorite", 401, "token", "is missing")
+checkError("POST", "/api/articles/some-slug/comments", 401, "token", "is missing")
+checkError("DELETE", "/api/articles/some-slug/comments/1", 401, "token", "is missing")
+checkError("POST", "/api/profiles/unknown/follow", 401, "token", "is missing")
+checkError("DELETE", "/api/profiles/unknown/follow", 401, "token", "is missing")
+
+true

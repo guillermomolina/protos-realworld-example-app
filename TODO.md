@@ -3,6 +3,7 @@
 ## Current validated state
 
 - Public routes: tags, article listing and details, profiles, and comments.
+- Conduit-compatible JSON errors for missing profiles/articles (404) and unauthed protected routes (401); token validation and write operations remain unimplemented.
 - Public article filtering by `tag`, `author`, and `favorited`, including sorting and pagination.
 - Favorites are populated through test fixtures; authenticated favorite mutations are not implemented.
 - Router and HTTP/1.1 unit tests use an in-memory duplex; the native two-Worker service also passed the Protos loopback TCP client for four requests (HTTP 200, 200, 404, 422).

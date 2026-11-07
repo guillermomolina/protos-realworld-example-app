@@ -21,22 +21,26 @@ json: (status, node) => {
     }
 }
 
-/// Return a bodyless HTTP 404 for an unknown resource.
-notFound: () => {
-    {
-        status: 404
-        headers: []
-        body: null
-    }
+/// Produce the RealWorld field-specific error envelope.
+/// The field is supplied by a known route, never from untrusted input.
+error: (status, field, message) => {
+    json(
+        status,
+        JSON.object(
+            "errors",
+            JSON.object(field, JSON.array(JSON.string(message)))
+        )
+    )
 }
 
-/// Return HTTP 401 when an endpoint requires authentication.
+/// Conduit 404: name the missing resource, e.g. "article" or "profile".
+notFound: (field) => {
+    error(404, field, "not found")
+}
+
+/// Conduit 401: there is no authenticated principal in the current slice.
 unauthorized: () => {
-    {
-        status: 401
-        headers: []
-        body: null
-    }
+    error(401, "token", "is missing")
 }
 
 

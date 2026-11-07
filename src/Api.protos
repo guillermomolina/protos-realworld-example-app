@@ -17,7 +17,68 @@ Responses: import("./Responses.protos")
 /// The result can be passed to std:http/server or std:http/host.
 /// No global application state or network authority is required.
 make: (store) => {
+    // Authentication is not yet provisioned. Protected operations fail closed
+    // before looking up a resource or mutating the store. No JWT is accepted.
+    authRequired: (request, match) => {
+        Responses.unauthorized()
+    }
+
     Router.compile([
+        {
+            method: "GET"
+            path: "/api/user"
+            handle: authRequired
+        },
+        {
+            method: "PUT"
+            path: "/api/user"
+            handle: authRequired
+        },
+        {
+            method: "POST"
+            path: "/api/profiles/{username}/follow"
+            handle: authRequired
+        },
+        {
+            method: "DELETE"
+            path: "/api/profiles/{username}/follow"
+            handle: authRequired
+        },
+        {
+            method: "POST"
+            path: "/api/articles"
+            handle: authRequired
+        },
+        {
+            method: "PUT"
+            path: "/api/articles/{slug}"
+            handle: authRequired
+        },
+        {
+            method: "DELETE"
+            path: "/api/articles/{slug}"
+            handle: authRequired
+        },
+        {
+            method: "POST"
+            path: "/api/articles/{slug}/favorite"
+            handle: authRequired
+        },
+        {
+            method: "DELETE"
+            path: "/api/articles/{slug}/favorite"
+            handle: authRequired
+        },
+        {
+            method: "POST"
+            path: "/api/articles/{slug}/comments"
+            handle: authRequired
+        },
+        {
+            method: "DELETE"
+            path: "/api/articles/{slug}/comments/{id}"
+            handle: authRequired
+        },
         {
             method: "GET"
             path: "/api/profiles/{username}"
@@ -25,7 +86,7 @@ make: (store) => {
                 profile: store.findProfile(match.params["username"])
 
                 if(profile === null) {
-                    Responses.notFound()
+                    Responses.notFound("profile")
                 } else {
                     Responses.json(
                         200,
@@ -42,7 +103,7 @@ make: (store) => {
                 article: store.find(slug)
 
                 if(article === null) {
-                    Responses.notFound()
+                    Responses.notFound("article")
                 } else {
                     Responses.json(
                         200,
@@ -119,7 +180,7 @@ make: (store) => {
                 found: store.find(match.params["slug"])
                 answer: null
                 if(found === null) {
-                    answer = Responses.notFound()
+                    answer = Responses.notFound("article")
                 } else {
                     answer = Responses.json(200, Articles.single(found))
                 }

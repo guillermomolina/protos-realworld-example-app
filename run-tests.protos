@@ -12,4 +12,7 @@ print("SLICE02_ARTICLES_QUERY=PASS")
 import("./tests/slice03-public-content.protos")
 print("SLICE03_PUBLIC_CONTENT=PASS")
 
+import("./tests/slice04-public-errors.protos")
+print("SLICE04_PUBLIC_ERRORS=PASS")
+
 true
