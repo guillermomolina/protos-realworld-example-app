@@ -1,0 +1,51 @@
+//! Native HTTP entry point for the RealWorld learning application.
+//!
+//! Run with:
+//!   protos --allow-network --service=service server.protos
+//!
+//! The CLI grants TCP authority only to this initial RootActor module.
+//! Imported application modules remain independent of network authority.
+//! This first server handles connections sequentially on loopback.
+
+Server: import("std:http/server").Server
+IpAddress: import("std:network/ip_addresses").IpAddress
+Store: import("./src/MemoryStore.protos")
+Api: import("./src/Api.protos")
+
+/// RootActor service bootstrap.
+/// Startup I/O happens in the "serve" message, after Actor initialization.
+service: () => {
+    writer: TextWriter(
+        process.stdout(),
+        process.stdoutEncoding()
+    )
+
+    store: Store.create()
+    handler: Api.make(store)
+    behavior: {
+        serve: () => {
+            // Bind only to 127.0.0.1:3000, not all network interfaces.
+            listener: network.listenTcp(
+                ipVersion: 4,
+                address: IpAddress(4, 2130706433),
+                port: 3000
+            ).value()
+
+            // Listener readiness is distinct from RootActor readiness.
+            writer.writeLine(
+                "REALWORLD_HTTP_READY=127.0.0.1:3000"
+            ).value()
+
+            // One HTTP request per accepted TCP connection.
+            // Server.serveOne.owning closes each connection afterward.
+            while(true) {
+                connection: listener.accept().value()
+                Server.serveOne.owning(connection, handler, null).value()
+            }
+            null
+        }
+    }
+
+    Actor.current().send("serve")
+    behavior
+}
