@@ -90,6 +90,106 @@ for(i, 0, expectedBody.size()) {
     }
 }
 
+
 Assertions.require(matches)
+
+// Additional HTTP/1.1 exchanges over the existing in-memory duplex.
+// JSON contents are checked by the other focal tests.
+author: {
+    username: "wire-author"
+    bio: null
+    image: null
+}
+
+store.addFixture({
+    slug: "wire-article"
+    title: "Wire article"
+    description: "HTTP test"
+    body: "Article body"
+    tagList: ["protos"]
+    createdAt: "2026-11-01T00:00:00.000Z"
+    updatedAt: "2026-11-01T00:00:00.000Z"
+    favoritesCount: 0
+    author: author
+})
+
+store.addCommentFixture(
+    "wire-article",
+    {
+        id: 1
+        body: "First comment"
+        createdAt: "2026-11-02T00:00:00.000Z"
+        updatedAt: "2026-11-02T00:00:00.000Z"
+        author: author
+    }
+)
+
+checkWire: (target, statusText) => {
+    expected: handle({
+        method: "GET"
+        target: Encoding.Latin1.encode(target)
+    })
+
+    exchange: duplexOf(
+        "GET " + target + " HTTP/1.1\r\n" +
+        "Host: localhost\r\n" +
+        "\r\n"
+    )
+
+    Server.serveOne.owning(exchange, handle, null).value()
+
+    bytes: exchange.writtenBytes()
+    statusBytes: Encoding.Latin1.encode(statusText)
+
+    Assertions.require(exchange.isClosed())
+    Assertions.require(bytes.size() >= 12)
+
+    for(i, 0, 3) {
+        Assertions.require(bytes[9 + i] == statusBytes[i])
+    }
+
+    // Locate the standard HTTP header/body separator.
+    bodyStart: -1
+    index: 0
+
+    while((index + 3 < bytes.size()) && (bodyStart < 0)) {
+        if(
+            (bytes[index] == 13) &&
+            (bytes[index + 1] == 10) &&
+            (bytes[index + 2] == 13) &&
+            (bytes[index + 3] == 10)
+        ) {
+            bodyStart = index + 4
+        }
+        index = index + 1
+    }
+
+    Assertions.require(bodyStart >= 0)
+
+    expectedBody: expected.body
+
+    if(expectedBody === null) {
+        Assertions.require(bodyStart == bytes.size())
+    } else {
+        Assertions.require(
+            bytes.size() - bodyStart == expectedBody.size()
+        )
+
+        for(i, 0, expectedBody.size()) {
+            Assertions.require(
+                bytes[bodyStart + i] == expectedBody[i]
+            )
+        }
+    }
+
+    true
+}
+
+checkWire("/api/articles?limit=1", "200")
+checkWire("/api/articles/wire-article", "200")
+checkWire("/api/profiles/wire-author", "200")
+checkWire("/api/articles/wire-article/comments", "200")
+checkWire("/api/profiles/unknown", "404")
+checkWire("/api/articles?limit=0", "422")
 
 true
