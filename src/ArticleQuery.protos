@@ -165,7 +165,7 @@ laterThan: (left, right) => {
     later
 }
 
-select: (articles, options) => {
+select: (articles, options, favoriteSlugs) => {
     parameters: options.parameters
 
     filtered: Arrays.filter(articles, (article) => {
@@ -181,9 +181,9 @@ select: (articles, options) => {
                 (article.author.username == parameters["author"])
         }
 
-        // No fixture has user favorites in the temporary store.
         if(parameters.containsKey("favorited")) {
-            included = false
+            included = included &&
+                Arrays.contains(favoriteSlugs, article.slug)
         }
 
         included

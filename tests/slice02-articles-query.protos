@@ -152,4 +152,102 @@ Assertions.require(
     errorNode.value["errors"].value["body"].value.size() == 1
 )
 
+// Last partially filled page preserves the total count.
+lastPageResponse: handle(requestOf("/api/articles?limit=2&offset=2"))
+lastPage: read(lastPageResponse)
+Assertions.require(lastPageResponse.status == 200)
+Assertions.require(lastPage.value["articlesCount"].value.coefficient == 3)
+Assertions.require(lastPage.value["articles"].value.size() == 1)
+Assertions.require(
+    lastPage.value["articles"].value[0].value["slug"].value == "old"
+)
+
+// A missing tag matches no articles.
+missingTag: read(handle(requestOf("/api/articles?tag=unknown")))
+Assertions.require(missingTag.value["articlesCount"].value.coefficient == 0)
+Assertions.require(missingTag.value["articles"].value.size() == 0)
+
+// Empty and nonnumeric pagination values are invalid.
+Assertions.require(
+    handle(requestOf("/api/articles?limit=")).status == 422
+)
+Assertions.require(
+    handle(requestOf("/api/articles?offset=")).status == 422
+)
+Assertions.require(
+    handle(requestOf("/api/articles?limit=1x")).status == 422
+)
+
+
+// Public favorite filtering uses fixture data, without JWT.
+store.addFavoriteFixture("alice", "old")
+store.addFavoriteFixture("alice", "new")
+store.addFavoriteFixture("alice", "new")
+store.addFavoriteFixture("bob", "middle")
+
+favoritedAliceResponse: handle(
+    requestOf("/api/articles?favorited=alice")
+)
+favoritedAlice: read(favoritedAliceResponse)
+
+Assertions.require(favoritedAliceResponse.status == 200)
+Assertions.require(
+    favoritedAlice.value["articlesCount"].value.coefficient == 2
+)
+Assertions.require(
+    favoritedAlice.value["articles"].value[0].value["slug"].value == "new"
+)
+Assertions.require(
+    favoritedAlice.value["articles"].value[1].value["slug"].value == "old"
+)
+
+// Repeated favorite fixtures do not increase the count twice.
+Assertions.require(
+    favoritedAlice.value["articles"].value[0].value["favoritesCount"]
+        .value.coefficient == 1
+)
+
+// Favorite, tag, author and pagination filters compose normally.
+filteredFavorites: read(handle(requestOf(
+    "/api/articles?favorited=alice&tag=protos&author=alice"
+)))
+Assertions.require(
+    filteredFavorites.value["articlesCount"].value.coefficient == 1
+)
+Assertions.require(
+    filteredFavorites.value["articles"].value[0].value["slug"].value == "old"
+)
+
+favoritePage: read(handle(requestOf(
+    "/api/articles?favorited=alice&limit=1&offset=1"
+)))
+Assertions.require(
+    favoritePage.value["articlesCount"].value.coefficient == 2
+)
+Assertions.require(
+    favoritePage.value["articles"].value[0].value["slug"].value == "old"
+)
+
+bobFavorites: read(handle(
+    requestOf("/api/articles?favorited=bob")
+))
+Assertions.require(
+    bobFavorites.value["articlesCount"].value.coefficient == 1
+)
+Assertions.require(
+    bobFavorites.value["articles"].value[0].value["slug"].value == "middle"
+)
+
+unknownFavorites: read(handle(
+    requestOf("/api/articles?favorited=unknown")
+))
+Assertions.require(
+    unknownFavorites.value["articlesCount"].value.coefficient == 0
+)
+
+// Without a viewer identity, "favorited" in article JSON remains false.
+Assertions.require(
+    favoritedAlice.value["articles"].value[0].value["favorited"].value == false
+)
+
 true

@@ -72,7 +72,16 @@ make: (store) => {
                 if(invalid) {
                     answer = Responses.invalidQuery()
                 } else {
-                    selected: ArticleQuery.select(store.all(), options)
+                    favoriteSlugs: []
+                    if(options.parameters.containsKey("favorited")) {
+                        favoriteSlugs = store.favoriteSlugsFor(
+                            options.parameters["favorited"]
+                        )
+                    }
+
+                    selected: ArticleQuery.select(
+                        store.all(), options, favoriteSlugs
+                    )
                     answer = Responses.json(
                         200,
                         Articles.list(selected.page, selected.total)

@@ -7,6 +7,7 @@ create: () => {
     items: []
     profiles: []
     comments: []
+    favorites: []
 
     store: {
         findProfile: (username) => {
@@ -63,6 +64,38 @@ create: () => {
                 }
             )
             value
+        }
+
+        // Favorites supplied by test fixtures, not HTTP authentication.
+        favoriteSlugsFor: (username) => {
+            slugs: []
+            for(entry in favorites) {
+                if(entry.username == username) {
+                    slugs = Arrays.append(slugs, entry.slug)
+                }
+            }
+            slugs
+        }
+
+        addFavoriteFixture: (username, slug) => {
+            article: store.find(slug)
+            if(article === null) {
+                Error().signal()
+            }
+
+            already: Arrays.contains(store.favoriteSlugsFor(username), slug)
+            if(!already) {
+                favorites = Arrays.append(
+                    favorites,
+                    {
+                        username: username
+                        slug: slug
+                    }
+                )
+                article.favoritesCount = article.favoritesCount + 1
+            }
+
+            article
         }
 
         all: () => {

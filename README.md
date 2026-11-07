@@ -30,7 +30,7 @@ The tests call the HTTP router directly, and also exercise one HTTP/1.1 exchange
 | Route | Behavior |
 | --- | --- |
 | `GET /api/tags` | Distinct tags from the current in-memory articles |
-| `GET /api/articles` | Public article list, tag/author filters, ordering and pagination |
+| `GET /api/articles` | Public article list, tag/author/favorited filters, ordering and pagination |
 | `GET /api/articles/:slug` | Public article details |
 | `GET /api/profiles/:username` | Public profile lookup |
 | `GET /api/articles/:slug/comments` | Public comments for an article |
@@ -62,10 +62,12 @@ Makefile             Test command
 
 The application uses existing Protos facilities such as `std:http/router`, `std:http/server`, `std:json/json` and `std:collections/array`; it does not implement private replacements for those libraries.
 
+See [TODO.md](TODO.md) for the remaining work and upstream Protos blockers.
+
 ## What is not implemented yet
 
 - User registration, login, signed tokens and authenticated operations
-- Following, favorites, authenticated article mutations and comment mutations
+- Following, authenticated favorite mutations, article mutations and comment mutations
 - Durable storage
 - TCP server startup and shutdown
 - Official RealWorld Hurl conformance
