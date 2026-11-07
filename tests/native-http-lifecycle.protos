@@ -63,6 +63,48 @@ checkUnblockedRequest: (network, endpoint) => {
     }, null).value()
 }
 
+// Verify that the Worker transfers the decoded body and original field
+// ordering/casing as a snapshot through the real Actor request/reply path.
+checkTransferred: (network, endpoint, target, body) => {
+    connection: network.connectTcp(endpoint).value()
+    request: {
+        method: "POST"
+        target: Encoding.Latin1.encode(target)
+        headers: [
+            ["Host", Encoding.Latin1.encode("127.0.0.1")],
+            ["Authorization", Encoding.Latin1.encode("Token not-real")],
+            ["X-Probe", Encoding.Latin1.encode("first")],
+            ["x-probe", Encoding.Latin1.encode("second")]
+        ]
+        body: body
+    }
+    Client.exchangeOne.owning(connection, request, (response) => {
+        Assertions.require(response.status == 204)
+        true
+    }, null).value()
+}
+
+// The raw request probe also covers chunked decoding and early body limits;
+// the standard Client intentionally writes Content-Length, not chunked.
+checkRawStatus: (network, endpoint, wire, expectedStatus) => {
+    connection: network.connectTcp(endpoint).value()
+    connection.write(Encoding.Latin1.encode(wire)).value()
+    bytes: Encoding.Latin1.encode("")
+    chunk: connection.read(4096).value()
+    while(chunk !== null) {
+        for(octet in chunk) {
+            bytes.add(octet)
+        }
+        chunk = connection.read(4096).value()
+    }
+    prefix: Encoding.Latin1.encode("HTTP/1.1 " + expectedStatus)
+    Assertions.require(bytes.size() >= prefix.size())
+    for(index, 0, prefix.size()) {
+        Assertions.require(bytes[index] == prefix[index])
+    }
+    connection.close().value()
+}
+
 // Read the raw held HTTP response to EOF. Assert its exact status prefix,
 // without depending on packet/read chunk boundaries.
 finishHeldRequest: (connection) => {
@@ -123,11 +165,66 @@ service: (network, writer) => {
             failures = failures + 1
             null
         }
-        handle: (method, target) => {
-            handler({
-                method: method
-                target: target
-            })
+        handle: (request) => {
+            // Fixture-only probes stay in the RootActor.
+            target: Encoding.Latin1.decode(request.target)
+
+            if(target == "/__worker_probe__") {
+                Assertions.require(request.method == "POST")
+                Assertions.require(request.version == "1.1")
+                Assertions.require(
+                    Encoding.UTF8.decode(request.body) ==
+                        "{\"article\":{\"body\":\"mañana\"}}"
+                )
+                probes: []
+                authorization: false
+                for(field in request.headers) {
+                    if(field[0] == "X-Probe" || field[0] == "x-probe") {
+                        probes = Array(...probes, field)
+                    }
+                    if(field[0] == "Authorization") {
+                        authorization =
+                            Encoding.Latin1.decode(field[1]) == "Token not-real"
+                    }
+                }
+                Assertions.require(authorization)
+                Assertions.require(probes.size() == 2)
+                Assertions.require(probes[0][0] == "X-Probe")
+                Assertions.require(probes[1][0] == "x-probe")
+                Assertions.require(Encoding.Latin1.decode(probes[0][1]) == "first")
+                Assertions.require(Encoding.Latin1.decode(probes[1][1]) == "second")
+                {
+                    status: 204
+                    headers: []
+                    body: null
+                }
+            } else {
+                if(target == "/__worker_probe_empty__") {
+                    Assertions.require(request.method == "POST")
+                    Assertions.require(request.version == "1.1")
+                    Assertions.require(request.body.size() == 0)
+                    {
+                        status: 204
+                        headers: []
+                        body: null
+                    }
+                } else {
+                    if(target == "/__worker_probe_chunked__") {
+                        Assertions.require(request.method == "POST")
+                        Assertions.require(request.version == "1.1")
+                        Assertions.require(
+                            Encoding.Latin1.decode(request.body) == "Wikipedia"
+                        )
+                        {
+                            status: 204
+                            headers: []
+                            body: null
+                        }
+                    } else {
+                        handler(request)
+                    }
+                }
+            }
         }
         run: () => {
             acceptedGate = makeGate()
@@ -152,6 +249,36 @@ service: (network, writer) => {
             Assertions.require(acceptedWorkers[0] != acceptedWorkers[1])
             Assertions.require(failures == 0)
             writer.writeLine("REALWORLD_CONCURRENT_WORKERS=PASS").value()
+
+            checkTransferred(
+                network,
+                endpoint,
+                "/__worker_probe__",
+                Encoding.UTF8.encode("{\"article\":{\"body\":\"mañana\"}}")
+            )
+            checkTransferred(network, endpoint, "/__worker_probe_empty__", null)
+            checkRawStatus(
+                network,
+                endpoint,
+                "POST /__worker_probe_chunked__ HTTP/1.1\r\n" +
+                "Host: 127.0.0.1\r\n" +
+                "Transfer-Encoding: chunked\r\n\r\n" +
+                "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+                "204"
+            )
+            writer.writeLine("REALWORLD_HTTP_ENVELOPE=PASS").value()
+
+            // Reject before invoking the handler: a large declared body is
+            // enough to exceed the configured cap without allocating it.
+            checkRawStatus(
+                network,
+                endpoint,
+                "POST /api/articles HTTP/1.1\r\n" +
+                "Host: 127.0.0.1\r\n" +
+                "Content-Length: 1048577\r\n\r\n",
+                "413"
+            )
+            writer.writeLine("REALWORLD_HTTP_LIMIT=PASS").value()
 
             // Drain starts synchronously, before the first in-flight request
             // head is completed. The previously accepted session must survive.

@@ -96,9 +96,9 @@ service: () => {
             null
         }
 
-        // Only transferable request metadata crosses the Actor boundary.
-        // TCP connections and request-body streams remain with the Worker.
-        // The current public endpoints do not consume request bodies.
+        // Workers transfer the request's method, raw target, version,
+        // ordered headers and bounded body Bytes. Connections and live
+        // ByteReadable request streams never leave their Worker Actor.
         connectionAccepted: (workerId) => {
             log.info("tcp connection accepted", %{ "worker": workerId })
             null
@@ -107,15 +107,13 @@ service: () => {
             log.error("http session failed", %{ "worker": workerId })
             null
         }
-        handle: (method, target) => {
-            response: handler({
-                method: method
-                target: target
-            })
+        handle: (request) => {
+            response: handler(request)
             // This records the generated response, not a completed TCP write.
-            // Deliberately omit target/query and headers to avoid logging secrets.
+            // Deliberately omit target/query, headers and body to avoid
+            // logging credentials or other request content.
             log.info("http response prepared", %{
-                "method": method
+                "method": request.method
                 "status": response.status
             })
             response

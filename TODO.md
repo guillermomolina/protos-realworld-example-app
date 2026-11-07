@@ -6,7 +6,8 @@
 - Conduit-compatible JSON errors for missing profiles/articles (404) and unauthed protected routes (401); token validation and write operations remain unimplemented.
 - Public article filtering by `tag`, `author`, and `favorited`, including sorting and pagination.
 - Favorites are populated through test fixtures; authenticated favorite mutations are not implemented.
-- Router and HTTP/1.1 unit tests use an in-memory duplex; the native two-Worker service also passed the Protos loopback TCP client for four requests (HTTP 200, 200, 404, 422).
+- Router and HTTP/1.1 unit tests use an in-memory duplex; the native two-Worker service has also passed real TCP requests (HTTP 200, 401, 404, 422).
+- Workers snapshot complete HTTP requests for RootActor routing: raw target Bytes, method, version, ordered headers and decoded body Bytes; `std:http/server` enforces a 1 MiB request-body cap (HTTP 413). Application handlers do not interpret credentials or mutation bodies yet.
 - `make test` passed in a previous reported local run; `make test-http` passed on Protos `0.3.452-SNAPSHOT` (2026-11-07). The official RealWorld suite has not been run.
 
 `make serve` starts a native TCP listener on `127.0.0.1:3000` using `--allow-network --service=service`. Two Worker Actors accept delegated TCP connections and request application responses from the RootActor, which alone owns `MemoryStore`. `make test-http` exercises the running service with a native Protos HTTP client. Authentication, durable storage, bounded-lifecycle hosting and graceful shutdown are still missing.
@@ -26,7 +27,7 @@ D247 is closed; D243–D246 remain open. Do not replace the missing cryptographi
 
 - [x] Start a native HTTP/1.1 service with an explicit Network grant and `std:http/server`.
 - [x] Add two TCP-accepting Worker Actors while retaining one RootActor-owned application store; validate native HTTP with Protos.
-- [ ] Run and record `make test-http-lifecycle` for a deterministic two-Worker overlap proof plus drain and abort. Manual `quit` starts the RootActor-owned drain; signal-triggered shutdown and `std:http/host` application-module loading remain separate work.
+- [x] Run and record `make test-http-lifecycle` for deterministic two-Worker overlap plus drain and abort (reported PASS on 2026-11-07). The new request-envelope and body-limit checks in this slice still require validation. Manual `quit` starts the RootActor-owned drain; signal-triggered shutdown and `std:http/host` application-module loading remain separate work.
 - [ ] Implement registration, login, current-user lookup, validation, and authorization.
 - [ ] Implement following/unfollowing, authenticated favorites, and the feed.
 - [ ] Create, update, and delete articles and comments.

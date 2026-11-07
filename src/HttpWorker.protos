@@ -18,14 +18,31 @@ start: (acceptor, application, workerId) => {
     active: null
     failureKind: null
 
+    // Std HTTP caps decoded request content at 1 MiB, including chunked
+    // messages. An oversized Content-Length is rejected before the handler;
+    // a late framing/limit failure remains owned by std:http/server.
+    httpLimits: { maxRequestBodyBytes: 1048576 }
+
     handleRequest: (request) => {
-        // Only HTTP metadata crosses the Actor boundary. The RootActor
-        // constructs a transferable response using its sole MemoryStore.
-        application.request(
-            "handle",
-            request.method,
-            request.target
-        ).value()
+        // request.body is a session-scoped ByteReadable and cannot be sent
+        // to another Actor. Consume it while the Worker still owns the HTTP
+        // session, then transfer only ordinary data and Bytes snapshots.
+        content: Encoding.Latin1.encode("")
+        chunk: request.body.read(8192).value()
+        while(chunk !== null) {
+            for(octet in chunk) {
+                content.add(octet)
+            }
+            chunk = request.body.read(8192).value()
+        }
+
+        application.request("handle", {
+            method: request.method
+            target: request.target
+            version: request.version
+            headers: request.headers
+            body: content
+        }).value()
     }
 
     behavior: {
@@ -63,7 +80,7 @@ start: (acceptor, application, workerId) => {
                                 active = Server.serveOne.owning(
                                     connection,
                                     handleRequest,
-                                    null
+                                    httpLimits
                                 )
                                 active.value()
                             },

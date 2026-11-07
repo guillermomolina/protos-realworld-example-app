@@ -61,8 +61,12 @@ The native Protos fixture uses an ephemeral loopback listener and the **same**
 `src/HttpWorker.protos` used by the server. It holds a request header incomplete
 until a Worker acknowledges accepting it, verifies a second Worker completes a
 real HTTP request meanwhile, then initiates drain **before** completing the
-first request. It also exercises cancellation-based abort on a second listener.
+first request. It also verifies cross-Actor HTTP headers and body transport, chunked body
+decoding, an empty request body and early HTTP 413 rejection, then exercises
+cancellation-based abort on a second listener.
 `timeout` bounds potential deadlocks in this native-only integration test.
+The native lifecycle run reports `REALWORLD_HTTP_ENVELOPE=PASS` and
+`REALWORLD_HTTP_LIMIT=PASS` when the new checks pass.
 
 On Protos `0.3.452-SNAPSHOT`, this test passed for four native loopback requests with statuses 200, 200, 404 and 422. The in-memory store starts empty, so articles and tags are empty until populated. The server listens only on `127.0.0.1:3000`. Two Worker Actors accept connections through delegated `TcpAcceptor` capabilities and run `std:http/server` for one HTTP/1.1 exchange per connection. Each Worker requests its response from the RootActor through a `GroupRef`; the RootActor exclusively owns the mutable `MemoryStore`. This is a bounded learning server, not a production HTTP host. Type `quit` and press Enter in the server terminal to request graceful drain: the RootActor closes the listener, waits for admitted sessions, stops both Workers, and then stops itself. Ctrl-C is host termination and is **not** guaranteed to drain. The current `make test-http` verifies HTTP correctness but does not itself establish simultaneous-request throughput or official RealWorld conformance.
 
@@ -77,6 +81,14 @@ On Protos `0.3.452-SNAPSHOT`, this test passed for four native loopback requests
 | `GET /api/articles/:slug` | Public article details |
 | `GET /api/profiles/:username` | Public profile lookup |
 | `GET /api/articles/:slug/comments` | Public comments for an article |
+
+The native Worker now snapshots complete HTTP requests (method, raw target,
+version, ordered and duplicate-preserving header pairs, and decoded body bytes)
+before sending them to the RootActor. It reads the session-owned body locally
+and caps it at **1 MiB** using `std:http/server` limits; over-limit requests
+are rejected with HTTP 413. Only transferable data crosses the Actor boundary:
+no TCP connection, stream or mutable application store is transferred.
+Authentication and mutation handlers do not consume these fields yet.
 
 Public list responses omit the article body, as required by the current RealWorld contract. Public 404 responses identify the missing `article` or `profile` in a JSON `errors` envelope. Protected operations without an authenticated principal return the Conduit 401 `errors.token` envelope; this is not an implementation of token validation or authenticated mutations. The tests also cover missing resources and unauthenticated access to the feed route.
 
