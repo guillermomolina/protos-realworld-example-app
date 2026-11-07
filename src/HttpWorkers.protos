@@ -1,0 +1,119 @@
+//! Actor-local control for RealWorld HTTP Workers.
+//!
+//! The caller owns the listener and retains its close authority. This module
+//! delegates only TcpAcceptor capabilities and keeps every Worker lifecycle
+//! visible through ordinary ActorRef requests and termination Futures.
+//!
+//! drain: stop admitting connections and allow accepted sessions to finish.
+//! abort: stop admitting and cancel outstanding accepts and sessions.
+
+/// Start a fixed number of Workers and wait until they have entered service.
+/// The returned control object and listener never cross the Actor boundary.
+start: (listener, application, workerCount) => {
+    workers: []
+    services: []
+    closing: null
+    stopped: null
+
+    // A Worker is recorded immediately after spawn, before requesting service.
+    Error.handle(
+        () => {
+            for(index, 0, workerCount) {
+                worker: Actor.spawn(
+                    "./HttpWorker.protos",
+                    "start",
+                    listener.acceptCapability(),
+                    application,
+                    index
+                )
+                workers = Array(...workers, worker)
+                services = Array(...services, worker.request("serve"))
+                if(worker.request("ready").value() !== true) {
+                    Error().signal()
+                }
+            }
+        },
+        (failure) => {
+            // A partially started host must not leak its listener or Actors.
+            closing = listener.close()
+            for(worker in workers) {
+                worker.send("abort")
+            }
+            for(worker in workers) {
+                worker.stop()
+            }
+            for(worker in workers) {
+                Error.handle(
+                    () => { worker.termination().value() },
+                    (error) => { error }
+                )
+            }
+            Error.handle(
+                () => { closing.value() },
+                (error) => { error }
+            )
+            failure.signal()
+        }
+    )
+
+    // Stopping starts synchronously on the first shutdown call: admission
+    // cutover and listener close precede the returned observation Future.
+    control: {
+        shutdown: (mode) => {
+            drain: String.recognizes(mode) && (mode == "drain")
+            abort: String.recognizes(mode) && (mode == "abort")
+            if(!(drain || abort)) {
+                Error().signal()
+            }
+            if(stopped === null) {
+                for(worker in workers) {
+                    worker.send(mode)
+                }
+                closing = listener.close()
+                stopped = (() => {
+                    failed: false
+                    // Never stop a Worker while it owns an HTTP connection.
+                    for(service in services) {
+                        Error.handle(
+                            () => {
+                                if(service.value() != "drained") {
+                                    failed = true
+                                }
+                            },
+                            (error) => {
+                                failed = true
+                                error
+                            }
+                        )
+                    }
+                    for(worker in workers) {
+                        worker.stop()
+                    }
+                    for(worker in workers) {
+                        Error.handle(
+                            () => { worker.termination().value() },
+                            (error) => {
+                                failed = true
+                                error
+                            }
+                        )
+                    }
+                    Error.handle(
+                        () => { closing.value() },
+                        (error) => {
+                            failed = true
+                            error
+                        }
+                    )
+                    if(failed) {
+                        Error().signal()
+                    }
+                    true
+                }).future()
+            }
+            // Cancellation of an observer does not cancel the shutdown Task.
+            (() => { stopped.value() }).future()
+        }
+    }
+    control
+}

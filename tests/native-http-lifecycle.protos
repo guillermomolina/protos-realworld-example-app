@@ -1,0 +1,193 @@
+//! Self-contained native Actor HTTP concurrency and shutdown integration test.
+//!
+//! Run with --allow-network --service=service: the RootActor creates an
+//! ephemeral loopback listener, delegates two acceptors, acts as the test
+//! client and validates the actual RealWorld Worker module.
+//! No production HTTP test-only route or external Python/Java client is used.
+
+Assertions: import("std:test/assertions")
+Client: import("std:http/client").Client
+IpAddress: import("std:network/ip_addresses").IpAddress
+IpEndpoint: import("std:network/ip_endpoints").IpEndpoint
+HttpWorkers: import("../src/HttpWorkers.protos")
+Store: import("../src/MemoryStore.protos")
+Api: import("../src/Api.protos")
+
+loopback: IpAddress(4, 2130706433)
+
+// A cancellation-backed one-shot notification, following the same approach
+// used by the Standard Library HTTP host's Worker readiness gate. This avoids
+// time-based sleeps and cannot busy-spin an Actor that must receive messages.
+makeGate: () => {
+    blocker: (() => { Actor.current().termination().value() }).future()
+    opened: (() => {
+        Error.handle(
+            () => { blocker.value() },
+            (error) => { error }
+        )
+        true
+    }).future()
+    {
+        wait: () => { opened.value() }
+        open: () => { blocker.cancel() }
+    }
+}
+
+readBody: (response) => {
+    bytes: Encoding.Latin1.encode("")
+    chunk: response.body.read(4096).value()
+    while(chunk !== null) {
+        for(octet in chunk) {
+            bytes.add(octet)
+        }
+        chunk = response.body.read(4096).value()
+    }
+    Encoding.UTF8.decode(bytes)
+}
+
+request: {
+    method: "GET"
+    target: Encoding.Latin1.encode("/api/tags")
+    headers: [["Host", Encoding.Latin1.encode("127.0.0.1")]]
+    body: null
+}
+
+// Test one complete HTTP exchange while another Worker is occupied by an
+// accepted, deliberately incomplete HTTP request head.
+checkUnblockedRequest: (network, endpoint) => {
+    connection: network.connectTcp(endpoint).value()
+    Client.exchangeOne.owning(connection, request, (response) => {
+        Assertions.require(response.status == 200)
+        Assertions.require(readBody(response) == "{\"tags\":[]}")
+        true
+    }, null).value()
+}
+
+// Read the raw held HTTP response to EOF. Assert its exact status prefix,
+// without depending on packet/read chunk boundaries.
+finishHeldRequest: (connection) => {
+    connection.write(Encoding.Latin1.encode("\r\n")).value()
+    bytes: Encoding.Latin1.encode("")
+    chunk: connection.read(4096).value()
+    while(chunk !== null) {
+        for(octet in chunk) {
+            bytes.add(octet)
+        }
+        chunk = connection.read(4096).value()
+    }
+    expected: Encoding.Latin1.encode("HTTP/1.1 200")
+    Assertions.require(bytes.size() >= expected.size())
+    for(index, 0, expected.size()) {
+        Assertions.require(bytes[index] == expected[index])
+    }
+    connection.close().value()
+}
+
+// Listener is closed after shutdown, so no new TCP connection can be acquired.
+checkClosed: (network, endpoint) => {
+    rejected: false
+    unexpected: null
+    Error.handle(
+        () => { unexpected = network.connectTcp(endpoint).value() },
+        (error) => {
+            rejected = true
+            error
+        }
+    )
+    if(unexpected !== null) {
+        unexpected.close().value()
+    }
+    Assertions.require(rejected)
+}
+
+service: (network, writer) => {
+    writer.writeLine("REALWORLD_LIFECYCLE_BOOT=BEGIN").value()
+    store: Store.create()
+    handler: Api.make(store)
+    application: Actor.group(Actor.current())
+    listener: null
+    host: null
+    acceptedWorkers: []
+    acceptedGate: null
+    failures: 0
+
+    behavior: {
+        connectionAccepted: (workerId) => {
+            acceptedWorkers = Array(...acceptedWorkers, workerId)
+            if(acceptedWorkers.size() == 1) {
+                acceptedGate.open()
+            }
+            null
+        }
+        connectionFailed: (workerId) => {
+            failures = failures + 1
+            null
+        }
+        handle: (method, target) => {
+            handler({
+                method: method
+                target: target
+            })
+        }
+        run: () => {
+            acceptedGate = makeGate()
+            listener = network.listenTcp(
+                ipVersion: 4,
+                address: loopback,
+                port: null
+            ).value()
+            endpoint: IpEndpoint(loopback, listener.localPort())
+            host = HttpWorkers.start(listener, application, 2)
+
+            // Hold one Worker on a partial HTTP head, and wait for the
+            // corresponding Actor message before opening the second client.
+            held: network.connectTcp(endpoint).value()
+            held.write(Encoding.Latin1.encode(
+                "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            )).value()
+            acceptedGate.wait()
+            Assertions.require(acceptedWorkers.size() == 1)
+            checkUnblockedRequest(network, endpoint)
+            Assertions.require(acceptedWorkers.size() == 2)
+            Assertions.require(acceptedWorkers[0] != acceptedWorkers[1])
+            Assertions.require(failures == 0)
+            writer.writeLine("REALWORLD_CONCURRENT_WORKERS=PASS").value()
+
+            // Drain starts synchronously, before the first in-flight request
+            // head is completed. The previously accepted session must survive.
+            closing: host.shutdown("drain")
+            finishHeldRequest(held)
+            Assertions.require(closing.value() === true)
+            checkClosed(network, endpoint)
+            writer.writeLine("REALWORLD_HTTP_DRAIN=PASS").value()
+
+            // Abort a separate listener with an admitted but incomplete
+            // request, checking that cancellation and owning cleanup finish.
+            acceptedWorkers = []
+            acceptedGate = makeGate()
+            listener = network.listenTcp(
+                ipVersion: 4,
+                address: loopback,
+                port: null
+            ).value()
+            endpoint = IpEndpoint(loopback, listener.localPort())
+            host = HttpWorkers.start(listener, application, 2)
+            blocked: network.connectTcp(endpoint).value()
+            blocked.write(Encoding.Latin1.encode(
+                "GET /api/tags HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            )).value()
+            acceptedGate.wait()
+            Assertions.require(host.shutdown("abort").value() === true)
+            blocked.close().value()
+            checkClosed(network, endpoint)
+            writer.writeLine("REALWORLD_HTTP_ABORT=PASS").value()
+
+            // All Workers are known terminated; the RootActor can now stop.
+            Actor.current().stop()
+            null
+        }
+    }
+    Actor.current().send("run")
+    writer.writeLine("REALWORLD_LIFECYCLE_BOOT=END").value()
+    behavior
+}

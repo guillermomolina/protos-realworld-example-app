@@ -19,6 +19,7 @@ ColorMode: import("std:text/color_mode")
 ColoredFormatter: import("std:logging/colored_formatter")
 Store: import("./src/MemoryStore.protos")
 Api: import("./src/Api.protos")
+HttpWorkers: import("./src/HttpWorkers.protos")
 
 /// Install the application service behavior on the RootActor.
 /// The bootstrap schedules startup after READY, so listener acquisition
@@ -44,7 +45,7 @@ service: () => {
     application: Actor.group(Actor.current())
 
     listener: null
-    workers: []
+    host: null
 
     behavior: {
         start: () => {
@@ -54,26 +55,9 @@ service: () => {
                 port: 3000
             ).value()
 
-            // Every Worker receives a separate Actor-local representation
-            // of acceptance authority for the same logical listener.
-            for(index, 0, 2) {
-                worker: Actor.spawn(
-                    "./src/HttpWorker.protos",
-                    "start",
-                    listener.acceptCapability(),
-                    application,
-                    index
-                )
-
-                // Confirm that the Worker initialized successfully before
-                // dispatching its long-running acceptance service.
-                worker.request("ready").value()
-                workers = Array(...workers, worker)
-            }
-
-            for(worker in workers) {
-                worker.send("serve")
-            }
+            // Keep Worker startup, service replies and lifetime ownership
+            // together, so drain can wait for admitted sessions to retire.
+            host = HttpWorkers.start(listener, application, 2)
 
             // Announce readiness only after the listener exists and both
             // Worker behaviors are initialized and scheduled to serve.
@@ -86,6 +70,29 @@ service: () => {
             writer.writeLine(
                 "REALWORLD_HTTP_READY=127.0.0.1:3000"
             ).value()
+
+            // A local console command requests explicit graceful drain. EOF
+            // leaves the server running, as for an unattended service.
+            // Ctrl-C remains a host termination, not this drain protocol.
+            (() => {
+                Error.handle(
+                    () => {
+                        stdin: TextReader(process.stdin(), process.stdinEncoding())
+                        command: stdin.readLine().value()
+                        while((command !== null) && (command != "quit")) {
+                            command = stdin.readLine().value()
+                        }
+                        if(command !== null) {
+                            Actor.current().send("shutdown", "drain")
+                        }
+                    },
+                    (error) => {
+                        log.warn("console control unavailable")
+                        error
+                    }
+                )
+                null
+            }).future()
             null
         }
 
@@ -112,6 +119,15 @@ service: () => {
                 "status": response.status
             })
             response
+        }
+        // This behavior is not exposed through an HTTP management route.
+        // The RootActor alone retains listener close and ActorRef.stop authority.
+        shutdown: (mode) => {
+            log.info("http shutdown requested", %{ "mode": mode })
+            host.shutdown(mode).value()
+            log.info("http shutdown complete", %{ "mode": mode })
+            Actor.current().stop()
+            null
         }
 
     }

@@ -50,7 +50,21 @@ With `make serve` still running, run the focused Protos HTTP integration test fr
 make test-http
 ```
 
-On Protos `0.3.452-SNAPSHOT`, this test passed for four native loopback requests with statuses 200, 200, 404 and 422. The in-memory store starts empty, so articles and tags are empty until populated. The server listens only on `127.0.0.1:3000`. Two Worker Actors accept connections through delegated `TcpAcceptor` capabilities and run `std:http/server` for one HTTP/1.1 exchange per connection. Each Worker requests its response from the RootActor through a `GroupRef`; the RootActor exclusively owns the mutable `MemoryStore`. This is a bounded learning server, not a production HTTP host. Ctrl-C ends the process; graceful drain/shutdown is not implemented. The current test confirms HTTP correctness, not simultaneous-request throughput or official RealWorld conformance.
+For a self-contained concurrency and shutdown regression, without a separately
+running `make serve`, run:
+
+```sh
+make test-http-lifecycle
+```
+
+The native Protos fixture uses an ephemeral loopback listener and the **same**
+`src/HttpWorker.protos` used by the server. It holds a request header incomplete
+until a Worker acknowledges accepting it, verifies a second Worker completes a
+real HTTP request meanwhile, then initiates drain **before** completing the
+first request. It also exercises cancellation-based abort on a second listener.
+`timeout` bounds potential deadlocks in this native-only integration test.
+
+On Protos `0.3.452-SNAPSHOT`, this test passed for four native loopback requests with statuses 200, 200, 404 and 422. The in-memory store starts empty, so articles and tags are empty until populated. The server listens only on `127.0.0.1:3000`. Two Worker Actors accept connections through delegated `TcpAcceptor` capabilities and run `std:http/server` for one HTTP/1.1 exchange per connection. Each Worker requests its response from the RootActor through a `GroupRef`; the RootActor exclusively owns the mutable `MemoryStore`. This is a bounded learning server, not a production HTTP host. Type `quit` and press Enter in the server terminal to request graceful drain: the RootActor closes the listener, waits for admitted sessions, stops both Workers, and then stops itself. Ctrl-C is host termination and is **not** guaranteed to drain. The current `make test-http` verifies HTTP correctness but does not itself establish simultaneous-request throughput or official RealWorld conformance.
 
 `--allow-network` is explicit and applies only to the initial RootActor; it does not grant filesystem access, DNS resolution or Network authority to imported modules and child Actors. Running without the flag does not authorize TCP listening.
 
@@ -78,6 +92,7 @@ src/
   Comments.protos      Comment JSON responses
   MemoryStore.protos   Temporary in-memory repository
   HttpWorker.protos    Worker Actor HTTP connection service
+  HttpWorkers.protos   RootActor-local Worker lifecycle controller
   Responses.protos     HTTP response helpers
 
 tests/
@@ -86,10 +101,12 @@ tests/
   slice02-articles-query.protos
   slice03-public-content.protos
   native-http.protos  Native HTTP integration client (Protos)
+  native-http-lifecycle.protos  Native concurrency, drain and abort fixture
 
 server.protos        RootActor service and Worker bootstrap
+native-http-lifecycle.protos  Test entry: explicitly passes Network to the fixture
 run-tests.protos     Focused test entry point
-Makefile             test, serve, and test-http commands
+Makefile             test, serve, test-http, and lifecycle checks
 ```
 
 The application uses existing Protos facilities such as `std:http/router`, `std:http/server`, `std:json/json` and `std:collections/array`; it does not implement private replacements for those libraries.
@@ -101,7 +118,7 @@ See [TODO.md](TODO.md) for the remaining work and upstream Protos blockers.
 - User registration, login, signed tokens and authenticated operations
 - Following, authenticated favorite mutations, article mutations and comment mutations
 - Durable storage
-- Graceful drain/shutdown and optional integration with `std:http/host`
+- Signal-triggered graceful drain and optional integration with `std:http/host` (the current manual `quit` command uses native drain)
 - Official RealWorld Hurl conformance
 
 The native CLI now supports explicit TCP authority with `--allow-network` and the long-lived RootActor service entry with `--service=service` ([D247](https://github.com/guillermomolina/protos/issues/1073)). It does not grant Filesystem access; durable storage is still pending. The app currently composes delegated `TcpAcceptor` capabilities, two Worker Actors and `std:http/server` directly. It does not use `std:http/host`, whose Worker handler import contract is not wired to this standalone CLI application. Standard `Bytes` can cross the Actor boundary in the validated Protos version ([BUG035](https://github.com/guillermomolina/protos/issues/1081)).

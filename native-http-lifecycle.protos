@@ -1,0 +1,15 @@
+//! Root-level entry for the native HTTP lifecycle integration.
+//!
+//! The direct-file resolver confines local SOURCE imports to the entry's
+//! containing directory. Keeping this entry at the repository root permits
+//! imports from tests/ to ../src/ without escaping that root.
+//!
+//! Only the CLI entry receives Network authority. Pass it explicitly to the
+//! same-Actor fixture; do not grant it to HTTP Worker Actors.
+
+Lifecycle: import("./tests/native-http-lifecycle.protos")
+
+service: () => {
+    writer: TextWriter(process.stdout(), process.stdoutEncoding())
+    Lifecycle.service(network, writer)
+}

@@ -25,7 +25,7 @@ D247 is closed; D243–D246 remain open. Do not replace the missing cryptographi
 
 - [x] Start a native HTTP/1.1 service with an explicit Network grant and `std:http/server`.
 - [x] Add two TCP-accepting Worker Actors while retaining one RootActor-owned application store; validate native HTTP with Protos.
-- [ ] Verify simultaneous-request handling and add graceful drain/shutdown; evaluate `std:http/host` application-module loading separately.
+- [ ] Run and record `make test-http-lifecycle` for a deterministic two-Worker overlap proof plus drain and abort. Manual `quit` starts the RootActor-owned drain; signal-triggered shutdown and `std:http/host` application-module loading remain separate work.
 - [ ] Implement registration, login, current-user lookup, validation, and authorization.
 - [ ] Implement following/unfollowing, authenticated favorites, and the feed.
 - [ ] Create, update, and delete articles and comments.

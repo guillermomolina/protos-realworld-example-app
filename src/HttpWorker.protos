@@ -4,13 +4,20 @@
 //! application service. Neither Network nor MemoryStore is transferred.
 //!
 //! HTTP parsing and connection custody stay here; business logic and
-//! mutable application state remain in the RootActor.
+//! mutable application state remain in the RootActor. Drain never cancels
+//! a session that was admitted before the shutdown cutover.
 
 Server: import("std:http/server").Server
 
 /// Build the Worker behavior from explicitly delegated capabilities.
 /// This is a SOURCE bootstrap binding selected by Actor.spawn.
 start: (acceptor, application, workerId) => {
+    admitting: true
+    serving: false
+    pending: null
+    active: null
+    failureKind: null
+
     handleRequest: (request) => {
         // Only HTTP metadata crosses the Actor boundary. The RootActor
         // constructs a transferable response using its sole MemoryStore.
@@ -22,35 +29,92 @@ start: (acceptor, application, workerId) => {
     }
 
     behavior: {
-        /// Initialization handshake used before acceptance begins.
-        ready: () => {
-            true
-        }
-
-        /// Serve successive connections using this Worker's acceptor.
-        /// Each connection carries one HTTP/1.1 request and response.
+        /// The long-running service replies only after admission ends and its
+        /// one in-flight session has retired with owning cleanup.
         serve: () => {
-            while(true) {
-                connection: acceptor.accept().value()
-                application.send("connectionAccepted", workerId)
-
-                // A failed exchange must not terminate the entire Worker.
-                // The owning Server retires the connection on every outcome.
+            serving = true
+            while(admitting) {
+                connection: null
+                acceptFailure: null
+                pending = acceptor.accept()
                 Error.handle(
-                    () => {
-                        Server.serveOne.owning(
-                            connection,
-                            handleRequest,
-                            null
-                        ).value()
-                    },
+                    () => { connection = pending.value() },
                     (error) => {
-                        // The RootActor owns the process writer and logger.
-                        // Do not transfer the Worker-local Error object.
-                        application.send("connectionFailed", workerId)
+                        acceptFailure = error
                         error
                     }
                 )
+                pending = null
+
+                if(acceptFailure !== null) {
+                    admitting = false
+                    if((acceptFailure.parent() !== IOLifecycleError) &&
+                       (acceptFailure.parent() !== Cancelled)) {
+                        failureKind = "listener"
+                        application.send("connectionFailed", workerId)
+                    }
+                } else {
+                    if(admitting) {
+                        application.send("connectionAccepted", workerId)
+                        // The server owns the accepted connection and closes it
+                        // on success, failure or cancellation.
+                        Error.handle(
+                            () => {
+                                active = Server.serveOne.owning(
+                                    connection,
+                                    handleRequest,
+                                    null
+                                )
+                                active.value()
+                            },
+                            (error) => {
+                                application.send("connectionFailed", workerId)
+                                error
+                            }
+                        )
+                        active = null
+                    } else {
+                        // A delivery racing the admission cutover is not served.
+                        Error.handle(
+                            () => { connection.close().value() },
+                            (error) => {
+                                failureKind = "cleanup"
+                                application.send("connectionFailed", workerId)
+                                error
+                            }
+                        )
+                    }
+                }
+            }
+            result: "drained"
+            if(failureKind !== null) {
+                result = failureKind
+            }
+            result
+        }
+
+        /// Same-sender FIFO places this request after serve entered its first
+        /// suspended accept operation, not merely after Actor initialization.
+        ready: () => {
+            serving && admitting
+        }
+
+        /// Stop new admission. The RootActor closes the listener to wake a
+        /// pending accept. An in-flight HTTP session finishes normally.
+        drain: () => {
+            admitting = false
+            null
+        }
+
+        /// Cancel pending acceptance and the active session, whose owning
+        /// cleanup still runs before serve replies.
+        abort: () => {
+            admitting = false
+            if(pending !== null) {
+                pending.cancel()
+            }
+            if(active !== null) {
+                active.cancel()
             }
             null
         }
