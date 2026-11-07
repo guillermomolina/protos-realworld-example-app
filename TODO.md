@@ -13,7 +13,7 @@
 - Favorites are populated through test fixtures; authenticated favorite mutations are not implemented.
 - Router and HTTP/1.1 unit tests use an in-memory duplex; the native two-Worker service has also passed real TCP requests (HTTP 200, 401, 404, 422).
 - Workers snapshot complete HTTP requests for RootActor routing: raw target Bytes, method, version, ordered headers and decoded body Bytes; `std:http/server` enforces a 1 MiB request-body cap (HTTP 413). Application handlers do not interpret credentials or mutation bodies yet.
-- Pure JSON request validation for future registration, login, article creation and comment creation: strict UTF-8, named object envelope, non-empty required strings, optional article tagList type. The helpers are not wired to public mutation routes.
+- Pure JSON request validation for registration, login, article creation and comment creation: strict UTF-8, named object envelope, non-empty required strings, optional article tagList type. Registration and login now use it in the router (422 invalid, 501 valid-but-unimplemented); protected writes still return 401 before body processing.
 - `make test` passed in a previous reported local run; `make test-http` passed on Protos `0.3.452-SNAPSHOT` (2026-11-07). The official RealWorld suite has not been run.
 
 `make serve` starts a native TCP listener on `127.0.0.1:3000` using `--allow-network --service=service`. Two Worker Actors accept delegated TCP connections and request application responses from the RootActor, which alone owns `MemoryStore`. `make test-http` exercises the running service with a native Protos HTTP client. Authentication, durable storage, bounded-lifecycle hosting and graceful shutdown are still missing.

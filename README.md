@@ -85,6 +85,8 @@ On Protos `0.3.452-SNAPSHOT`, this test passed for four native loopback requests
 
 | Route | Behavior |
 | --- | --- |
+| `POST /api/users` | JSON validation (422), otherwise explicit 501 until secure registration exists |
+| `POST /api/users/login` | JSON validation (422), otherwise explicit 501 until secure login exists |
 | `GET /api/tags` | Distinct tags from the current in-memory articles |
 | `GET /api/articles` | Public article list, tag/author/favorited filters, ordering and pagination |
 | `GET /api/articles/:slug` | Public article details |
@@ -97,15 +99,21 @@ before sending them to the RootActor. It reads the session-owned body locally
 and caps it at **1 MiB** using `std:http/server` limits; over-limit requests
 are rejected with HTTP 413. Only transferable data crosses the Actor boundary:
 no TCP connection, stream or mutable application store is transferred.
-Authentication and mutation handlers do not consume these fields yet.
+Registration and login now validate these body bytes, but do not create users or issue tokens.
 
 `src/app/RequestJson.protos` separately validates UTF-8 JSON `user`, `article` and
 `comment` envelopes, required non-empty string fields, and optional article
 `tagList` arrays. It returns structured validation results that existing
-`Responses.error` can render as Conduit-style 422 errors. These pure helpers
-are tested without enabling registration, login, or authenticated writes.
-Email syntax/policy, password security, and successful mutation responses are
-not implemented in this slice.
+`Responses.error` can render as Conduit-style 422 errors. These helpers were first tested independently; the public identity routes now
+validate request bodies without creating users, issuing tokens, or
+enabling authenticated writes.
+Registration and login now call these validators in the HTTP router. Invalid
+request bodies return Conduit-style HTTP 422 errors; structurally valid
+requests return an explicit HTTP 501 `errors.service` response without
+creating credentials or changing state. Protected routes continue to
+return HTTP 401 before interpreting untrusted mutation bodies. Email
+syntax/policy, password security, and successful mutation responses remain
+unimplemented.
 
 Public list responses omit the article body, as required by the current RealWorld contract. Public 404 responses identify the missing `article` or `profile` in a JSON `errors` envelope. Protected operations without an authenticated principal return the Conduit 401 `errors.token` envelope; this is not an implementation of token validation or authenticated mutations. The tests also cover missing resources and unauthenticated access to the feed route.
 
@@ -136,6 +144,7 @@ src/
     slice03-public-content.protos
     slice04-public-errors.protos
     slice06-json-contract.protos
+    slice07-identity-routing.protos
     native-http.protos       Running-server integration client
     native-http-lifecycle.protos  Native concurrency/drain/abort fixture
 

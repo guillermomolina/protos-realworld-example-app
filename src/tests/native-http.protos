@@ -64,5 +64,59 @@ check("/api/articles/unknown/comments", 404, "{\"errors\":{\"article\":[\"not fo
 check("/api/user", 401, "{\"errors\":{\"token\":[\"is missing\"]}}")
 check("/api/articles/feed", 401, "{\"errors\":{\"token\":[\"is missing\"]}}")
 
+
+// Native POST: HTTP Client -> Worker -> RootActor -> JSON router.
+checkPost: (target, body, expectedStatus, expectedBody) => {
+    connection: network.connectTcp(
+        IpEndpoint(loopback, 3000)
+    ).value()
+
+    request: {
+        method: "POST"
+        target: Encoding.Latin1.encode(target)
+        headers: [
+            ["Host", Encoding.Latin1.encode("127.0.0.1")],
+            ["Content-Type", Encoding.Latin1.encode("application/json")]
+        ]
+        body: Encoding.UTF8.encode(body)
+    }
+
+    Client.exchangeOne.owning(
+        connection,
+        request,
+        (response) => {
+            Assertions.require(response.status == expectedStatus)
+            Assertions.require(readBody(response) == expectedBody)
+            true
+        },
+        null
+    ).value()
+}
+
+checkPost(
+    "/api/users",
+    "{\"user\":{\"username\":\"\",\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
+    422,
+    "{\"errors\":{\"username\":[\"can't be blank\"]}}"
+)
+checkPost(
+    "/api/users",
+    "{\"user\":{\"username\":\"alice\",\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
+    501,
+    "{\"errors\":{\"service\":[\"not implemented\"]}}"
+)
+checkPost(
+    "/api/users/login",
+    "{\"user\":{\"email\":\"a@b.test\",\"password\":\"\"}}",
+    422,
+    "{\"errors\":{\"password\":[\"can't be blank\"]}}"
+)
+checkPost(
+    "/api/users/login",
+    "{\"user\":{\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
+    501,
+    "{\"errors\":{\"service\":[\"not implemented\"]}}"
+)
+
 print("REALWORLD_NATIVE_HTTP=PASS")
 true

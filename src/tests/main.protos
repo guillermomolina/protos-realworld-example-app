@@ -19,5 +19,8 @@ run: (report) => {
     import("./slice06-json-contract.protos")
     report("REALWORLD_JSON_CONTRACT=PASS")
 
+    import("./slice07-identity-routing.protos")
+    report("REALWORLD_IDENTITY_ROUTING=PASS")
+
     true
 }

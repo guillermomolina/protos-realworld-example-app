@@ -12,6 +12,7 @@ Comments: import("./Comments.protos")
 JSON: import("std:json/json")
 ArticleQuery: import("./ArticleQuery.protos")
 Responses: import("./Responses.protos")
+RequestJson: import("./RequestJson.protos")
 
 /// Build the public API handler from an explicitly supplied store.
 /// The result can be passed to std:http/server or std:http/host.
@@ -23,7 +24,31 @@ make: (store) => {
         Responses.unauthorized()
     }
 
+    // JSON validation is active; account storage and token issuance are not.
+    // Successful validation must not turn into simulated authentication.
+    identityRequest: (result) => {
+        if(result.valid) {
+            Responses.error(501, "service", "not implemented")
+        } else {
+            Responses.error(422, result.field, result.message)
+        }
+    }
+
     Router.compile([
+        {
+            method: "POST"
+            path: "/api/users"
+            handle: (request, match) => {
+                identityRequest(RequestJson.registerUser(request.body))
+            }
+        },
+        {
+            method: "POST"
+            path: "/api/users/login"
+            handle: (request, match) => {
+                identityRequest(RequestJson.loginUser(request.body))
+            }
+        },
         {
             method: "GET"
             path: "/api/user"

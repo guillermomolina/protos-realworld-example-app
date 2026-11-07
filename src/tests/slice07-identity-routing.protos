@@ -1,0 +1,71 @@
+//! Registration/login HTTP routing for bounded JSON request bodies.
+//!
+//! No identity provider, password storage, JWT or implicit authorization.
+//! Invalid payloads receive 422; validated requests return an explicit 501.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Store: import("../app/MemoryStore.protos")
+Api: import("../app/Api.protos")
+
+store: Store.create()
+handle: Api.make(store)
+
+request: (method, target, text) => {
+    {
+        method: method
+        target: Encoding.Latin1.encode(target)
+        body: Encoding.UTF8.encode(text)
+    }
+}
+
+check: (method, target, text, status, field, message) => {
+    response: handle(request(method, target, text))
+    Assertions.require(response.status == status)
+    Assertions.require(response.body !== null)
+    Assertions.require(response.headers.size() == 1)
+    decoded: JSON.parse(Encoding.UTF8.decode(response.body))
+    Assertions.require(decoded.kind == "object")
+    errors: decoded.value["errors"].value
+    Assertions.require(errors.containsKey(field))
+    Assertions.require(errors[field].value.size() == 1)
+    Assertions.require(errors[field].value[0].value == message)
+    true
+}
+
+check("POST", "/api/users", "", 422, "body", "is invalid")
+check("POST", "/api/users", "{", 422, "body", "is invalid")
+check("POST", "/api/users", "{}", 422, "body", "is invalid")
+check("POST", "/api/users", "{\"user\":[]}", 422, "body", "is invalid")
+check("POST", "/api/users",
+    "{\"user\":{\"username\":\"\",\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
+    422, "username", "can't be blank")
+check("POST", "/api/users",
+    "{\"user\":{\"username\":\"alice\",\"email\":\"\",\"password\":\"eightchars\"}}",
+    422, "email", "can't be blank")
+check("POST", "/api/users",
+    "{\"user\":{\"username\":\"alice\",\"email\":\"a@b.test\",\"password\":\"\"}}",
+    422, "password", "can't be blank")
+check("POST", "/api/users",
+    "{\"user\":{\"username\":\"alice\",\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
+    501, "service", "not implemented")
+
+check("POST", "/api/users/login", "{", 422, "body", "is invalid")
+check("POST", "/api/users/login",
+    "{\"user\":{\"email\":\"\",\"password\":\"eightchars\"}}",
+    422, "email", "can't be blank")
+check("POST", "/api/users/login",
+    "{\"user\":{\"email\":\"a@b.test\",\"password\":null}}",
+    422, "password", "can't be blank")
+check("POST", "/api/users/login",
+    "{\"user\":{\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
+    501, "service", "not implemented")
+
+// Authentication must still precede validation on protected operations.
+check("POST", "/api/articles", "{", 401, "token", "is missing")
+check("PUT", "/api/user", "{", 401, "token", "is missing")
+check("POST", "/api/articles/some-slug/comments", "{", 401, "token", "is missing")
+
+Assertions.require(handle(request("GET", "/api/tags", "")).status == 200)
+Assertions.require(handle(request("GET", "/api/articles", "")).status == 200)
+true
