@@ -1,0 +1,133 @@
+//! Focused RealWorld JSON request-body contract checks.
+//!
+//! No user credentials are stored, no endpoint is enabled, and no
+//! authentication/persistence provider is substituted by these tests.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+RequestJson: import("../src/RequestJson.protos")
+Responses: import("../src/Responses.protos")
+
+bytes: (text) => {
+    Encoding.UTF8.encode(text)
+}
+
+valid: (result) => {
+    Assertions.require(result.valid)
+    Assertions.require(result.fields !== null)
+    Assertions.require(result.field === null)
+    Assertions.require(result.message === null)
+    result.fields
+}
+
+invalid: (result, field, message) => {
+    Assertions.require(!result.valid)
+    Assertions.require(result.fields === null)
+    Assertions.require(result.field == field)
+    Assertions.require(result.message == message)
+
+    // Show that every error can use the existing Conduit 422 envelope.
+    response: Responses.error(422, result.field, result.message)
+    Assertions.require(response.status == 422)
+    node: JSON.parse(Encoding.UTF8.decode(response.body))
+    errors: node.value["errors"].value
+    Assertions.require(errors[field].value[0].value == message)
+    true
+}
+
+// Registration payloads are prepared but no registration endpoint is enabled.
+registration: valid(RequestJson.registerUser(bytes(
+    "{\"user\":{\"username\":\"mañana\",\"email\":\"hello@example.test\",\"password\":\"test password\"}}"
+)))
+Assertions.require(registration["username"].value == "mañana")
+Assertions.require(registration["password"].value == "test password")
+
+invalid(RequestJson.registerUser(bytes(
+    "{\"user\":{\"username\":\"\",\"email\":\"a@b.test\",\"password\":\"eightchars\"}}"
+)), "username", "can't be blank")
+invalid(RequestJson.registerUser(bytes(
+    "{\"user\":{\"username\":\"bob\",\"email\":\"\",\"password\":\"eightchars\"}}"
+)), "email", "can't be blank")
+invalid(RequestJson.registerUser(bytes(
+    "{\"user\":{\"username\":\"bob\",\"email\":\"a@b.test\",\"password\":\"\"}}"
+)), "password", "can't be blank")
+invalid(RequestJson.registerUser(bytes(
+    "{\"user\":{\"username\":null,\"email\":\"a@b.test\",\"password\":\"eightchars\"}}"
+)), "username", "can't be blank")
+invalid(RequestJson.registerUser(bytes(
+    "{\"user\":{\"username\":42,\"email\":\"a@b.test\",\"password\":\"eightchars\"}}"
+)), "username", "is invalid")
+invalid(RequestJson.registerUser(bytes(
+    "{\"user\":{\"email\":\"a@b.test\",\"password\":\"eightchars\"}}"
+)), "username", "can't be blank")
+
+// Login uses only email and password; full email/password policy is deferred.
+login: valid(RequestJson.loginUser(bytes(
+    "{\"user\":{\"email\":\"a@b.test\",\"password\":\"secret\"}}"
+)))
+Assertions.require(login["email"].value == "a@b.test")
+invalid(RequestJson.loginUser(bytes(
+    "{\"user\":{\"email\":null,\"password\":\"secret\"}}"
+)), "email", "can't be blank")
+invalid(RequestJson.loginUser(bytes(
+    "{\"user\":{\"email\":\"a@b.test\",\"password\":false}}"
+)), "password", "is invalid")
+
+// Article creation checks required text and optional string tagList shape.
+article: valid(RequestJson.createArticle(bytes(
+    "{\"article\":{\"title\":\"A\",\"description\":\"Description\",\"body\":\"Text\",\"tagList\":[\"one\",\"two\",\"one\"]}}"
+)))
+Assertions.require(article["tagList"].value.size() == 3)
+Assertions.require(article["tagList"].value[2].value == "one")
+valid(RequestJson.createArticle(bytes(
+    "{\"article\":{\"title\":\"A\",\"description\":\"D\",\"body\":\"B\"}}"
+)))
+invalid(RequestJson.createArticle(bytes(
+    "{\"article\":{\"title\":\"\",\"description\":\"D\",\"body\":\"B\"}}"
+)), "title", "can't be blank")
+invalid(RequestJson.createArticle(bytes(
+    "{\"article\":{\"title\":\"A\",\"description\":\"\",\"body\":\"B\"}}"
+)), "description", "can't be blank")
+invalid(RequestJson.createArticle(bytes(
+    "{\"article\":{\"title\":\"A\",\"description\":\"D\",\"body\":\"\"}}"
+)), "body", "can't be blank")
+invalid(RequestJson.createArticle(bytes(
+    "{\"article\":{\"title\":\"A\",\"description\":\"D\",\"body\":\"B\",\"tagList\":null}}"
+)), "tagList", "is invalid")
+invalid(RequestJson.createArticle(bytes(
+    "{\"article\":{\"title\":\"A\",\"description\":\"D\",\"body\":\"B\",\"tagList\":[\"ok\",7]}}"
+)), "tagList", "is invalid")
+
+// Comments follow the same body-string rule as official negative Hurl cases.
+comment: valid(RequestJson.createComment(bytes(
+    "{\"comment\":{\"body\":\"hello\"}}"
+)))
+Assertions.require(comment["body"].value == "hello")
+invalid(RequestJson.createComment(bytes(
+    "{\"comment\":{\"body\":\"\"}}"
+)), "body", "can't be blank")
+invalid(RequestJson.createComment(bytes(
+    "{\"comment\":{\"body\":null}}"
+)), "body", "can't be blank")
+invalid(RequestJson.createComment(bytes(
+    "{\"comment\":{\"body\":[]}}"
+)), "body", "is invalid")
+
+// Parser boundaries: malformed JSON, duplicate members, invalid UTF-8,
+// wrong envelope types and trailing data are ordinary body validation errors.
+invalid(RequestJson.loginUser(bytes("")), "body", "is invalid")
+invalid(RequestJson.loginUser(bytes("not json")), "body", "is invalid")
+invalid(RequestJson.loginUser(bytes("{}")), "body", "is invalid")
+invalid(RequestJson.loginUser(bytes("[]")), "body", "is invalid")
+invalid(RequestJson.loginUser(bytes("{\"user\":null}")), "body", "is invalid")
+invalid(RequestJson.loginUser(bytes("{\"user\":[]}")), "body", "is invalid")
+invalid(RequestJson.loginUser(bytes("{\"user\":{}} trailing")), "body", "is invalid")
+invalid(RequestJson.loginUser(bytes(
+    "{\"user\":{\"email\":\"a@b.test\",\"email\":\"duplicate@test.test\",\"password\":\"pw\"}}"
+)), "body", "is invalid")
+
+badUtf8: Encoding.Latin1.encode("")
+badUtf8.add(255)
+invalid(RequestJson.loginUser(badUtf8), "body", "is invalid")
+
+true

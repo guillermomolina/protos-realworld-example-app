@@ -1,0 +1,146 @@
+//! Parse and validate RealWorld JSON mutation envelopes without host authority.
+//!
+//! This is application-level input validation, not authentication, persistence,
+//! password policy, or an HTTP endpoint. The HTTP Worker has already provided
+//! a bounded, transferable Bytes snapshot of the request body.
+//!
+//! The result is {valid, fields, field, message}: fields is the JSON object
+//! member Map on success, and field/message are a single validation error on
+//! failure. No credential material is logged or retained outside the caller.
+
+JSON: import("std:json/json")
+
+invalid: (field, message) => {
+    {
+        valid: false
+        fields: null
+        field: field
+        message: message
+    }
+}
+
+accepted: (fields) => {
+    {
+        valid: true
+        fields: fields
+        field: null
+        message: null
+    }
+}
+
+/// Read a UTF-8 JSON object containing a named object-valued envelope.
+/// Invalid UTF-8, invalid JSON, duplicate member names, absent envelopes,
+/// and non-object envelopes yield a body error instead of escaping an Error.
+parseEnvelope: (bodyBytes, envelope) => {
+    result: invalid("body", "is invalid")
+    Error.handle(
+        () => {
+            text: Encoding.UTF8.decode(bodyBytes)
+
+            // A decoder may replace invalid octets. Require lossless UTF-8
+            // before interpreting any untrusted payload as JSON text.
+            again: Encoding.UTF8.encode(text)
+            exact: again.size() == bodyBytes.size()
+            if(exact) {
+                for(index, 0, bodyBytes.size()) {
+                    if(again[index] != bodyBytes[index]) {
+                        exact = false
+                    }
+                }
+            }
+
+            if(exact) {
+                node: JSON.parse(text)
+                if(node.kind == "object") {
+                    outer: node.value
+                    if(outer.containsKey(envelope)) {
+                        child: outer[envelope]
+                        if(child.kind == "object") {
+                            result = accepted(child.value)
+                        }
+                    }
+                }
+            }
+        },
+        (failure) => {
+            // The application must return an ordinary validation result, not
+            // terminate the RootActor on a malformed public request.
+            failure
+        }
+    )
+    result
+}
+
+/// Validate required, non-empty string fields in the supplied order.
+/// A missing, null, or empty string is "can't be blank"; other JSON types
+/// are "is invalid". No trimming, coercion or credential transformations.
+requiredText: (result, fieldNames) => {
+    outcome: result
+    if(outcome.valid) {
+        for(fieldName in fieldNames) {
+            if(outcome.valid) {
+                fields: outcome.fields
+                if(!fields.containsKey(fieldName)) {
+                    outcome = invalid(fieldName, "can't be blank")
+                } else {
+                    entry: fields[fieldName]
+                    if(entry.kind == "null") {
+                        outcome = invalid(fieldName, "can't be blank")
+                    } else {
+                        if(entry.kind != "string") {
+                            outcome = invalid(fieldName, "is invalid")
+                        } else {
+                            if(entry.value == "") {
+                                outcome = invalid(fieldName, "can't be blank")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    outcome
+}
+
+/// A create-article tagList may be omitted; when present, it must be an
+/// Array of JSON strings. Preserve its order, including repeated names.
+optionalTags: (result) => {
+    outcome: result
+    if(outcome.valid) {
+        fields: outcome.fields
+        if(fields.containsKey("tagList")) {
+            entry: fields["tagList"]
+            if(entry.kind != "array") {
+                outcome = invalid("tagList", "is invalid")
+            } else {
+                for(tag in entry.value) {
+                    if(tag.kind != "string") {
+                        outcome = invalid("tagList", "is invalid")
+                    }
+                }
+            }
+        }
+    }
+    outcome
+}
+
+/// Payload shapes needed by the future RealWorld mutation handlers. Successful
+/// results are validated JSON nodes, not created accounts/articles/comments.
+registerUser: (bodyBytes) => {
+    requiredText(parseEnvelope(bodyBytes, "user"), ["username", "email", "password"])
+}
+
+loginUser: (bodyBytes) => {
+    requiredText(parseEnvelope(bodyBytes, "user"), ["email", "password"])
+}
+
+createArticle: (bodyBytes) => {
+    optionalTags(requiredText(
+        parseEnvelope(bodyBytes, "article"),
+        ["title", "description", "body"]
+    ))
+}
+
+createComment: (bodyBytes) => {
+    requiredText(parseEnvelope(bodyBytes, "comment"), ["body"])
+}

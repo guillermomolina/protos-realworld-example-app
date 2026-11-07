@@ -90,6 +90,14 @@ are rejected with HTTP 413. Only transferable data crosses the Actor boundary:
 no TCP connection, stream or mutable application store is transferred.
 Authentication and mutation handlers do not consume these fields yet.
 
+`src/RequestJson.protos` separately validates UTF-8 JSON `user`, `article` and
+`comment` envelopes, required non-empty string fields, and optional article
+`tagList` arrays. It returns structured validation results that existing
+`Responses.error` can render as Conduit-style 422 errors. These pure helpers
+are tested without enabling registration, login, or authenticated writes.
+Email syntax/policy, password security, and successful mutation responses are
+not implemented in this slice.
+
 Public list responses omit the article body, as required by the current RealWorld contract. Public 404 responses identify the missing `article` or `profile` in a JSON `errors` envelope. Protected operations without an authenticated principal return the Conduit 401 `errors.token` envelope; this is not an implementation of token validation or authenticated mutations. The tests also cover missing resources and unauthenticated access to the feed route.
 
 All data currently comes from test fixtures. It is lost when the process ends. Public responses have not yet passed RealWorld's official Hurl test suite.
@@ -106,12 +114,14 @@ src/
   HttpWorker.protos    Worker Actor HTTP connection service
   HttpWorkers.protos   RootActor-local Worker lifecycle controller
   Responses.protos     HTTP response helpers
+  RequestJson.protos   Pure JSON envelope/field validation for future mutations
 
 tests/
   slice01-smoke.protos
   slice01-wire-smoke.protos
   slice02-articles-query.protos
   slice03-public-content.protos
+  slice06-json-contract.protos  Pure JSON mutation-payload contract tests
   native-http.protos  Native HTTP integration client (Protos)
   native-http-lifecycle.protos  Native concurrency, drain and abort fixture
 

@@ -15,4 +15,7 @@ print("SLICE03_PUBLIC_CONTENT=PASS")
 import("./tests/slice04-public-errors.protos")
 print("SLICE04_PUBLIC_ERRORS=PASS")
 
+import("./tests/slice06-json-contract.protos")
+print("REALWORLD_JSON_CONTRACT=PASS")
+
 true
