@@ -1,8 +1,15 @@
-// Actor-local, temporary storage for the first HTTP/JSON slice.
-// Not a durable database and not an authentication authority.
+//! Minimal Actor-local data store for the learning application.
+//!
+//! State is captured by closures created inside create(). Each store
+//! instance owns its own article, profile, comment and favorite collections.
+//! There is no database, persistence or authentication authority.
+//!
+//! Fixture insertion methods support examples and tests. They are not
+//! replacements for authenticated RealWorld mutation endpoints.
 
 Arrays: import("std:collections/array")
 
+/// Create an independent in-memory store.
 create: () => {
     items: []
     profiles: []
@@ -10,6 +17,8 @@ create: () => {
     favorites: []
 
     store: {
+        // A public profile may be registered explicitly, appear as
+        // an article author, or appear only as a comment author.
         findProfile: (username) => {
             found: null
 
@@ -77,6 +86,8 @@ create: () => {
             slugs
         }
 
+        // Repeated favorites from the same user are ignored.
+        // This keeps favoritesCount consistent with unique user/article pairs.
         addFavoriteFixture: (username, slug) => {
             article: store.find(slug)
             if(article === null) {
@@ -98,6 +109,8 @@ create: () => {
             article
         }
 
+        // Return a new Array so query operations do not work directly
+        // on the collection retained by the store.
         all: () => {
             Array(...items)
         }
@@ -112,6 +125,7 @@ create: () => {
             result
         }
 
+        // Collect distinct tags in first-seen order across articles.
         tags: () => {
             names: []
             for(item in items) {

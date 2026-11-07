@@ -1,7 +1,13 @@
-// HTTP responses in the format expected by RealWorld.
+//! HTTP response construction for the RealWorld API.
+//!
+//! A response is an ordinary object with status, headers and body slots.
+//! std:http/server converts that object into an HTTP/1.1 response.
+//! JSON encoding is kept separate from routing and domain logic.
 
 JSON: import("std:json/json")
 
+/// Create a JSON HTTP response.
+/// Serialize using std:json and encode the body as UTF-8 bytes.
 json: (status, node) => {
     {
         status: status
@@ -15,6 +21,7 @@ json: (status, node) => {
     }
 }
 
+/// Return a bodyless HTTP 404 for an unknown resource.
 notFound: () => {
     {
         status: 404
@@ -23,6 +30,7 @@ notFound: () => {
     }
 }
 
+/// Return HTTP 401 when an endpoint requires authentication.
 unauthorized: () => {
     {
         status: 401
@@ -33,6 +41,7 @@ unauthorized: () => {
 
 
 // Validation errors use the RealWorld errors envelope.
+/// Return HTTP 422 using RealWorld's standard errors envelope.
 invalidQuery: () => {
     json(
         422,

@@ -1,4 +1,8 @@
-// Query parameters and article listing for the RealWorld API.
+//! Query parsing, validation and article selection.
+//!
+//! This module receives query text from the Router. It converts parameters
+//! into ordinary Protos values, filters articles and applies pagination.
+//! It does not access HTTP connections, storage or network capabilities.
 
 Arrays: import("std:collections/array")
 
@@ -16,6 +20,9 @@ hexValue: (octet) => {
     value
 }
 
+/// Decode one URL query component from its UTF-8 bytes.
+/// '+' represents a space; '%HH' represents an encoded byte.
+/// Invalid percent escapes signal an Error to the caller.
 decodeComponent: (source) => {
     output: Encoding.UTF8.encode("")
     index: 0
@@ -50,6 +57,9 @@ decodeComponent: (source) => {
     Encoding.UTF8.decode(output)
 }
 
+/// Parse a query string into a Map.
+/// Repeated parameter names use the last supplied value.
+/// Empty parameter names are ignored.
 parse: (query) => {
     parameters: Map()
 
@@ -116,6 +126,9 @@ nonNegativeInteger: (text, minimum) => {
     result
 }
 
+/// Validate listing options and apply RealWorld defaults.
+/// The default limit is 20 and the default offset is 0.
+/// Limit must be positive; offset may be zero.
 read: (query) => {
     parameters: parse(query)
     limit: 20
@@ -136,7 +149,9 @@ read: (query) => {
     }
 }
 
-// Compare normalized UTC timestamps, newest first.
+// ISO UTC timestamps in the fixtures share a canonical format, so
+// lexicographic byte comparison also gives chronological ordering.
+// This assumption must be revisited if other timestamp formats are allowed.
 laterThan: (left, right) => {
     a: Encoding.UTF8.encode(left)
     b: Encoding.UTF8.encode(right)
@@ -165,6 +180,9 @@ laterThan: (left, right) => {
     later
 }
 
+/// Filter, sort and paginate articles without modifying the input.
+/// favoriteSlugs is supplied by the store for the requested username.
+/// The total count is calculated before applying limit and offset.
 select: (articles, options, favoriteSlugs) => {
     parameters: options.parameters
 

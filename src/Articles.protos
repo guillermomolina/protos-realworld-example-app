@@ -1,8 +1,14 @@
-// RealWorld JSON presentation. No HTTP or storage authority.
+//! JSON presentation of RealWorld articles, profiles and tags.
+//!
+//! Domain objects are ordinary Protos values. This module converts them
+//! into std:json nodes without changing the underlying data.
+//! HTTP status codes and storage concerns are handled elsewhere.
 
 JSON: import("std:json/json")
 Arrays: import("std:collections/array")
 
+/// Represent an optional String as a JSON string or JSON null.
+/// A Protos null value must not be serialized as the text "null".
 nullableText: (value) => {
     answer: JSON.nullValue()
     if(value !== null) {
@@ -11,6 +17,8 @@ nullableText: (value) => {
     answer
 }
 
+/// Build the public profile representation.
+/// Without an authenticated viewer, following is always false.
 profile: (author) => {
     JSON.object(
         "username", JSON.string(author.username),
@@ -20,6 +28,9 @@ profile: (author) => {
     )
 }
 
+/// Build an article representation.
+/// Lists omit the body; detail responses include it.
+/// Public requests have no viewer identity, so favorited is false.
 article: (value, detailed) => {
     tags: []
     for(tag in value.tagList) {
@@ -46,6 +57,9 @@ article: (value, detailed) => {
     JSON.object(...fields)
 }
 
+/// Build the article-list envelope.
+/// total is the number of matching articles before pagination,
+/// not the number of articles included in this page.
 list: (values, total) => {
     nodes: []
     for(value in values) {

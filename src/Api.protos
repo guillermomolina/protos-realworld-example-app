@@ -1,5 +1,10 @@
-// First RealWorld read-only HTTP routes.
-// The supplied store is Actor-local and has no ambient capabilities.
+//! Public HTTP API composition.
+//!
+//! The Router matches incoming requests and invokes ordinary Protos closures.
+//! Each handler reads from the supplied Actor-local store and constructs a
+//! response using the presentation modules.
+//!
+//! This module does not create sockets, Actors or network permissions.
 
 Router: import("std:http/router").Router
 Articles: import("./Articles.protos")
@@ -8,6 +13,9 @@ JSON: import("std:json/json")
 ArticleQuery: import("./ArticleQuery.protos")
 Responses: import("./Responses.protos")
 
+/// Build the public API handler from an explicitly supplied store.
+/// The result can be passed to std:http/server or std:http/host.
+/// No global application state or network authority is required.
 make: (store) => {
     Router.compile([
         {
@@ -57,6 +65,9 @@ make: (store) => {
                 options: null
                 invalid: false
 
+                // Invalid query parameters become HTTP 422 responses.
+                // Error.handle prevents a malformed query from aborting
+                // the request handler.
                 Error.handle(
                     () => {
                         options = ArticleQuery.read(match.query)
@@ -72,6 +83,8 @@ make: (store) => {
                 if(invalid) {
                     answer = Responses.invalidQuery()
                 } else {
+                    // The public favorited filter names a user.
+                    // It does not require the caller to be authenticated.
                     favoriteSlugs: []
                     if(options.parameters.containsKey("favorited")) {
                         favoriteSlugs = store.favoriteSlugsFor(

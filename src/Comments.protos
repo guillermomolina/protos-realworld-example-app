@@ -1,9 +1,13 @@
-// JSON representation of public article comments.
+//! JSON presentation of public article comments.
+//!
+//! Comments reuse Articles.profile so author objects have the same JSON
+//! structure in article and comment responses.
 
 JSON: import("std:json/json")
 Arrays: import("std:collections/array")
 Articles: import("./Articles.protos")
 
+/// Convert one stored comment into its RealWorld JSON representation.
 comment: (value) => {
     JSON.object(
         "id", JSON.number(value.id, 0),
@@ -14,6 +18,7 @@ comment: (value) => {
     )
 }
 
+/// Convert an Array of comments into the {"comments": [...]} envelope.
 list: (values) => {
     nodes: Arrays.map(values, (value) => {
         comment(value)
