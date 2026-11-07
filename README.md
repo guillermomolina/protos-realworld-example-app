@@ -125,6 +125,18 @@ falling back to older article/comment fixtures. No HTTP identity write or
 authentication behavior is enabled by these internal methods. RealWorld
 email normalization and secure credentials remain future work.
 
+`src/app/FollowStore.protos` holds fixture-only follow relationships by
+stable identity ID. It rejects unknown identities and self-follow, and
+makes repeated follow/unfollow operations idempotent. `MemoryStore`
+exposes internal following/follower queries and selects a feed from the
+articles of followed identities using `ArticleQuery` ordering and
+pagination. Article fixtures linked to existing identities retain a
+stable author association after username changes; old fixtures without
+a link can be matched by their author username when the identity appears.
+The public article author is still the historical fixture snapshot.
+**This does not enable HTTP follow/unfollow or `/api/articles/feed`**:
+those routes remain HTTP 401 until an authenticated principal exists.
+
 Public list responses omit the article body, as required by the current RealWorld contract. Public 404 responses identify the missing `article` or `profile` in a JSON `errors` envelope. Protected operations without an authenticated principal return the Conduit 401 `errors.token` envelope; this is not an implementation of token validation or authenticated mutations. The tests also cover missing resources and unauthenticated access to the feed route.
 
 All data currently comes from test fixtures. It is lost when the process ends. Public responses have not yet passed RealWorld's official Hurl test suite.
@@ -143,6 +155,7 @@ src/
     Comments.protos          Comment JSON responses
     MemoryStore.protos       Actor-local in-memory repository
     IdentityStore.protos     Credential-free identity metadata repository
+    FollowStore.protos       Stable-ID follow relationships (fixtures only)
     HttpWorker.protos        Worker HTTP connection service
     HttpWorkers.protos       Worker lifecycle controller
     Responses.protos         HTTP response helpers
@@ -157,6 +170,7 @@ src/
     slice06-json-contract.protos
     slice07-identity-routing.protos
     slice08-identity-store.protos
+    slice09-social-feed.protos
     native-http.protos       Running-server integration client
     native-http-lifecycle.protos  Native concurrency/drain/abort fixture
 

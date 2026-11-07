@@ -1,0 +1,209 @@
+//! Internal RealWorld follow graph and feed-selection conformance.
+//!
+//! The RootActor store is the only owner of fixture mutations. No HTTP
+//! client becomes an authenticated viewer through these internal operations.
+
+Assertions: import("std:test/assertions")
+Identities: import("../app/IdentityStore.protos")
+FollowStore: import("../app/FollowStore.protos")
+Store: import("../app/MemoryStore.protos")
+ArticleQuery: import("../app/ArticleQuery.protos")
+Api: import("../app/Api.protos")
+JSON: import("std:json/json")
+
+// An independent graph must reject unknown IDs without creating edges.
+identity: Identities.create()
+graph: FollowStore.create(identity)
+Assertions.require(!graph.followFixture(999, 1000).ok)
+Assertions.require(graph.followFixture(999, 1000).field == "follower")
+Assertions.require(graph.followingIdsFor(999).size() == 0)
+
+alice: identity.addFixture("alice", "alice@example.test", null, null)
+bob: identity.addFixture("bob", "bob@example.test", null, null)
+carol: identity.addFixture("carol", "carol@example.test", null, null)
+Assertions.require(alice.ok && bob.ok && carol.ok)
+Assertions.require(alice.value.id == 1)
+Assertions.require(bob.value.id == 2)
+Assertions.require(carol.value.id == 3)
+
+unknownTarget: graph.followFixture(alice.value.id, 777)
+Assertions.require(!unknownTarget.ok)
+Assertions.require(unknownTarget.field == "profile")
+self: graph.followFixture(alice.value.id, alice.value.id)
+Assertions.require(!self.ok)
+Assertions.require(self.field == "profile")
+Assertions.require(!graph.isFollowing(alice.value.id, bob.value.id))
+
+first: graph.followFixture(alice.value.id, bob.value.id)
+Assertions.require(first.ok && first.changed)
+again: graph.followFixture(alice.value.id, bob.value.id)
+Assertions.require(again.ok && !again.changed)
+Assertions.require(graph.isFollowing(alice.value.id, bob.value.id))
+Assertions.require(!graph.isFollowing(bob.value.id, alice.value.id))
+
+second: graph.followFixture(alice.value.id, carol.value.id)
+third: graph.followFixture(carol.value.id, bob.value.id)
+Assertions.require(second.ok && second.changed)
+Assertions.require(third.ok && third.changed)
+Assertions.require(graph.followingIdsFor(alice.value.id).size() == 2)
+Assertions.require(graph.followerIdsFor(bob.value.id).size() == 2)
+Assertions.require(graph.followerIdsFor(bob.value.id)[0] == alice.value.id)
+Assertions.require(graph.followerIdsFor(bob.value.id)[1] == carol.value.id)
+
+// Snapshot lists are reconstructed on each read, never the edge store.
+firstSnapshot: graph.followingIdsFor(alice.value.id)
+secondSnapshot: graph.followingIdsFor(alice.value.id)
+Assertions.require(firstSnapshot !== secondSnapshot)
+Assertions.require(firstSnapshot[0] == bob.value.id)
+
+renamed: identity.updateFixture(
+    bob.value.id, "bob-new", "bob-new@example.test", null, null
+)
+Assertions.require(renamed.ok)
+Assertions.require(identity.findUsername("bob") === null)
+Assertions.require(graph.isFollowing(alice.value.id, bob.value.id))
+Assertions.require(graph.followerIdsFor(bob.value.id).size() == 2)
+
+removed: graph.unfollowFixture(alice.value.id, bob.value.id)
+Assertions.require(removed.ok && removed.changed)
+Assertions.require(!graph.isFollowing(alice.value.id, bob.value.id))
+missing: graph.unfollowFixture(alice.value.id, bob.value.id)
+Assertions.require(missing.ok && !missing.changed)
+Assertions.require(graph.followerIdsFor(bob.value.id).size() == 1)
+Assertions.require(graph.unfollowFixture(777, bob.value.id).field == "follower")
+Assertions.require(graph.unfollowFixture(alice.value.id, 777).field == "profile")
+Assertions.require(graph.followingIdsFor(alice.value.id).size() == 1)
+Assertions.require(graph.isFollowing(carol.value.id, bob.value.id))
+
+otherGraph: FollowStore.create(identity)
+Assertions.require(!otherGraph.isFollowing(carol.value.id, bob.value.id))
+
+// Application integration: follow only known identities, not fixture-only
+// profile strings. Feed count precedes pagination and follows shared ordering.
+store: Store.create()
+a: store.addIdentityFixture("alice", "alice@example.test", null, null)
+b: store.addIdentityFixture("bob", "bob@example.test", "Bob", null)
+c: store.addIdentityFixture("carol", "carol@example.test", null, null)
+d: store.addIdentityFixture("dana", "dana@example.test", null, null)
+Assertions.require(a.ok && b.ok && c.ok && d.ok)
+
+makeArticle: (slug, authorName, createdAt) => {
+    {
+        slug: slug
+        title: slug
+        description: "Test description"
+        body: "Test body"
+        tagList: ["realworld"]
+        createdAt: createdAt
+        updatedAt: createdAt
+        favoritesCount: 0
+        author: {
+            username: authorName
+            bio: null
+            image: null
+        }
+    }
+}
+
+store.addFixture(makeArticle("bob-old", "bob", "2026-11-01T00:00:00.000Z"))
+store.addFixture(makeArticle("alice-own", "alice", "2026-11-02T00:00:00.000Z"))
+store.addFixture(makeArticle("carol-new", "carol", "2026-11-05T00:00:00.000Z"))
+store.addFixture(makeArticle("bob-new", "bob", "2026-11-04T00:00:00.000Z"))
+store.addFixture(makeArticle("unknown", "ghost", "2026-11-06T00:00:00.000Z"))
+
+allOptions: ArticleQuery.read(null)
+before: store.feedForIdentity(a.value.id, allOptions)
+Assertions.require(before.ok)
+Assertions.require(before.total == 0)
+Assertions.require(before.page.size() == 0)
+Assertions.require(!store.feedForIdentity(999, allOptions).ok)
+Assertions.require(store.feedForIdentity(999, allOptions).field == "user")
+
+firstFollow: store.followIdentityFixture(a.value.id, b.value.id)
+Assertions.require(firstFollow.ok && firstFollow.changed)
+Assertions.require(!store.followIdentityFixture(a.value.id, b.value.id).changed)
+Assertions.require(store.isFollowingIdentity(a.value.id, b.value.id))
+Assertions.require(store.followingIdentityIdsFor(a.value.id)[0] == b.value.id)
+Assertions.require(store.followerIdentityIdsFor(b.value.id)[0] == a.value.id)
+
+bobFeed: store.feedForIdentity(a.value.id, allOptions)
+Assertions.require(bobFeed.ok && bobFeed.total == 2)
+Assertions.require(bobFeed.page.size() == 2)
+Assertions.require(bobFeed.page[0].slug == "bob-new")
+Assertions.require(bobFeed.page[1].slug == "bob-old")
+
+Assertions.require(store.followIdentityFixture(a.value.id, c.value.id).changed)
+complete: store.feedForIdentity(a.value.id, allOptions)
+Assertions.require(complete.total == 3)
+Assertions.require(complete.page[0].slug == "carol-new")
+Assertions.require(complete.page[1].slug == "bob-new")
+Assertions.require(complete.page[2].slug == "bob-old")
+
+options: ArticleQuery.read("limit=1&offset=1")
+page: store.feedForIdentity(a.value.id, options)
+Assertions.require(page.ok)
+Assertions.require(page.total == 3)
+Assertions.require(page.page.size() == 1)
+Assertions.require(page.page[0].slug == "bob-new")
+
+emptyPage: store.feedForIdentity(a.value.id, ArticleQuery.read("offset=10"))
+Assertions.require(emptyPage.ok)
+Assertions.require(emptyPage.total == 3)
+Assertions.require(emptyPage.page.size() == 0)
+
+// Author link established when the article fixture was created is stable
+// across an identity rename (public author JSON is still fixture snapshot).
+Assertions.require(store.updateIdentityFixture(
+    b.value.id, "robert", "robert@example.test", null, null
+).ok)
+Assertions.require(store.identityById(b.value.id).username == "robert")
+Assertions.require(store.isFollowingIdentity(a.value.id, b.value.id))
+Assertions.require(store.feedForIdentity(a.value.id, allOptions).total == 3)
+Assertions.require(store.feedForIdentity(a.value.id, allOptions).page[1].slug == "bob-new")
+
+// A legacy article fixture inserted before its identity exists can still be
+// associated by author name at query time once the identity is added.
+store.addFixture(makeArticle("late", "eve", "2026-11-07T00:00:00.000Z"))
+eve: store.addIdentityFixture("eve", "eve@example.test", null, null)
+Assertions.require(eve.ok)
+Assertions.require(store.followIdentityFixture(a.value.id, eve.value.id).changed)
+Assertions.require(store.feedForIdentity(a.value.id, allOptions).total == 4)
+Assertions.require(store.feedForIdentity(a.value.id, allOptions).page[0].slug == "late")
+
+// Existing fixture comments, anonymous public endpoints and protected routes
+// remain unchanged. Following does not magically authorize a request.
+handle: Api.make(store)
+protected: handle({
+    method: "GET"
+    target: Encoding.Latin1.encode("/api/articles/feed")
+})
+Assertions.require(protected.status == 401)
+followHttp: handle({
+    method: "POST"
+    target: Encoding.Latin1.encode("/api/profiles/bob/follow")
+})
+Assertions.require(followHttp.status == 401)
+Assertions.require(store.isFollowingIdentity(a.value.id, b.value.id))
+
+publicResponse: handle({
+    method: "GET"
+    target: Encoding.Latin1.encode("/api/profiles/robert")
+})
+Assertions.require(publicResponse.status == 200)
+publicNode: JSON.parse(Encoding.UTF8.decode(publicResponse.body))
+publicProfile: publicNode.value["profile"].value
+Assertions.require(publicProfile["following"].value == false)
+Assertions.require(!publicProfile.containsKey("email"))
+
+Assertions.require(store.unfollowIdentityFixture(a.value.id, b.value.id).changed)
+Assertions.require(store.feedForIdentity(a.value.id, allOptions).total == 2)
+Assertions.require(store.unfollowIdentityFixture(a.value.id, b.value.id).ok)
+Assertions.require(!store.unfollowIdentityFixture(a.value.id, b.value.id).changed)
+Assertions.require(!store.isFollowingIdentity(a.value.id, b.value.id))
+
+isolated: Store.create()
+Assertions.require(isolated.identityById(b.value.id) === null)
+Assertions.require(isolated.followingIdentityIdsFor(a.value.id).size() == 0)
+Assertions.require(isolated.feedForIdentity(a.value.id, allOptions).total == 0)
+
+true

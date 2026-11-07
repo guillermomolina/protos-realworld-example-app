@@ -4,12 +4,15 @@
 //! instance owns its own article, profile, comment and favorite collections.
 //! There is no database, persistence or authentication authority.
 //! An isolated identity repository holds only non-secret account metadata.
+//! A separate follow graph and article-author bindings use stable IDs.
 //!
 //! Fixture insertion methods support examples and tests. They are not
 //! replacements for authenticated RealWorld mutation endpoints.
 
 Arrays: import("std:collections/array")
 Identities: import("./IdentityStore.protos")
+Follows: import("./FollowStore.protos")
+ArticleQuery: import("./ArticleQuery.protos")
 
 /// Create an independent in-memory store.
 create: () => {
@@ -18,6 +21,10 @@ create: () => {
     comments: []
     favorites: []
     identities: Identities.create()
+    follows: Follows.create(identities)
+    // Fixture article objects are linked to their author IDs when
+    // identities exist. Links survive later username changes.
+    articleAuthors: []
 
     store: {
         // A public profile may be registered explicitly, appear as
@@ -70,6 +77,79 @@ create: () => {
 
         updateIdentityFixture: (id, username, email, bio, image) => {
             identities.updateFixture(id, username, email, bio, image)
+        }
+
+        // Fixture-only social operations: they do not authenticate a caller.
+        followIdentityFixture: (followerId, followedId) => {
+            follows.followFixture(followerId, followedId)
+        }
+
+        unfollowIdentityFixture: (followerId, followedId) => {
+            follows.unfollowFixture(followerId, followedId)
+        }
+
+        isFollowingIdentity: (followerId, followedId) => {
+            follows.isFollowing(followerId, followedId)
+        }
+
+        followingIdentityIdsFor: (followerId) => {
+            follows.followingIdsFor(followerId)
+        }
+
+        followerIdentityIdsFor: (followedId) => {
+            follows.followerIdsFor(followedId)
+        }
+
+        /// Select followed authors' articles, newest first, then paginate.
+        /// The viewer identity must exist. Options come from ArticleQuery.read.
+        /// No caller may obtain this by sending an unauthenticated HTTP request.
+        feedForIdentity: (viewerId, options) => {
+            result: {
+                ok: false
+                page: []
+                total: 0
+                field: "user"
+                message: "not found"
+            }
+
+            if(identities.findId(viewerId) !== null) {
+                followedIds: follows.followingIdsFor(viewerId)
+                selectedArticles: []
+                for(article in items) {
+                    authorId: null
+
+                    // Prefer the stable association captured on insertion.
+                    for(binding in articleAuthors) {
+                        if(binding.article === article) {
+                            authorId = binding.authorId
+                        }
+                    }
+
+                    // Legacy fixtures may predate their author identity.
+                    if(authorId === null) {
+                        author: identities.findUsername(article.author.username)
+                        if(author !== null) {
+                            authorId = author.id
+                        }
+                    }
+
+                    if((authorId !== null) &&
+                       Arrays.contains(followedIds, authorId)) {
+                        selectedArticles = Arrays.append(selectedArticles, article)
+                    }
+                }
+
+                selected: ArticleQuery.select(selectedArticles, options, [])
+                result = {
+                    ok: true
+                    page: selected.page
+                    total: selected.total
+                    field: null
+                    message: null
+                }
+            }
+
+            result
         }
 
         addProfileFixture: (profile) => {
@@ -171,6 +251,13 @@ create: () => {
 
         // Fixture insertion only. Authenticated mutations arrive later.
         addFixture: (article) => {
+            author: identities.findUsername(article.author.username)
+            if(author !== null) {
+                articleAuthors = Arrays.append(articleAuthors, {
+                    article: article
+                    authorId: author.id
+                })
+            }
             items = Arrays.append(items, article)
             article
         }

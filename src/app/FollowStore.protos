@@ -1,0 +1,121 @@
+//! Actor-local follow graph keyed by stable identity IDs.
+//!
+//! A relationship is an ordered pair of existing identity IDs. Changes are
+//! idempotent and never expose an authentication capability. All changes here
+//! are strictly fixture operations; HTTP follow/unfollow stays unauthorized.
+
+Arrays: import("std:collections/array")
+
+accepted: (changed) => {
+    {
+        ok: true
+        changed: changed
+        field: null
+        message: null
+    }
+}
+
+rejected: (field, message) => {
+    {
+        ok: false
+        changed: false
+        field: field
+        message: message
+    }
+}
+
+/// Each instance is independent and receives its identity lookup explicitly.
+create: (identities) => {
+    edges: []
+
+    contains: (followerId, followedId) => {
+        found: false
+        for(edge in edges) {
+            if((edge.followerId == followerId) &&
+               (edge.followedId == followedId)) {
+                found = true
+            }
+        }
+        found
+    }
+
+    graph: {
+        isFollowing: (followerId, followedId) => {
+            contains(followerId, followedId)
+        }
+
+        /// Return a new Array of followed IDs; no mutable edge escapes.
+        followingIdsFor: (followerId) => {
+            result: []
+            for(edge in edges) {
+                if(edge.followerId == followerId) {
+                    result = Arrays.append(result, edge.followedId)
+                }
+            }
+            result
+        }
+
+        /// Return a new Array of follower IDs; no mutable edge escapes.
+        followerIdsFor: (followedId) => {
+            result: []
+            for(edge in edges) {
+                if(edge.followedId == followedId) {
+                    result = Arrays.append(result, edge.followerId)
+                }
+            }
+            result
+        }
+
+        /// Trusted test-fixture edge mutation, not HTTP authorization.
+        followFixture: (followerId, followedId) => {
+            result: null
+            if(identities.findId(followerId) === null) {
+                result = rejected("follower", "not found")
+            } else {
+                if(identities.findId(followedId) === null) {
+                    result = rejected("profile", "not found")
+                } else {
+                    if(followerId == followedId) {
+                        result = rejected("profile", "cannot follow yourself")
+                    } else {
+                        if(contains(followerId, followedId)) {
+                            result = accepted(false)
+                        } else {
+                            edges = Arrays.append(edges, {
+                                followerId: followerId
+                                followedId: followedId
+                            })
+                            result = accepted(true)
+                        }
+                    }
+                }
+            }
+            result
+        }
+
+        /// Removing an absent valid relationship is an idempotent success.
+        unfollowFixture: (followerId, followedId) => {
+            result: null
+            if(identities.findId(followerId) === null) {
+                result = rejected("follower", "not found")
+            } else {
+                if(identities.findId(followedId) === null) {
+                    result = rejected("profile", "not found")
+                } else {
+                    if(contains(followerId, followedId)) {
+                        edges = Arrays.filter(edges, (edge) => {
+                            !((edge.followerId == followerId) &&
+                              (edge.followedId == followedId))
+                        })
+                        result = accepted(true)
+                    } else {
+                        result = accepted(false)
+                    }
+                }
+            }
+            result
+        }
+    }
+
+    graph
+}

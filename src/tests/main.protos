@@ -25,5 +25,8 @@ run: (report) => {
     import("./slice08-identity-store.protos")
     report("REALWORLD_IDENTITY_STORE=PASS")
 
+    import("./slice09-social-feed.protos")
+    report("REALWORLD_SOCIAL_FEED=PASS")
+
     true
 }
