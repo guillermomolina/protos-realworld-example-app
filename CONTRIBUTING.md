@@ -19,4 +19,4 @@ Preserve the distinctions between local tests, externally adapted tests and upst
 
 ## Scope and licensing
 
-Durable storage, restart recovery and production deployment hardening are future work. A separate license file has not yet been published in this application repository; do not interpret public GitHub visibility as a grant of reuse rights. License selection belongs to the repository owner.
+Durable storage, restart recovery and production deployment hardening are future work. This independent example application is distributed under the MIT license (see LICENSE).
