@@ -1,10 +1,72 @@
-# RealWorld backend in Protos
+# RealWorld (Conduit) backend in Protos
 
-A Protos-first RealWorld HTTP backend with RootActor-owned, in-memory accounts,
-credentials, profiles, articles, comments, follows and favorites. Slice 12 adds
-secure authentication and authenticated domain routes. The maintainer has reported
-passing direct, native HTTP, HTTP lifecycle and adapted Hurl tests on Protos
-`0.3.459-SNAPSHOT`; the validation details and scope are recorded below.
+A complete *HTTP route implementation* of the [RealWorld (Conduit) backend API](https://docs.realworld.show/specifications/backend/introduction/), written in [Protos](https://github.com/guillermomolina/protos), an experimental prototype-based programming language implemented on GraalVM/Truffle.
+
+This project demonstrates that Protos can build a nontrivial application with **real TCP networking, two HTTP Worker Actors, RootActor-owned state, Argon2id passwords and HS256 JWT authentication**, using Protos modules and its Standard Library rather than an application-specific Java server.
+
+**Status:** All 19 required application routes are implemented. Local unit/integration and HTTP lifecycle tests have been reported passing. The official Hurl suite passes **12/13 files unmodified**, and **13/13 files (157 requests)** with a documented token-refresh adjustment. **State is in memory and is lost at restart**; this is not a production-ready or fully conformant, persistent backend.
+
+## Quick start
+
+Requires **Protos `0.3.459-SNAPSHOT`** (development baseline) or a newer compatible build, `make`, and `openssl` on your `PATH`. This is not a published stable Protos release.
+
+```sh
+# Terminal 1: from this repository's root
+make serve
+# Look for: REALWORLD_HTTP_READY=127.0.0.1:3000
+```
+
+```sh
+# Terminal 2: exercise public HTTP endpoints
+curl -i http://127.0.0.1:3000/api/tags
+curl -i http://127.0.0.1:3000/api/articles
+```
+
+Type `quit` and Enter in terminal 1 for graceful shutdown. `make serve` generates an ephemeral **development-only** JWT signing key using OpenSSL when no key is configured; set `REALWORLD_JWT_KEY_BASE64URL` explicitly when you need a stable key. The listener binds to `127.0.0.1`, not the public Internet.
+
+## Architecture
+
+```text
+                    TCP 127.0.0.1:3000
+                            |
+                +-----------+-----------+
+                |                       |
+          HTTP Worker Actor 1     HTTP Worker Actor 2
+                |                       |
+                +-----------+-----------+
+                            |
+                    transferable request data
+                            |
+                         RootActor
+                    /       |        \
+                Router   Auth/JWT    MemoryStore
+                            |             |
+                       Argon2id       Users, articles,
+                       + Entropy       follows, favorites
+```
+
+Workers handle their own TCP sessions and transfer bounded HTTP request snapshots; they never receive the mutable store, credentials, signing key, Clock or Entropy grants. The RootActor owns authentication, authorization and all application mutations. There is no custom application-private crypto implementation.
+
+**Suggested source reading order:** [`src/main.protos`](src/main.protos) → [`HttpWorker.protos`](src/app/HttpWorker.protos) → [`Api.protos`](src/app/Api.protos) → [`Auth.protos`](src/app/Auth.protos) → [`AuthStore.protos`](src/app/AuthStore.protos) → [`MemoryStore.protos`](src/app/MemoryStore.protos).
+
+## Tests and compatibility
+
+| Command | Reported outcome |
+| --- | --- |
+| `make test` | 12 test groups passed, including secure authentication |
+| `make test-http` | Authenticated HTTP over real TCP passed |
+| `make test-http-lifecycle` | Workers, request limits, drain and abort passed |
+| `make test-hurl` | 13 files / 157 requests passed **with an explicit test adjustment** |
+
+The **unmodified** official RealWorld Hurl suite passed 12 of 13 files. Its remaining case reused a JWT after a password change, while this implementation revokes old tokens. The tracked [`hurl-refresh-token.patch`](src/tests/hurl-refresh-token.patch) updates the test's token in a temporary copy; it does not modify the official checkout. **An adjusted Hurl pass is not an unmodified official conformance claim.** Details and prerequisites follow below.
+
+## Project status and contributions
+
+The remaining major application feature is **durable persistence and restart recovery**. SQLite/portable database access is separate Protos ecosystem work; it is not included or silently simulated here. The backend has no HTTPS, public hosting or production operational hardening.
+
+See [`TODO.md`](TODO.md) for outstanding work, [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution guidance, and [GitHub Issues](https://github.com/guillermomolina/protos-realworld-example-app/issues) to report a reproducible problem or propose an improvement. For the language itself, see the [Protos repository](https://github.com/guillermomolina/protos) and [language website](https://protos.guillermomolina.com/).
+
+---
 
 ## Required Protos capabilities
 
@@ -27,7 +89,7 @@ make serve
 protos --allow-network --allow-entropy --allow-clock --service=service src/main.protos
 ```
 
-Set `REALWORLD_JWT_KEY_BASE64URL` in the server process environment before starting.
+For a stable signing key, set `REALWORLD_JWT_KEY_BASE64URL` in the server process environment before starting; `make serve` otherwise supplies a temporary development key.
 Its value must be a valid Base64url encoding of **32–4096 cryptographically random
 key octets**. Generate the key outside source code with a trusted secret-management
 or random-key tool. Keep it secret and stable across service starts; never commit
