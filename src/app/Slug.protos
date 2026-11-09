@@ -1,0 +1,54 @@
+//! Deterministic ASCII slugs. Call only after the bounded title policy passes.
+//!
+//! The slug is the public article URL identifier: "Hello, Protos!" becomes
+//! "hello-protos". Keep only ASCII letters/digits and collapse other bytes into
+//! word separators. Titles with none use "article"; no transliteration is tried.
+//! The original title is still stored as entered; this conversion is for URLs.
+base: (title) => {
+    output: Encoding.Latin1.encode("")
+    separator: false
+    for(octet in Encoding.UTF8.encode(title)) {
+        value: octet
+        if((value >= 65) && (value <= 90)) { value = value + 32 }
+        if(((value >= 97) && (value <= 122)) ||
+           ((value >= 48) && (value <= 57))) {
+            if(separator && (output.size() > 0)) { output.add(45) }
+            output.add(value)
+            separator = false
+        } else { separator = true }
+    }
+    result: Encoding.Latin1.decode(output)
+    if(result == "") { result = "article" }
+    result
+}
+
+/// Ordinary decimal rendering keeps allocation independent of display hooks.
+decimal: (number) => {
+    value: number
+    reversed: Encoding.Latin1.encode("")
+    if(value == 0) { reversed.add(48) }
+    while(value > 0) {
+        digit: value % 10
+        reversed.add(48 + digit)
+        value = (value - digit) / 10
+    }
+    output: Encoding.Latin1.encode("")
+    for(index, 0, reversed.size()) {
+        output.add(reversed[reversed.size() - index - 1])
+    }
+    Encoding.Latin1.decode(output)
+}
+
+/// Try the base, then -2, -3, ... against current store contents. Duplicate titles
+/// therefore succeed. Api allocates and inserts without an intervening wait;
+/// updates never allocate again, preserving links when an article is renamed.
+allocate: (store, title) => {
+    stem: base(title)
+    slug: stem
+    suffix: 2
+    while(store.find(slug) !== null) {
+        slug = stem + "-" + decimal(suffix)
+        suffix = suffix + 1
+    }
+    slug
+}

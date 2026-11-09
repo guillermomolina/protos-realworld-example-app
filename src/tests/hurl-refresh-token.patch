@@ -1,0 +1,11 @@
+--- errors_auth.hurl
++++ errors_auth.hurl
+@@ -246,6 +246,8 @@
+     "password": "bonjour1"
+   }
+ }
+ HTTP 200
++[Captures]
++token: jsonpath "$.user.token"
+ 
+ # Update password to 64 chars - should accept

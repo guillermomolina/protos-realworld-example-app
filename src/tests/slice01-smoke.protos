@@ -1,4 +1,7 @@
-// focal assertions for the first RealWorld read API slice.
+//! First application example: build a store, create a handler and call it.
+//! A request/response is an ordinary object, so these tests need no TCP socket.
+//! Seed articles directly, then assert list/detail/tag/error JSON contracts.
+//! Api.make without Auth intentionally leaves protected operations unavailable.
 
 Assertions: import("std:test/assertions")
 JSON: import("std:json/json")
@@ -17,7 +20,9 @@ decode: (response) => {
 }
 
 store: Store.create()
-handle: Api.make(store)
+// Surface the original operational error instead of hiding its stack behind
+// an assertion about a sanitized HTTP 503. No exception payload is printed.
+handle: Api.make(store, null, (failure) => { failure.signal() })
 
 emptyTags: handle(requestOf("GET", "/api/tags"))
 Assertions.require(emptyTags.status == 200)

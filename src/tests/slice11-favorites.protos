@@ -1,7 +1,7 @@
 //! Fixture-only stable-ID favorites, public filters and lifecycle invariants.
 //!
 //! No supplied identity ID is accepted from HTTP. Article favorite endpoints
-//! remain unauthorized until validated tokens establish a principal.
+//! remain unauthorized in this fixture, which does not supply an Auth service.
 
 Assertions: import("std:test/assertions")
 JSON: import("std:json/json")

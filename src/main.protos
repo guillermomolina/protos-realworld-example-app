@@ -1,7 +1,7 @@
 //! Native HTTP entry point for the RealWorld learning application.
 //!
 //! Run with:
-//!   protos --allow-network --service=service src/main.protos
+//!   protos --allow-network --allow-entropy --allow-clock --service=service src/main.protos
 //!
 //! The RootActor owns Network authority and the single mutable MemoryStore.
 //! Two Worker Actors accept connections through explicitly delegated
@@ -10,6 +10,28 @@
 //!
 //! Each Worker processes one HTTP connection at a time. This bounds the
 //! application's active sessions to two, without introducing shared state.
+//!
+//! Suggested reading order for someone new to the project:
+//!   main -> HttpWorker -> Api -> Auth -> AuthStore -> MemoryStore.
+//! Follow Articles/Comments/Users last to see how domain values become JSON.
+//!
+//! One request travels through these steps:
+//!   TCP connection -> Worker reads HTTP -> RootActor handles a data snapshot
+//!   -> Router selects a handler -> authenticate/validate/change state
+//!   -> build response Bytes -> Worker writes HTTP and closes the connection.
+//!
+//! Protos notation used throughout this example:
+//!   name: value declares a binding or an object slot; name = value updates it.
+//!   (arguments) => { ... } creates a Closure (a function). Its final expression
+//!   is its result. { name: value } builds an object with named slots.
+//!   import(...) loads a module; .slot reads a slot and .method(...) calls it.
+//!   Keep `} else {` on the same logical line: a newline ends the conditional.
+//!
+//! An Actor owns its mutable state and communicates by messages. A capability
+//! is an object granting a particular operation, such as accepting connections.
+//! The CLI supplies Network, Entropy and Clock only with the explicit grants.
+//! Passing a capability is a deliberate grant of authority, not just data sharing.
+//! This module exports service; importing it does not itself start a listener.
 
 IpAddress: import("std:network/ip_addresses").IpAddress
 Level: import("std:logging/level")
@@ -20,11 +42,16 @@ ColoredFormatter: import("std:logging/colored_formatter")
 Store: import("./app/MemoryStore.protos")
 Api: import("./app/Api.protos")
 HttpWorkers: import("./app/HttpWorkers.protos")
+Auth: import("./app/Auth.protos")
+Base64url: import("std:text/base64url")
+Instant: import("std:datetime/instant")
 
 /// Install the application service behavior on the RootActor.
 /// The bootstrap schedules startup after READY, so listener acquisition
 /// and Worker initialization run in an ordinary Actor message turn.
 service: () => {
+    // TextWriter turns Strings into output using the process's chosen encoding.
+    // stdout is a capability too; only this Actor writes application logs.
     writer: TextWriter(
         process.stdout(),
         process.stdoutEncoding()
@@ -38,7 +65,7 @@ service: () => {
     )
 
     store: Store.create()
-    handler: Api.make(store)
+    handler: null
 
     // A GroupRef grants request/reply communication with this service
     // without granting Workers permission to stop the RootActor.
@@ -47,17 +74,71 @@ service: () => {
     listener: null
     host: null
 
+    // Emit only a fixed application label, never the provider's exception,
+    // environment contents or key material. Startup must still fail closed.
+    failStartup: (reason) => {
+        writer.writeLine("REALWORLD_HTTP_STARTUP_FAILED=" + reason).value()
+        Error().signal()
+    }
+    startupStep: (name, operation) => {
+        // Error.handle evaluates the first Closure and invokes the second if
+        // an Error is signaled. Re-signaling keeps startup unsuccessful; the
+        // safe label explains the stage without exposing the exception payload.
+        result: null
+        Error.handle(
+            () => { result = operation() },
+            (failure) => {
+                writer.writeLine("REALWORLD_HTTP_STARTUP_FAILED=" + name).value()
+                failure.signal()
+            }
+        )
+        result
+    }
+
     behavior: {
+        // The returned object's slots are the messages this Actor can handle.
+        // send("start") below schedules startup; it does not call start inline.
         start: () => {
-            listener = network.listenTcp(
-                ipVersion: 4,
-                address: IpAddress(4, 2130706433),
-                port: 3000
-            ).value()
+            // Resolve explicit RootActor authorities before opening a listener.
+            // This observation also fails startup if Clock is absent.
+            startupStep("clock", () => { Instant(clock.epochNanoseconds()) })
+            encodedKey: startupStep("environment", () => {
+                process.environment().get("REALWORLD_JWT_KEY_BASE64URL")
+            })
+            if(encodedKey === null) { failStartup("missing_REALWORLD_JWT_KEY_BASE64URL") }
+            key: startupStep("jwt_key_base64url_decode", () => {
+                Base64url.decode(encodedKey)
+            })
+            if(key === null) { failStartup("invalid_jwt_key") }
+            if((key.size() < 32) || (key.size() > 4096)) {
+                failStartup("jwt_key_requires_32_to_4096_octets")
+            }
+            // Resolve Entropy before readiness rather than waiting for the
+            // first registration. These bytes are not a replacement key.
+            entropyProbe: startupStep("entropy", () => { entropy.bytes(16).value() })
+            if(entropyProbe.size() != 16) { failStartup("invalid_entropy_result") }
+            // Never captured by a Worker or included in request/reply data.
+            // now is a zero-argument Closure, not a cached startup timestamp.
+            // Auth invokes it whenever it needs the current trusted time.
+            handler = startupStep("authentication_setup", () => {
+                authentication: Auth.create(store, entropy, key,
+                    () => { Instant(clock.epochNanoseconds()) })
+                Api.make(store, authentication)
+            })
+
+            listener = startupStep("listen_127_0_0_1_3000", () => {
+                network.listenTcp(
+                    ipVersion: 4,
+                    address: IpAddress(4, 2130706433),
+                    port: 3000
+                ).value()
+            })
 
             // Keep Worker startup, service replies and lifetime ownership
             // together, so drain can wait for admitted sessions to retire.
-            host = HttpWorkers.start(listener, application, 2)
+            host = startupStep("http_workers", () => {
+                HttpWorkers.start(listener, application, 2)
+            })
 
             // Announce readiness only after the listener exists and both
             // Worker behaviors are initialized and scheduled to serve.
@@ -108,6 +189,8 @@ service: () => {
             null
         }
         handle: (request) => {
+            // This is where the Workers' request messages enter application code.
+            // handler returns ordinary response data; it never writes a socket.
             response: handler(request)
             // This records the generated response, not a completed TCP write.
             // Deliberately omit target/query, headers and body to avoid

@@ -1,8 +1,14 @@
 //! Actor-local follow graph keyed by stable identity IDs.
 //!
 //! A relationship is an ordered pair of existing identity IDs. Changes are
-//! idempotent and never expose an authentication capability. All changes here
-//! are strictly fixture operations; HTTP follow/unfollow stays unauthorized.
+//! idempotent and never expose an authentication capability. MemoryStore uses
+//! the trusted Fixture operations after Api obtains a principal from Auth.
+//!
+//! An edge is {followerId, followedId}: its direction matters. Following someone
+//! includes that author's articles in your feed; it does not make them follow
+//! you. The graph checks both identities exist and disallows self-follow.
+//! Repeating follow/unfollow succeeds without inserting/removing a second edge.
+//! Results use ok for success and changed for whether an edge actually changed.
 
 Arrays: import("std:collections/array")
 
@@ -66,7 +72,8 @@ create: (identities) => {
             result
         }
 
-        /// Trusted test-fixture edge mutation, not HTTP authorization.
+        /// Trusted edge mutation shared by fixtures and the application facade.
+        /// Supplying numeric IDs alone is never HTTP authorization.
         followFixture: (followerId, followedId) => {
             result: null
             if(identities.findId(followerId) === null) {

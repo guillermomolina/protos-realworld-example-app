@@ -2,6 +2,11 @@
 //!
 //! Start the application with `make serve` in another terminal.
 //! Run these assertions with `make test-http`.
+//!
+//! Unlike the direct suite, each exchange opens a real connection to port 3000.
+//! Restart the server before rerunning: fixed test account names remain in memory.
+//! Follow the authenticated scenario near registration at the end of this file
+//! to see tokens captured from JSON and passed back in Authorization headers.
 
 Assertions: import("std:test/assertions")
 Client: import("std:http/client").Client
@@ -100,23 +105,77 @@ checkPost(
     "{\"errors\":{\"username\":[\"can't be blank\"]}}"
 )
 checkPost(
-    "/api/users",
-    "{\"user\":{\"username\":\"alice\",\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
-    501,
-    "{\"errors\":{\"service\":[\"not implemented\"]}}"
-)
-checkPost(
     "/api/users/login",
     "{\"user\":{\"email\":\"a@b.test\",\"password\":\"\"}}",
     422,
     "{\"errors\":{\"password\":[\"can't be blank\"]}}"
 )
-checkPost(
-    "/api/users/login",
-    "{\"user\":{\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
-    501,
-    "{\"errors\":{\"service\":[\"not implemented\"]}}"
-)
+// Every authenticated step traverses native TCP -> Worker -> RootActor.
+// Parse tokens from actual responses; diagnostics contain no request secrets.
+JSON: import("std:json/json")
+Arrays: import("std:collections/array")
+exchange: (method, target, body, token, status) => {
+    // Client.exchangeOne.owning closes the connection after the response callback
+    // finishes, even when an assertion fails. Read the body inside that callback
+    // while its session is live; return detached parsed JSON to the test steps.
+    connection: network.connectTcp(IpEndpoint(loopback, 3000)).value()
+    headers: [["Host", Encoding.Latin1.encode("127.0.0.1")],
+        ["Content-Type", Encoding.Latin1.encode("application/json")]]
+    if(token !== null) {
+        headers = Arrays.append(headers,
+            ["Authorization", Encoding.Latin1.encode("Token " + token)])
+    }
+    bytes: null
+    if(body !== null) { bytes = Encoding.UTF8.encode(JSON.encode(body)) }
+    result: null
+    Client.exchangeOne.owning(connection, {
+        method: method
+        target: Encoding.Latin1.encode(target)
+        headers: headers
+        body: bytes
+    }, (response) => {
+        Assertions.require(response.status == status)
+        text: readBody(response)
+        if(status == 204) { Assertions.require(text == "") } else { result = JSON.parse(text).value }
+        true
+    }, null).value()
+    result
+}
+registration: JSON.object("user", JSON.object(
+    "username", JSON.string("native-alice"),
+    "email", JSON.string("native-alice@example.test"),
+    "password", JSON.string("native integration password")))
+registered: exchange("POST", "/api/users", registration, null, 201)["user"].value
+Assertions.require(registered["token"].kind == "string")
+Assertions.require(!registered.containsKey("password"))
+Assertions.require(!registered.containsKey("id"))
+logged: exchange("POST", "/api/users/login", JSON.object("user", JSON.object(
+    "email", JSON.string("native-alice@example.test"),
+    "password", JSON.string("native integration password"))), null, 200)["user"].value
+token: logged["token"].value
+account: exchange("GET", "/api/user", null, token, 200)["user"].value
+Assertions.require(account["username"].value == "native-alice")
+created: exchange("POST", "/api/articles", JSON.object("article", JSON.object(
+    "title", JSON.string("Native secure article"),
+    "description", JSON.string("TCP integration"),
+    "body", JSON.string("Real HTTP content"))), token, 201)["article"].value
+path: "/api/articles/" + created["slug"].value
+read: exchange("GET", path, null, token, 200)["article"].value
+Assertions.require(read["body"].value == "Real HTTP content")
+favorite: exchange("POST", path + "/favorite", null, token, 200)["article"].value
+Assertions.require(favorite["favorited"].value)
+Assertions.require(favorite["favoritesCount"].value.coefficient == 1)
+comment: exchange("POST", path + "/comments", JSON.object("comment", JSON.object(
+    "body", JSON.string("Native comment"))), token, 201)["comment"].value
+unfavorite: exchange("DELETE", path + "/favorite", null, token, 200)["article"].value
+Assertions.require(!unfavorite["favorited"].value)
+Assertions.require(unfavorite["favoritesCount"].value.coefficient == 0)
+commentId: JSON.encode(comment["id"])
+exchange("DELETE", path + "/comments/" + commentId, null, token, 204)
+Assertions.require(exchange("GET", path + "/comments", null, null, 200)["comments"].value.size() == 0)
+exchange("DELETE", path, null, token, 204)
+exchange("GET", path, null, null, 404)
+// The in-memory account remains until restart; run against a fresh server.
 
 print("REALWORLD_NATIVE_HTTP=PASS")
 true

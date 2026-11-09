@@ -1,0 +1,18 @@
+//! Explicit allowlist: never serialize internal identity or credential objects.
+//!
+//! A presenter turns domain data into standard JSON nodes; Responses later
+//! serializes the nodes to UTF-8 HTTP Bytes. This account view intentionally
+//! includes email and the access token, unlike a public author/profile view.
+//! Nullable bio/image are JSON null, not the String "null" or omitted members.
+JSON: import("std:json/json")
+Articles: import("./Articles.protos")
+
+single: (identity, token) => {
+    JSON.object("user", JSON.object(
+        "username", JSON.string(identity.username),
+        "email", JSON.string(identity.email),
+        "token", JSON.string(token),
+        "bio", Articles.nullableText(identity.bio),
+        "image", Articles.nullableText(identity.image)
+    ))
+}

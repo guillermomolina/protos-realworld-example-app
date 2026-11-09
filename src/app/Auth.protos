@@ -1,0 +1,176 @@
+//! RootActor application authentication. The injected now closure is called
+//! afresh for every issuance, verification and domain timestamp observation.
+//!
+//! Auth answers "which account is making this request?". Owner authorization
+//! answers "may that account change this resource?" and remains in Api/stores.
+//! AuthStore keeps credentials; this module keeps the signing key and connects
+//! verified JWT claims to those retained accounts. It never trusts decoded JSON
+//! claims without the Standard Library's signature and policy verification.
+JWT: import("std:auth/jwt")
+JSON: import("std:json/json")
+ISO8601: import("std:datetime/iso8601")
+Credentials: import("./AuthStore.protos")
+Authorization: import("./Authorization.protos")
+Users: import("./Users.protos")
+Responses: import("./Responses.protos")
+
+/// Issuer identifies this service; audience identifies its intended consumers.
+/// The protected type distinguishes access tokens from other JWT uses. All
+/// lifetimes/skew here are seconds; standard JWT fixes the signing algorithm.
+policy: () => {
+    {
+        issuer: "protos-realworld"
+        audience: "protos-realworld"
+        type: "realworld-access+jwt"
+        maxLifetimeSeconds: 3600
+        clockSkewSeconds: 0
+    }
+}
+
+/// JWT timestamps are whole epoch seconds, whereas Instant stores nanoseconds.
+/// Remove the remainder before dividing so division is exact Integer arithmetic.
+/// For times before the epoch, floor down: -1 nanosecond belongs to second -1.
+seconds: (instant) => {
+    nanos: instant.nanoseconds
+    remainder: nanos % 1000000000
+    quotient: (nanos - remainder) / 1000000000
+    if((nanos < 0) && (remainder != 0)) {
+        quotient = quotient - 1
+    }
+    quotient
+}
+
+/// Dependencies are explicit so each instance belongs to one application store.
+/// Production supplies real RootActor authority; tests can control only now's
+/// Instant value while retaining genuine password/JWT/entropy providers.
+create: (store, entropy, signingKey, now) => {
+    // The standard codec admits genuine Bytes and creates an independent copy.
+    // A non-Bytes input is rejected before a service can retain any key.
+    retainedKey: null
+    Error.handle(
+        () => { retainedKey = Encoding.Latin1.encode(Encoding.Latin1.decode(signingKey)) },
+        (failure) => { failure }
+    )
+    if(retainedKey === null) { Error().signal() }
+    if((retainedKey.size() < 32) || (retainedKey.size() > 4096)) { Error().signal() }
+    credentials: Credentials.create(store, entropy)
+    jwtPolicy: policy()
+    // Private issuance also supports a prepared subject before account commit.
+    issueForSubject: (subject, generation) => {
+        if((subject === null) || (generation === null)) { Error().signal() }
+        observed: now()
+        issued: seconds(observed)
+        // sub is a random stable subject, not a username. iat is issuance time;
+        // exp is expiration time. generation is this application's revocation
+        // counter: a password change increments it in the retained credentials.
+        // JSON.number(integer, 0) creates an exact number with no decimal scale.
+        claims: JSON.object(
+            "iss", JSON.string("protos-realworld"),
+            "aud", JSON.string("protos-realworld"),
+            "sub", JSON.string(subject),
+            "iat", JSON.number(issued, 0),
+            "exp", JSON.number(issued + 3600, 0),
+            "generation", JSON.number(generation, 0)
+        )
+        JWT.issue(claims, retainedKey, jwtPolicy, observed)
+    }
+    issue: (identity) => {
+        issueForSubject(credentials.subjectFor(identity.id),
+            credentials.generationFor(identity.id))
+    }
+    accountResponse: (result, status, registration) => {
+        // Registration has already signed before committing either record.
+        // Signing again here could report failure after creating an account.
+        // Login and account updates issue their response token in the usual way.
+        response: null
+        if(result.ok) {
+            token: null
+            if(registration) { token = result.token } else { token = issue(result.value) }
+            response = Responses.json(status, Users.single(result.value, token))
+        } else {
+            if(result.field == "credentials") { response = Responses.invalidCredentials() } else {
+                if(result.field == "token") { response = Responses.invalidToken() } else { response = Responses.domainError(result) }
+            }
+        }
+        response
+    }
+    service: {
+        register: (fields) => {
+            accountResponse(credentials.register(fields["username"].value,
+                fields["email"].value, fields["password"].value,
+                issueForSubject), 201, true)
+        }
+        login: (fields) => {
+            accountResponse(credentials.authenticate(fields["email"].value,
+                fields["password"].value), 200, false)
+        }
+        issue: issue
+        resolve: (headers) => {
+            // Parsing establishes only that credentials were supplied. Only
+            // verify + retained-subject lookup + matching generation can create
+            // the "valid" state. Absent and invalid both have principal=null.
+            parsed: Authorization.read(headers)
+            result: {
+                state: parsed.state
+                principal: null
+            }
+            if(parsed.state == "supplied") {
+                result = {
+                    state: "invalid"
+                    principal: null
+                }
+                claims: null
+                // Handle expected token failures locally. signal() transfers
+                // control to an enclosing handler; it does not return a false
+                // result at the signaling point. Unexpected failures must reach
+                // Api's operational-error boundary instead of becoming HTTP 401.
+                Error.handle(
+                    () => { claims = JWT.verify(parsed.token, retainedKey, jwtPolicy, now()) },
+                    (failure) => {
+                        // Provider/Clock failures propagate as operational
+                        // errors; only standard JwtError means invalid token.
+                        if(!(failure.parent() === JWT.JwtError)) { failure.signal() }
+                        failure
+                    }
+                )
+                if(claims !== null) {
+                    fields: claims.value
+                    if(fields.containsKey("sub") && fields.containsKey("generation")) {
+                        subject: fields["sub"]
+                        generation: fields["generation"]
+                        if((subject.kind == "string") && (generation.kind == "number")) {
+                            identity: credentials.findSubject(subject.value)
+                            if(identity !== null) {
+                                expected: credentials.generationFor(identity.id)
+                                // Require an exact integer claim, never a lossy
+                                // floating point conversion or truthy string.
+                                if(JSON.encode(generation) == JSON.encode(JSON.number(expected, 0))) {
+                                    result = {
+                                        state: "valid"
+                                        principal: {
+                                            id: identity.id
+                                            generation: expected
+                                            token: parsed.token
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            result
+        }
+        current: (principal) => {
+            // Users.single allowlists public account fields. Re-read metadata
+            // because the token's stable subject outlives username/email edits.
+            Users.single(store.identityById(principal.id), principal.token)
+        }
+        update: (principal, fields) => {
+            accountResponse(credentials.updateAccount(principal.id,
+                principal.generation, fields), 200, false)
+        }
+        timestamp: () => { ISO8601.formatInstant(now()) }
+    }
+    service
+}

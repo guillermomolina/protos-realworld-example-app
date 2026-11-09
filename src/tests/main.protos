@@ -1,38 +1,65 @@
 //! RealWorld test suite; reporting is supplied by the CLI entry.
+//!
+//! Learning path: smoke/wire tests explain response objects and HTTP framing;
+//! queries/public content explain presentation; identity/social/content/favorite
+//! fixtures explain domain rules without credentials. The final group connects
+//! all these pieces to genuine cryptography and authenticated request handling.
+//!
+//! Assertions.require(false) signals an Error, stopping before the PASS marker.
+//! A report is evidence only for the group that has just completed. This runner
+//! does not start the production server; native HTTP has its own test entry.
 
-run: (report) => {
+run: (report, entropy, clock) => {
+    // Report before each import: an import or assertion failure must not look
+    // like an unidentified failure in a later cryptographic test group.
+    // Labels contain no request data, credentials or exception payloads.
+    report("SLICE01_SMOKE=START")
     import("./slice01-smoke.protos")
     report("SLICE01_SMOKE=PASS")
 
+    report("SLICE01_WIRE=START")
     import("./slice01-wire-smoke.protos")
     report("SLICE01_WIRE=PASS")
 
+    report("SLICE02_ARTICLES_QUERY=START")
     import("./slice02-articles-query.protos")
     report("SLICE02_ARTICLES_QUERY=PASS")
 
+    report("SLICE03_PUBLIC_CONTENT=START")
     import("./slice03-public-content.protos")
     report("SLICE03_PUBLIC_CONTENT=PASS")
 
+    report("SLICE04_PUBLIC_ERRORS=START")
     import("./slice04-public-errors.protos")
     report("SLICE04_PUBLIC_ERRORS=PASS")
 
+    report("REALWORLD_JSON_CONTRACT=START")
     import("./slice06-json-contract.protos")
     report("REALWORLD_JSON_CONTRACT=PASS")
 
+    report("REALWORLD_IDENTITY_ROUTING=START")
     import("./slice07-identity-routing.protos")
     report("REALWORLD_IDENTITY_ROUTING=PASS")
 
+    report("REALWORLD_IDENTITY_STORE=START")
     import("./slice08-identity-store.protos")
     report("REALWORLD_IDENTITY_STORE=PASS")
 
+    report("REALWORLD_SOCIAL_FEED=START")
     import("./slice09-social-feed.protos")
     report("REALWORLD_SOCIAL_FEED=PASS")
 
+    report("REALWORLD_CONTENT_MUTATIONS=START")
     import("./slice10-content-mutations.protos")
     report("REALWORLD_CONTENT_MUTATIONS=PASS")
 
+    report("REALWORLD_IDENTITY_FAVORITES=START")
     import("./slice11-favorites.protos")
     report("REALWORLD_IDENTITY_FAVORITES=PASS")
+
+    report("REALWORLD_SECURE_AUTH_HTTP=START")
+    import("./slice12-secure-auth-http.protos").run(entropy, clock)
+    report("REALWORLD_SECURE_AUTH_HTTP=PASS")
 
     true
 }

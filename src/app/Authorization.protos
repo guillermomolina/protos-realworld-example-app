@@ -1,0 +1,70 @@
+//! Duplicate-preserving parsing of the HTTP snapshot. No token decoding here.
+//!
+//! headers is an Array of [String fieldName, Bytes fieldValue] pairs. Keeping
+//! the Array matters: a Map could silently discard a duplicate Authorization.
+//! Field names ignore ASCII case, while the accepted value is exactly one
+//! "Token " prefix followed by a three-part compact JWT (at most 8192 bytes).
+//! A syntactically plausible token is still untrusted; Auth verifies it next.
+
+asciiLower: (text) => {
+    bytes: Encoding.UTF8.encode("")
+    for(octet in Encoding.UTF8.encode(text)) {
+        value: octet
+        if((value >= 65) && (value <= 90)) { value = value + 32 }
+        bytes.add(value)
+    }
+    Encoding.UTF8.decode(bytes)
+}
+
+/// Return {state, token}: absent (none), invalid (bad/duplicate syntax), or
+/// supplied (one token to verify). This parser never returns a principal.
+read: (headers) => {
+    count: 0
+    token: null
+    valid: true
+    for(pair in headers) {
+        if(asciiLower(pair[0]) == "authorization") {
+            count = count + 1
+            bytes: pair[1]
+            if((bytes.size() < 7) || (bytes.size() > 8198)) {
+                valid = false
+            } else {
+                prefix: Encoding.Latin1.encode("Token ")
+                for(index, 0, 6) {
+                    if(bytes[index] != prefix[index]) { valid = false }
+                }
+                output: Encoding.Latin1.encode("")
+                dots: 0
+                // Compact JWT is header.payload.signature. Count separators
+                // and nonempty parts without interpreting any claimed identity.
+                segmentSize: 0
+                for(index, 6, bytes.size()) {
+                    octet: bytes[index]
+                    if(octet == 46) {
+                        if(segmentSize == 0) { valid = false }
+                        dots = dots + 1
+                        segmentSize = 0
+                    } else {
+                        allowed: ((octet >= 65) && (octet <= 90)) ||
+                            ((octet >= 97) && (octet <= 122)) ||
+                            ((octet >= 48) && (octet <= 57)) ||
+                            (octet == 45) || (octet == 95)
+                        if(!allowed) { valid = false }
+                        segmentSize = segmentSize + 1
+                    }
+                    output.add(octet)
+                }
+                if((dots != 2) || (segmentSize == 0)) { valid = false }
+                token = Encoding.Latin1.decode(output)
+            }
+        }
+    }
+    state: "invalid"
+    if(count == 0) { state = "absent" } else {
+        if((count == 1) && valid) { state = "supplied" }
+    }
+    {
+        state: state
+        token: token
+    }
+}

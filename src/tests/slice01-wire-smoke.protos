@@ -1,4 +1,7 @@
-// focal HTTP/1.1 wire test without network authority.
+//! Test actual standard HTTP parsing/serialization without a network grant.
+//! duplexOf supplies read/write/close operations over in-memory Bytes; the real
+//! Server consumes that interface as it would a connection. Completed Futures
+//! preserve the asynchronous I/O contract without opening a TCP socket.
 
 Assertions: import("std:test/assertions")
 Server: import("std:http/server").Server

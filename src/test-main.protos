@@ -1,6 +1,14 @@
 //! Run focused RealWorld tests from the shared src/ SOURCE root.
 //! src/tests/ may import sibling ../app/ modules through this entry.
+//!
+//! Start here to learn the application through assertions rather than sockets.
+//! `make test` grants Entropy/Clock to this RootActor entry, which forwards them
+//! explicitly to the suite. Importing a test module executes its top-level
+//! assertions; the secure-auth module instead exports run(entropy, clock).
+//! START/LOADED markers help distinguish import failures from assertion failures.
 
+print("REALWORLD_TEST_ENTRY=START")
 Suite: import("./tests/main.protos")
-Suite.run(print)
+print("REALWORLD_TEST_SUITE=LOADED")
+Suite.run(print, entropy, clock)
 true

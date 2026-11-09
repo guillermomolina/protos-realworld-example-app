@@ -1,6 +1,40 @@
-// Article query and pagination regression tests.
+//! Query/filter/pagination examples, including exact fractional-time ordering.
+//! The first cases call ArticleQuery directly; the remaining cases exercise
+//! public HTTP handlers over seeded stores. No client can choose a principal.
 
 Assertions: import("std:test/assertions")
+FractionalQuery: import("../app/ArticleQuery.protos")
+
+// Exact chronological ordering across fractional precision within one second.
+fractionalArticles: [
+    { slug: "whole"
+      createdAt: "2026-11-09T10:00:00Z" },
+    { slug: "tenths"
+      createdAt: "2026-11-09T10:00:00.1Z" },
+    { slug: "hundredths"
+      createdAt: "2026-11-09T10:00:00.11Z" },
+    { slug: "nanoseconds"
+      createdAt: "2026-11-09T10:00:00.111111111Z" }
+]
+fractionalSelected: FractionalQuery.select(
+    fractionalArticles, FractionalQuery.read(null), [])
+Assertions.require(fractionalSelected.total == 4)
+Assertions.require(fractionalSelected.page.size() == 4)
+Assertions.require(fractionalSelected.page[0].slug == "nanoseconds")
+Assertions.require(fractionalSelected.page[1].slug == "hundredths")
+Assertions.require(fractionalSelected.page[2].slug == "tenths")
+Assertions.require(fractionalSelected.page[3].slug == "whole")
+fractionalPage: FractionalQuery.select(
+    fractionalArticles, FractionalQuery.read("limit=2&offset=1"), [])
+Assertions.require(fractionalPage.total == 4)
+Assertions.require(fractionalPage.page.size() == 2)
+Assertions.require(fractionalPage.page[0].slug == "hundredths")
+Assertions.require(fractionalPage.page[1].slug == "tenths")
+Assertions.require(!FractionalQuery.laterThan(
+    "2026-11-09T10:00:00Z", "2026-11-09T10:00:00.000000000Z"))
+Assertions.require(!FractionalQuery.laterThan(
+    "2026-11-09T10:00:00.000000000Z", "2026-11-09T10:00:00Z"))
+
 JSON: import("std:json/json")
 Store: import("../app/MemoryStore.protos")
 Api: import("../app/Api.protos")

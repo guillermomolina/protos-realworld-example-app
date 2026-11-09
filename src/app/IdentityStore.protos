@@ -4,8 +4,14 @@
 //! and immutable-by-copy lookup results. Contains no password, verifier, token,
 //! signing key, login method or cryptographic substitute.
 //!
-//! Mutations are fixture-only: do not expose them as registration/update HTTP
-//! handlers until trusted credential hashing and JWT support are integrated.
+//! MemoryStore reuses the trusted Fixture operations for authenticated account
+//! admission/update after AuthStore performs security work. The operations here
+//! cannot authenticate a client or issue a token by themselves.
+//!
+//! A numeric id is assigned once; usernames/emails can change. Other stores keep
+//! that id as their owner/relationship key, so a rename preserves ownership.
+//! Lookups return new objects: editing a returned profile cannot edit retained
+//! state. Rejected insertions do not advance nextId or occupy either name.
 
 Arrays: import("std:collections/array")
 
@@ -123,7 +129,8 @@ create: () => {
         }
 
         /// Trusted fixture insertion, never a registration endpoint.
-        /// Uniqueness is exact/case-sensitive; email policy is not yet here.
+        /// Uniqueness is exact/case-sensitive. HTTP email/password policy is
+        /// enforced by RequestJson/AuthStore before reaching this repository.
         addFixture: (username, email, bio, image) => {
             outcome: null
             if((username === null) || (username == "")) {

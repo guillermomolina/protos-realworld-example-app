@@ -1,4 +1,6 @@
-// Public profile and comment API tests.
+//! Public profile/comment presentation through an in-memory request handler.
+//! Seeded domain values become JSON nodes, then UTF-8 response Bytes. Assertions
+//! decode those Bytes to inspect field types, nulls, author projections and 404s.
 
 Assertions: import("std:test/assertions")
 JSON: import("std:json/json")

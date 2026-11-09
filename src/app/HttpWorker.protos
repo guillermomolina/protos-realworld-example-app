@@ -6,6 +6,16 @@
 //! HTTP parsing and connection custody stay here; business logic and
 //! mutable application state remain in the RootActor. Drain never cancels
 //! a session that was admitted before the shutdown cutover.
+//!
+//! Think of this Actor as one independent HTTP connection attendant. The
+//! acceptor lets it accept from an existing listener but not open new listeners.
+//! application is a communication reference: request("handle", data) asks the
+//! RootActor for a reply, whereas send(...) reports an event without waiting.
+//!
+//! Network calls return Futures. .value() suspends this turn while waiting for
+//! acceptance, body data or an application reply; it is not a polling loop.
+//! The Actor can then process drain/abort messages while its service is waiting.
+//! There is one active session per Worker, and two Workers in the main service.
 
 Server: import("std:http/server").Server
 
@@ -37,6 +47,8 @@ start: (acceptor, application, workerId) => {
         }
 
         application.request("handle", {
+            // Headers stay ordered pairs, preserving duplicates for security
+            // checks. The target stays raw Bytes so Router owns URL decoding.
             method: request.method
             target: request.target
             version: request.version
@@ -78,6 +90,9 @@ start: (acceptor, application, workerId) => {
                         Error.handle(
                             () => {
                                 active = Server.serveOne.owning(
+                                    // "owning" gives the server responsibility
+                                    // for closing this one connection on every
+                                    // completion path, including cancellation.
                                     connection,
                                     handleRequest,
                                     httpLimits

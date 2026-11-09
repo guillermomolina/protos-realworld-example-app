@@ -4,6 +4,11 @@
 //! ephemeral loopback listener, delegates two acceptors, acts as the test
 //! client and validates the actual RealWorld Worker module.
 //! No production HTTP test-only route or external Python/Java client is used.
+//!
+//! Gates below coordinate observable events rather than guessing timings with
+//! sleeps. This makes overlap, admission cutover and cleanup assertions about
+//! actual Actor progress. A successful HTTP response alone cannot prove drain
+//! or cancellation correctness, which is why this suite is separate.
 
 Assertions: import("std:test/assertions")
 Client: import("std:http/client").Client

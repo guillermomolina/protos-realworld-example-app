@@ -1,216 +1,334 @@
-//! Public HTTP API composition.
+//! HTTP composition. Router retains raw-target, percent-encoding and matching
+//! authority. Only verified RootActor principals supply domain caller IDs.
 //!
-//! The Router matches incoming requests and invokes ordinary Protos closures.
-//! Each handler reads from the supplied Actor-local store and constructs a
-//! response using the presentation modules.
+//! This is the meeting point of HTTP, authentication and the domain stores.
+//! request contains method, raw target Bytes, ordered header pairs and body
+//! Bytes. Router supplies match.params for path variables and match.query for
+//! the query text. Router, rather than this application, matches URL paths.
+//! The result is {status, headers, body}; HttpWorker sends it to the client.
 //!
-//! This module does not create sockets, Actors or network permissions.
-
+//! A principal is a small account reference obtained from a verified token.
+//! A viewer is its ID, or null for anonymous presentation. Neither comes from
+//! a user-supplied JSON ID. Domain stores still check ownership after login.
 Router: import("std:http/router").Router
+JSON: import("std:json/json")
 Articles: import("./Articles.protos")
 Comments: import("./Comments.protos")
-JSON: import("std:json/json")
 ArticleQuery: import("./ArticleQuery.protos")
 Responses: import("./Responses.protos")
 RequestJson: import("./RequestJson.protos")
+Slug: import("./Slug.protos")
 
-/// Build the public API handler from an explicitly supplied store.
-/// The result can be passed to std:http/server or std:http/host.
-/// No global application state or network authority is required.
-make: (store) => {
-    // Authentication is not yet provisioned. Protected operations fail closed
-    // before looking up a resource or mutating the store. No JWT is accepted.
-    authRequired: (request, match) => {
-        Responses.unauthorized()
-    }
+/// A single-store call is deliberately fail closed. It never simulates crypto.
+/// make(store) supports anonymous fixtures; make(store, auth) enables real auth.
+/// ...services collects optional arguments into an Array. A third argument is
+/// a local diagnostic callback for tests, never something HTTP clients select.
+make: (store, ...services) => {
+    auth: null
+    if(services.size() > 0) { auth = services[0] }
+    // Optional RootActor-local test observer. Production construction supplies
+    // only Auth; exception objects never enter an HTTP response or Worker log.
+    onFailure: null
+    if(services.size() > 1) { onFailure = services[1] }
 
-    // JSON validation is active; account storage and token issuance are not.
-    // Successful validation must not turn into simulated authentication.
-    identityRequest: (result) => {
-        if(result.valid) {
-            Responses.error(501, "service", "not implemented")
-        } else {
-            Responses.error(422, result.field, result.message)
-        }
-    }
+    // Operational errors are sanitized at the HTTP boundary. Auth.resolve
+    // alone classifies expected JwtError as an invalid credential.
+    route: (protected, operation) => {
+        // Return a new Closure that wraps a route's business operation.
+        // protected=true requires a principal; false allows anonymous access.
+        // Optional credentials are still verified: an invalid token is not
+        // silently treated as a trusted user or accepted as anonymous.
+        (request, match) => {
+            response: null
 
-    Router.compile([
-        {
-            method: "POST"
-            path: "/api/users"
-            handle: (request, match) => {
-                identityRequest(RequestJson.registerUser(request.body))
-            }
-        },
-        {
-            method: "POST"
-            path: "/api/users/login"
-            handle: (request, match) => {
-                identityRequest(RequestJson.loginUser(request.body))
-            }
-        },
-        {
-            method: "GET"
-            path: "/api/user"
-            handle: authRequired
-        },
-        {
-            method: "PUT"
-            path: "/api/user"
-            handle: authRequired
-        },
-        {
-            method: "POST"
-            path: "/api/profiles/{username}/follow"
-            handle: authRequired
-        },
-        {
-            method: "DELETE"
-            path: "/api/profiles/{username}/follow"
-            handle: authRequired
-        },
-        {
-            method: "POST"
-            path: "/api/articles"
-            handle: authRequired
-        },
-        {
-            method: "PUT"
-            path: "/api/articles/{slug}"
-            handle: authRequired
-        },
-        {
-            method: "DELETE"
-            path: "/api/articles/{slug}"
-            handle: authRequired
-        },
-        {
-            method: "POST"
-            path: "/api/articles/{slug}/favorite"
-            handle: authRequired
-        },
-        {
-            method: "DELETE"
-            path: "/api/articles/{slug}/favorite"
-            handle: authRequired
-        },
-        {
-            method: "POST"
-            path: "/api/articles/{slug}/comments"
-            handle: authRequired
-        },
-        {
-            method: "DELETE"
-            path: "/api/articles/{slug}/comments/{id}"
-            handle: authRequired
-        },
-        {
-            method: "GET"
-            path: "/api/profiles/{username}"
-            handle: (request, match) => {
-                profile: store.findProfile(match.params["username"])
-
-                if(profile === null) {
-                    Responses.notFound("profile")
+            // Legacy public routes have no authentication service.
+            // Keep this path independent of JWT and error observation.
+            if(auth === null) {
+                if(protected) {
+                    response = Responses.unauthorized()
                 } else {
-                    Responses.json(
-                        200,
-                        JSON.object("profile", Articles.profile(profile))
-                    )
+                    response = operation(request, match, null)
                 }
-            }
-        },
-        {
-            method: "GET"
-            path: "/api/articles/{slug}/comments"
-            handle: (request, match) => {
-                slug: match.params["slug"]
-                article: store.find(slug)
-
-                if(article === null) {
-                    Responses.notFound("article")
-                } else {
-                    Responses.json(
-                        200,
-                        Comments.list(store.commentsFor(slug))
-                    )
-                }
-            }
-        },
-        {
-            method: "GET"
-            path: "/api/tags"
-            handle: (request, match) => {
-                Responses.json(200, Articles.tags(store.tags()))
-            }
-        },
-        {
-            method: "GET"
-            path: "/api/articles"
-            handle: (request, match) => {
-                options: null
-                invalid: false
-
-                // Invalid query parameters become HTTP 422 responses.
-                // Error.handle prevents a malformed query from aborting
-                // the request handler.
+            } else {
+                // The real service verifies credentials before routing.
                 Error.handle(
                     () => {
-                        options = ArticleQuery.read(match.query)
+                        resolved: auth.resolve(request.headers)
+                        if(resolved.state == "invalid") {
+                            response = Responses.invalidToken()
+                        } else {
+                            if(protected && (resolved.principal === null)) {
+                                response = Responses.unauthorized()
+                            } else {
+                                response = operation(
+                                    request, match, resolved.principal
+                                )
+                            }
+                        }
                     },
-                    (error) => {
-                        invalid = true
-                        error
+                    (failure) => {
+                        if(onFailure !== null) {
+                            onFailure(failure)
+                        }
+                        response = Responses.unavailable()
+                        failure
                     }
                 )
-
-                answer: null
-
-                if(invalid) {
-                    answer = Responses.invalidQuery()
-                } else {
-                    // The public favorited filter names a user.
-                    // It does not require the caller to be authenticated.
-                    favoriteSlugs: []
-                    if(options.parameters.containsKey("favorited")) {
-                        favoriteSlugs = store.favoriteSlugsFor(
-                            options.parameters["favorited"]
-                        )
-                    }
-
-                    selected: ArticleQuery.select(
-                        store.all(), options, favoriteSlugs
-                    )
-                    answer = Responses.json(
-                        200,
-                        Articles.list(selected.page, selected.total)
-                    )
-                }
-
-                answer
             }
-        },
-        {
-            method: "GET"
-            path: "/api/articles/feed"
-            handle: (request, match) => {
-                // No authenticated principal is available in this slice.
-                Responses.unauthorized()
-            }
-        },
-        {
-            method: "GET"
-            path: "/api/articles/{slug}"
-            handle: (request, match) => {
-                found: store.find(match.params["slug"])
-                answer: null
-                if(found === null) {
-                    answer = Responses.notFound("article")
-                } else {
-                    answer = Responses.json(200, Articles.single(found))
-                }
-                answer
+
+            response
+        }
+    }
+
+    viewer: (principal) => {
+        id: null
+        if(principal !== null) { id = principal.id }
+        id
+    }
+    identityRequest: (request, registering) => {
+        // Registration/login are public, but their bodies must pass validation
+        // before any credential provider or account mutation is invoked.
+        result: null
+        if(registering) { result = RequestJson.registerUser(request.body) } else { result = RequestJson.loginUser(request.body) }
+        response: null
+        if(!result.valid) { response = Responses.validation(result) } else {
+            if(auth === null) { response = Responses.unavailable() } else {
+                if(registering) { response = auth.register(result.fields) } else { response = auth.login(result.fields) }
             }
         }
+        response
+    }
+    profileResponse: (username, principal) => {
+        profile: store.findProfile(username)
+        response: Responses.notFound("profile")
+        if(profile !== null) {
+            response = Responses.json(200, JSON.object("profile",
+                Articles.profileFor(profile, viewer(principal), store)))
+        }
+        response
+    }
+    followRoute: (adding) => {
+        // Both verbs share one operation. The URL supplies the target username;
+        // principal.id supplies the follower. A rename never rewrites the graph.
+        route(true, (request, match, principal) => {
+            username: match.params["username"]
+            target: store.identityByUsername(username)
+            response: Responses.notFound("profile")
+            if(target !== null) {
+                result: null
+                if(adding) { result = store.follow(principal.id, target.id) } else { result = store.unfollow(principal.id, target.id) }
+                if(result.ok) { response = profileResponse(username, principal) } else { response = Responses.domainError(result) }
+            }
+            response
+        })
+    }
+    listing: (feed) => {
+        // feed=true requires login and selects followed authors; false lists
+        // public content. Both use the same query and presentation contracts.
+        route(feed, (request, match, principal) => {
+            options: null
+            invalid: false
+            Error.handle(
+                () => { options = ArticleQuery.read(match.query) },
+                (failure) => {
+                    invalid = true
+                    failure
+                }
+            )
+            response: null
+            if(invalid) { response = Responses.invalidQuery() } else {
+                selected: null
+                if(feed) { selected = store.feedForIdentity(principal.id, options) } else {
+                    favoriteSlugs: []
+                    if(options.parameters.containsKey("favorited")) {
+                        favoriteSlugs = store.favoriteSlugsFor(options.parameters["favorited"])
+                    }
+                    selected = ArticleQuery.select(store.all(), options, favoriteSlugs)
+                }
+                response = Responses.json(200, Articles.listFor(
+                    selected.page, selected.total, viewer(principal), store))
+            }
+            response
+        })
+    }
+    // Owner authorization precedes even JSON decoding on article updates.
+    ownedArticle: (operation) => {
+        route(true, (request, match, principal) => {
+            slug: match.params["slug"]
+            response: null
+            if(store.find(slug) === null) { response = Responses.notFound("article") } else {
+                if(store.articleOwnerId(slug) != principal.id) {
+                    response = Responses.forbidden("article")
+                } else { response = operation(request, slug, principal) }
+            }
+            response
+        })
+    }
+    favoriteRoute: (adding) => {
+        // The graph operation is idempotent: repeated POST/DELETE requests do
+        // not repeatedly change counts. Read the updated article for the reply.
+        route(true, (request, match, principal) => {
+            slug: match.params["slug"]
+            result: null
+            if(adding) { result = store.favorite(principal.id, slug) } else { result = store.unfavorite(principal.id, slug) }
+            response: null
+            if(result.ok) {
+                response = Responses.json(200, Articles.singleFor(store.find(slug), principal.id, store))
+            } else { response = Responses.domainError(result) }
+            response
+        })
+    }
+
+    // Each entry declares an HTTP method, a path template and a handler Closure.
+    // The wrappers above run before the body of each protected handler below.
+    Router.compile([
+        { method: "POST"
+            path: "/api/users"
+            handle: route(false, (request, match, principal) => {
+            identityRequest(request, true)
+        }) },
+        { method: "POST"
+            path: "/api/users/login"
+            handle: route(false, (request, match, principal) => {
+            identityRequest(request, false)
+        }) },
+        { method: "GET"
+            path: "/api/user"
+            handle: route(true, (request, match, principal) => {
+            Responses.json(200, auth.current(principal))
+        }) },
+        { method: "PUT"
+            path: "/api/user"
+            handle: route(true, (request, match, principal) => {
+            result: RequestJson.updateUser(request.body)
+            response: null
+            if(result.valid) { response = auth.update(principal, result.fields) } else { response = Responses.validation(result) }
+            response
+        }) },
+        { method: "GET"
+            path: "/api/profiles/{username}"
+            handle: route(false, (request, match, principal) => {
+            profileResponse(match.params["username"], principal)
+        }) },
+        { method: "POST"
+            path: "/api/profiles/{username}/follow"
+            handle: followRoute(true) },
+        { method: "DELETE"
+            path: "/api/profiles/{username}/follow"
+            handle: followRoute(false) },
+        { method: "GET"
+            path: "/api/articles"
+            handle: listing(false) },
+        { method: "GET"
+            path: "/api/articles/feed"
+            handle: listing(true) },
+        { method: "POST"
+            path: "/api/articles"
+            handle: route(true, (request, match, principal) => {
+            input: RequestJson.createArticle(request.body)
+            response: null
+            if(!input.valid) { response = Responses.validation(input) } else {
+                fields: input.fields
+                time: auth.timestamp()
+                slug: Slug.allocate(store, fields["title"].value)
+                result: store.createArticle(principal.id, slug, fields["title"].value,
+                    fields["description"].value, fields["body"].value,
+                    RequestJson.tagsOr(fields, []), time)
+                if(result.ok) {
+                    response = Responses.created(Articles.singleFor(result.value, principal.id, store))
+                } else { response = Responses.domainError(result) }
+            }
+            response
+        }) },
+        { method: "GET"
+            path: "/api/articles/{slug}"
+            handle: route(false, (request, match, principal) => {
+            found: store.find(match.params["slug"])
+            response: Responses.notFound("article")
+            if(found !== null) {
+                response = Responses.json(200, Articles.singleFor(found, viewer(principal), store))
+            }
+            response
+        }) },
+        { method: "PUT"
+            path: "/api/articles/{slug}"
+            handle: ownedArticle((request, slug, principal) => {
+            input: RequestJson.updateArticle(request.body)
+            response: null
+            if(!input.valid) { response = Responses.validation(input) } else {
+                fields: input.fields
+                result: store.updateArticle(principal.id, slug,
+                    RequestJson.textOr(fields, "title", null),
+                    RequestJson.textOr(fields, "description", null),
+                    RequestJson.textOr(fields, "body", null),
+                    RequestJson.tagsOr(fields, null), auth.timestamp())
+                if(result.ok) {
+                    response = Responses.json(200, Articles.singleFor(result.value, principal.id, store))
+                } else { response = Responses.domainError(result) }
+            }
+            response
+        }) },
+        { method: "DELETE"
+            path: "/api/articles/{slug}"
+            handle: ownedArticle((request, slug, principal) => {
+            result: store.deleteArticle(principal.id, slug)
+            response: null
+            if(result.ok) { response = Responses.noContent() } else { response = Responses.domainError(result) }
+            response
+        }) },
+        { method: "POST"
+            path: "/api/articles/{slug}/favorite"
+            handle: favoriteRoute(true) },
+        { method: "DELETE"
+            path: "/api/articles/{slug}/favorite"
+            handle: favoriteRoute(false) },
+        { method: "GET"
+            path: "/api/articles/{slug}/comments"
+            handle: route(false, (request, match, principal) => {
+            slug: match.params["slug"]
+            response: Responses.notFound("article")
+            if(store.find(slug) !== null) {
+                response = Responses.json(200, Comments.listFor(store.commentsFor(slug), viewer(principal), store))
+            }
+            response
+        }) },
+        { method: "POST"
+            path: "/api/articles/{slug}/comments"
+            handle: route(true, (request, match, principal) => {
+            slug: match.params["slug"]
+            response: Responses.notFound("article")
+            if(store.find(slug) !== null) {
+                input: RequestJson.createComment(request.body)
+                if(!input.valid) { response = Responses.validation(input) } else {
+                    result: store.createComment(principal.id, slug, input.fields["body"].value, auth.timestamp())
+                    if(result.ok) {
+                        response = Responses.created(JSON.object("comment", Comments.commentFor(result.value, principal.id, store)))
+                    } else { response = Responses.domainError(result) }
+                }
+            }
+            response
+        }) },
+        { method: "DELETE"
+            path: "/api/articles/{slug}/comments/{id}"
+            handle: route(true, (request, match, principal) => {
+            id: null
+            Error.handle(
+                () => { id = ArticleQuery.nonNegativeInteger(match.params["id"], 1) },
+                (failure) => { failure }
+            )
+            response: Responses.notFound("comment")
+            if(store.find(match.params["slug"]) === null) { response = Responses.notFound("article") } else {
+                if(id !== null) {
+                    result: store.deleteComment(principal.id, match.params["slug"], id)
+                    if(result.ok) { response = Responses.noContent() } else { response = Responses.domainError(result) }
+                }
+            }
+            response
+        }) },
+        { method: "GET"
+            path: "/api/tags"
+            handle: route(false, (request, match, principal) => {
+            Responses.json(200, Articles.tags(store.tags()))
+        }) }
     ])
 }

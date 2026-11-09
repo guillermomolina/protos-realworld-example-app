@@ -6,6 +6,10 @@
 //!
 //! Only the CLI entry receives Network authority. Pass it explicitly to the
 //! same-Actor fixture; do not grant it to HTTP Worker Actors.
+//!
+//! Unlike main.protos, this service is the test harness itself. It creates an
+//! ephemeral listener, runs its clients and shuts down without a separate server.
+//! It tests transport/lifetime behavior rather than password/JWT configuration.
 
 Lifecycle: import("./tests/native-http-lifecycle.protos")
 

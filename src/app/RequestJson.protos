@@ -1,12 +1,23 @@
 //! Parse and validate RealWorld JSON mutation envelopes without host authority.
 //!
-//! This is application-level input validation, not authentication, persistence,
-//! password policy, or an HTTP endpoint. The HTTP Worker has already provided
+//! This is application-level input validation, not authentication,
+//! persistence or cryptography. The HTTP Worker has already provided
 //! a bounded, transferable Bytes snapshot of the request body.
 //!
 //! The result is {valid, fields, field, message}: fields is the JSON object
 //! member Map on success, and field/message are a single validation error on
 //! failure. No credential material is logged or retained outside the caller.
+//!
+//! Pipeline: request Bytes -> lossless UTF-8 -> standard JSON parser -> named
+//! envelope -> field policy. For example {"user":{"email":"a@example.test"}}
+//! has an outer object, a user envelope and an email string node.
+//! JSON nodes have kind/value slots; a node's .value is data, not Future.value().
+//! The standard parser rejects duplicate member names; no custom parser is used.
+//!
+//! Missing, explicit JSON null and empty text have different update meanings.
+//! Validators preserve missing members in the Map, normalize nullable profile
+//! text, and reject null for required text/tags. Only after valid=true may Api
+//! extract fields and call a mutation. Validation itself writes no account data.
 
 JSON: import("std:json/json")
 
@@ -124,23 +135,205 @@ optionalTags: (result) => {
     outcome
 }
 
-/// Payload shapes needed by the future RealWorld mutation handlers. Successful
+/// Payload shapes used by RealWorld mutation handlers. Successful
 /// results are validated JSON nodes, not created accounts/articles/comments.
 registerUser: (bodyBytes) => {
-    requiredText(parseEnvelope(bodyBytes, "user"), ["username", "email", "password"])
+    accountPolicy(requiredText(parseEnvelope(bodyBytes, "user"), ["username", "email", "password"]), true)
 }
 
 loginUser: (bodyBytes) => {
-    requiredText(parseEnvelope(bodyBytes, "user"), ["email", "password"])
+    accountPolicy(requiredText(parseEnvelope(bodyBytes, "user"), ["email", "password"]), false)
 }
 
 createArticle: (bodyBytes) => {
-    optionalTags(requiredText(
+    articlePolicy(optionalTags(requiredText(
         parseEnvelope(bodyBytes, "article"),
         ["title", "description", "body"]
-    ))
+    )))
 }
 
 createComment: (bodyBytes) => {
     requiredText(parseEnvelope(bodyBytes, "comment"), ["body"])
+}
+
+/// Count Unicode scalar values after the strict UTF-8 boundary has validated.
+characters: (text) => {
+    count: 0
+    for(octet in Encoding.UTF8.encode(text)) {
+        if((octet < 128) || (octet >= 192)) { count = count + 1 }
+    }
+    count
+}
+
+passwordAllowed: (password) => {
+    // Count characters for the minimum, UTF-8 bytes for the provider's maximum.
+    // For example "é" is one character but occupies more than one UTF-8 byte.
+    allowed: false
+    if(String.recognizes(password)) {
+        allowed = (characters(password) >= 8) &&
+            (Encoding.UTF8.encode(password).size() <= 4096)
+    }
+    allowed
+}
+
+/// Deliberate ASCII dot-atom account email policy, without normalization.
+emailAllowed: (email) => {
+    allowed: false
+    if(String.recognizes(email)) {
+        bytes: Encoding.UTF8.encode(email)
+        at: -1
+        invalid: (bytes.size() < 5) || (bytes.size() > 254)
+        for(index, 0, bytes.size()) {
+            if(bytes[index] == 64) {
+                if(at >= 0) { invalid = true }
+                at = index
+            }
+        }
+        if((at <= 0) || (at > 64) || (at >= bytes.size() - 1)) { invalid = true }
+        if(!invalid) {
+            previousDot: true
+            for(index, 0, at) {
+                octet: bytes[index]
+                letterOrDigit: ((octet >= 65) && (octet <= 90)) ||
+                    ((octet >= 97) && (octet <= 122)) || ((octet >= 48) && (octet <= 57))
+                punctuation: false
+                for(permitted in Encoding.Latin1.encode("!#$%&'*+-/=?^_`{|}~")) {
+                    if(octet == permitted) { punctuation = true }
+                }
+                if(octet == 46) {
+                    if(previousDot) { invalid = true }
+                    previousDot = true
+                } else {
+                    if(!(letterOrDigit || punctuation)) { invalid = true }
+                    previousDot = false
+                }
+            }
+            if(previousDot) { invalid = true }
+            labelSize: 0
+            dots: 0
+            previousHyphen: false
+            for(index, at + 1, bytes.size()) {
+                octet: bytes[index]
+                if(octet == 46) {
+                    if((labelSize == 0) || previousHyphen) { invalid = true }
+                    labelSize = 0
+                    previousHyphen = false
+                    dots = dots + 1
+                } else {
+                    letterOrDigit: ((octet >= 65) && (octet <= 90)) ||
+                        ((octet >= 97) && (octet <= 122)) || ((octet >= 48) && (octet <= 57))
+                    if(!(letterOrDigit || (octet == 45))) { invalid = true }
+                    if((octet == 45) && (labelSize == 0)) { invalid = true }
+                    labelSize = labelSize + 1
+                    if(labelSize > 63) { invalid = true }
+                    previousHyphen = octet == 45
+                }
+            }
+            if((labelSize == 0) || previousHyphen || (dots == 0)) { invalid = true }
+        }
+        allowed = !invalid
+    }
+    allowed
+}
+
+accountPolicy: (result, checkPassword) => {
+    outcome: result
+    if(outcome.valid) {
+        fields: outcome.fields
+        if(fields.containsKey("email")) {
+            if(!emailAllowed(fields["email"].value)) {
+                outcome = invalid("email", "is invalid")
+            }
+        }
+        if(fields.containsKey("username")) {
+            if(Encoding.UTF8.encode(fields["username"].value).size() > 256) {
+                outcome = invalid("username", "is too long")
+            }
+        }
+        if(checkPassword && fields.containsKey("password")) {
+            if(!passwordAllowed(fields["password"].value)) {
+                outcome = invalid("password", "must contain at least 8 characters and at most 4096 UTF-8 bytes")
+            }
+        }
+    }
+    outcome
+}
+
+/// Validate only supplied required fields; preserve absence in the member Map.
+partialText: (result, names) => {
+    outcome: result
+    if(outcome.valid) {
+        for(name in names) {
+            if(outcome.valid && outcome.fields.containsKey(name)) {
+                checked: requiredText(accepted(outcome.fields), [name])
+                if(!checked.valid) { outcome = checked }
+            }
+        }
+    }
+    outcome
+}
+
+updateUser: (bodyBytes) => {
+    parsed: parseEnvelope(bodyBytes, "user")
+    result: parsed
+    if(parsed.valid) { result = userFields(parsed.fields) }
+    result
+}
+
+/// Share update policy between HTTP validation and trusted credential admission.
+/// The Map belongs to this request; normalizing its nullable nodes is safe.
+userFields: (fields) => {
+    outcome: accountPolicy(partialText(accepted(fields),
+        ["username", "email", "password"]), true)
+    if(outcome.valid) {
+        for(name in ["bio", "image"]) {
+            if(outcome.valid && outcome.fields.containsKey(name)) {
+                node: outcome.fields[name]
+                if((node.kind != "null") && (node.kind != "string")) {
+                    outcome = invalid(name, "is invalid")
+                } else {
+                    if((node.kind == "string") && (node.value == "")) {
+                        outcome.fields[name] = JSON.nullValue()
+                    }
+                }
+            }
+        }
+    }
+    outcome
+}
+
+articlePolicy: (result) => {
+    outcome: result
+    if(outcome.valid && outcome.fields.containsKey("title")) {
+        if(Encoding.UTF8.encode(outcome.fields["title"].value).size() > 1024) {
+            outcome = invalid("title", "is too long")
+        }
+    }
+    outcome
+}
+
+updateArticle: (bodyBytes) => {
+    articlePolicy(optionalTags(partialText(parseEnvelope(bodyBytes, "article"),
+        ["title", "description", "body"])))
+}
+
+/// Extract a supplied text or nullable profile field, retaining the old value
+/// on omission. Call only after validation.
+textOr: (fields, name, previous) => {
+    value: previous
+    if(fields.containsKey(name)) {
+        node: fields[name]
+        value = null
+        if(node.kind == "string") { value = node.value }
+    }
+    value
+}
+
+tagsOr: (fields, previous) => {
+    tags: previous
+    if(fields.containsKey("tagList")) {
+        tags = []
+        for(node in fields["tagList"].value) { tags = Array(...tags, node.value) }
+    }
+    tags
 }

@@ -1,49 +1,64 @@
 # TODO — RealWorld backend in Protos
 
-## Current validated state
-
-- Source layout: `src/main.protos` serves the app, `src/app/` holds its
-  modules, and `src/tests/` holds the test corpus. `src/test-main.protos`
-  and `src/lifecycle-main.protos` keep cross-directory imports inside the
-  direct-file SOURCE root; no `.protos` files remain at repository root.
-
-- Public routes: tags, article listing and details, profiles, and comments.
-- Conduit-compatible JSON errors for missing profiles/articles (404) and unauthed protected routes (401); token validation and write operations remain unimplemented.
-- Public article filtering by `tag`, `author`, and `favorited`, including sorting and pagination.
-- Favorites support stable-ID fixture add/remove operations, exact edge uniqueness, idempotency, count maintenance, legacy username-to-ID migration and public `favorited` filtering after identity renames. HTTP favorite mutations remain unauthorized.
-- Router and HTTP/1.1 unit tests use an in-memory duplex; the native two-Worker service has also passed real TCP requests (HTTP 200, 401, 404, 422).
-- Workers snapshot complete HTTP requests for RootActor routing: raw target Bytes, method, version, ordered headers and decoded body Bytes; `std:http/server` enforces a 1 MiB request-body cap (HTTP 413). Application handlers do not interpret credentials or mutation bodies yet.
-- Credential-free identity metadata now has its own Actor-local repository with stable IDs, exact username/email uniqueness, atomic fixture updates, copy-out lookups, and public profiles that omit email/credentials. It is not wired to registration/login mutations and does not contain password hashes or JWTs.
-- Following/follower graph keyed by stable identity IDs and feed selection (latest first, count before pagination) are implemented in the RootActor-owned fixture domain. Renames retain established links. HTTP follow/unfollow and feed remain 401, pending a real authenticated viewer.
-- Fixture-only article/comment creation, partial article update and ownership-checked deletion are implemented with stable identity IDs; managed content is visible through public GETs, filters and feed. Article deletion cascades comments and removes favorite edges. Trusted callers supply unique slugs and timestamps, not untrusted HTTP clients.
-- Pure JSON request validation for registration, login, article creation and comment creation: strict UTF-8, named object envelope, non-empty required strings, optional article tagList type. Registration and login now use it in the router (422 invalid, 501 valid-but-unimplemented); protected writes still return 401 before body processing.
-- `make test` passed in a previous reported local run; `make test-http` passed on Protos `0.3.452-SNAPSHOT` (2026-11-07). The official RealWorld suite has not been run.
-
-`make serve` starts a native TCP listener on `127.0.0.1:3000` using `--allow-network --service=service`. Two Worker Actors accept delegated TCP connections and request application responses from the RootActor, which alone owns `MemoryStore`. `make test-http` exercises the running service with a native Protos HTTP client. Authentication, durable storage, bounded-lifecycle hosting and graceful shutdown are still missing.
-
-## Protos dependencies
-
-- [x] [D247 — Network permission for the Native/JVM CLI](https://github.com/guillermomolina/protos/issues/1073): closed; the explicit CLI grant and native HTTP service have been verified without an external JDK.
-- [x] [BUG035 — Standard Bytes Actor transfer](https://github.com/guillermomolina/protos/issues/1081): Protos `0.3.452-SNAPSHOT` passed the application's two-Worker native HTTP integration test.
-- [ ] [D243 — Secure entropy](https://github.com/guillermomolina/protos/issues/1069).
-- [ ] [D244 — HMAC and key handling](https://github.com/guillermomolina/protos/issues/1070).
-- [ ] [D245 — Password hashing and verification](https://github.com/guillermomolina/protos/issues/1071).
-- [ ] [D246 — JWT](https://github.com/guillermomolina/protos/issues/1072).
-
-D247 is closed; D243–D246 remain open. Do not replace the missing cryptographic facilities with application-local implementations or a Java bootstrap.
-
 ## Remaining application work
 
-- [x] Start a native HTTP/1.1 service with an explicit Network grant and `std:http/server`.
-- [x] Add two TCP-accepting Worker Actors while retaining one RootActor-owned application store; validate native HTTP with Protos.
-- [x] Run and record `make test-http-lifecycle` for deterministic two-Worker overlap, request-envelope transport, HTTP 413, drain and abort (reported PASS on 2026-11-07). Manual `quit` starts the RootActor-owned drain; signal-triggered shutdown and `std:http/host` application-module loading remain separate work.
-- [ ] Implement registration, login, current-user lookup, validation, and authorization.
-- [ ] Expose following/unfollowing, the feed and favorite/unfavorite via authenticated HTTP handlers; their internal stable-ID fixture domains and read integrations are implemented.
-- [ ] Expose article and comment writes over authenticated HTTP after secure identity integration; internal fixture-only creation/update/deletion and read integration are implemented.
-- [ ] Select and integrate durable storage; verify restarts and clean shutdown.
-- [ ] Run the official RealWorld Hurl suite and record the exact revision and results.
-- [ ] Finish startup instructions for a clean checkout.
+- [ ] Durable persistence: save accounts, password verifiers, JWT subjects and
+  generations, articles, comments, follows and favorites. Restore the same
+  identities and relationships after restarting the process.
+- [ ] Add restart/recovery tests when persistence is implemented.
 
-Overall tracking: [RealWorld backend implementation](https://github.com/guillermomolina/protos/issues/1068).
+The current backend stores everything in memory. Restarting loses all accounts
+and domain data. Persistence is the main remaining application feature; the
+implemented HTTP routes and authentication have passed the checks listed below.
 
-**Do not claim RealWorld conformance** until the official tests pass against a running server.
+## Optional work for deployment
+
+These tasks are needed for a production deployment, not to run the learning
+example locally:
+
+- [ ] Configure HTTPS and deployment supervision.
+- [ ] Add request/rate limits appropriate to the deployment. The existing HTTP
+  request-body size limit is already implemented and tested.
+- [ ] Define secure storage and rotation of the production JWT signing key.
+  `make serve` generates a temporary development key only when none is configured.
+- [ ] Connect process shutdown signals to graceful drain. The manual `quit`
+  command and the drain/abort lifecycle already work.
+
+Using `std:http/host` is a possible future refactor, not a missing feature or a
+requirement for completing this example.
+
+## Implemented and validated
+
+- All 19 Slice 12 routes: registration/login, account retrieval/update, profiles,
+  follows, feed, article CRUD, comments, favorites and tags.
+- Standard Library Argon2id and JWT authentication, stable subjects and ownership,
+  token revocation after password changes, atomic registration and account updates.
+- Input validation, unique slugs, chronological ordering, filters, pagination and
+  viewer-aware JSON presentation.
+- RootActor-owned state and security authority, two HTTP Workers, bounded request
+  snapshots and safe logs.
+
+Results reported by the maintainer on **2026-11-09**, with the Protos
+`0.3.459-SNAPSHOT` development baseline:
+
+| Command | Result |
+| --- | --- |
+| `make test` | All 12 groups PASS, including secure authentication HTTP |
+| `make test-http` | `REALWORLD_NATIVE_HTTP=PASS` |
+| `make test-http-lifecycle` | All five checks PASS: concurrent Workers, request envelope, body limit, drain and abort |
+| `make test-hurl` | All 13 files and 157 requests succeeded; zero failed files |
+
+## Hurl compatibility note
+
+`make test-hurl` applies the tracked token-refresh patch to a temporary copy of
+external tests. After a password change, the next request uses the token returned
+by that change. The original test reused the revoked token and therefore received
+HTTP 401. This adjustment preserves the application's token-revocation requirement
+and does not modify the external checkout.
+
+All 157 requests pass with this documented adjustment. This is an adapted-suite
+result, not a claim that the unmodified official suite passes. Its exact external
+revision was not recorded in the reported run. Proposing the test correction
+upstream is optional and does not block application development.
+
+No Standard Library blocker has been identified by the reported validations.

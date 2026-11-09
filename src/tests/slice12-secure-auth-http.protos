@@ -1,0 +1,397 @@
+//! Secure integration tests. All providers are genuine Standard Library APIs.
+//! Run only from the capability-bearing direct test entry in a RootActor turn.
+//!
+//! call builds the same bounded request data that HttpWorker sends to Api and
+//! checks both status and JSON. These are integration tests inside one Actor;
+//! native-http.protos separately verifies the full TCP path through Workers.
+//! Time is controllable to test exact expiry boundaries and failed registration,
+//! but Argon2id, random subjects, JWT signatures and verification remain real.
+//! The publicly documented signing-key literal here is test data, never a
+//! production secret. JWT uses symmetric signing, not a public/private key pair.
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Password: import("std:crypto/password")
+JWT: import("std:auth/jwt")
+Instant: import("std:datetime/instant")
+Store: import("../app/MemoryStore.protos")
+Auth: import("../app/Auth.protos")
+AuthStore: import("../app/AuthStore.protos")
+Api: import("../app/Api.protos")
+Slug: import("../app/Slug.protos")
+RequestJson: import("../app/RequestJson.protos")
+
+run: (entropy, clock) => {
+    // The test entry must forward real capabilities, even though boundary
+    // assertions below deliberately use a controllable injected Instant.
+    Assertions.require(clock.epochNanoseconds() > 0)
+    Assertions.require(Auth.seconds(Instant(0)) == 0)
+    Assertions.require(Auth.seconds(Instant(999999999)) == 0)
+    Assertions.require(Auth.seconds(Instant(1000000000)) == 1)
+    Assertions.require(Auth.seconds(Instant(-1)) == -1)
+    Assertions.require(Auth.seconds(Instant(-1000000000)) == -1)
+    Assertions.require(Auth.seconds(Instant(-1000000001)) == -2)
+    verifier: Password.hash("a long test password", entropy).value()
+    Assertions.require(Password.verify("a long test password", verifier).value())
+    Assertions.require(!Password.verify("wrong password", verifier).value())
+    Assertions.require(!Password.needsRehash(verifier))
+    prefix: Encoding.UTF8.encode("protos-password-v1:nfc:$argon2id$")
+    recordBytes: Encoding.UTF8.encode(verifier)
+    for(index, 0, prefix.size()) { Assertions.require(recordBytes[index] == prefix[index]) }
+
+    // Public deterministic key belongs only to this test source.
+    key: Encoding.UTF8.encode("slice12-public-test-key-32-bytes-only")
+    epoch: 1800000000000000000
+    current: Instant(epoch)
+    store: Store.create()
+    clockFails: false
+    clockObservations: 0
+    auth: Auth.create(store, entropy, key, () => {
+        clockObservations = clockObservations + 1
+        if(clockFails) { Error().signal() }
+        current
+    })
+    handler: Api.make(store, auth)
+    request: (method, path, body, headers) => {
+        bytes: Encoding.UTF8.encode("")
+        if(body !== null) { bytes = Encoding.UTF8.encode(JSON.encode(body)) }
+        {
+            method: method
+            target: Encoding.Latin1.encode(path)
+            headers: headers
+            body: bytes
+        }
+    }
+    call: (method, path, body, token, status) => {
+        // Add credentials exactly as an HTTP client would. Never print them on
+        // assertion failure: only the suite's safe progress markers are reported.
+        headers: []
+        if(token !== null) {
+            headers = [["Authorization", Encoding.Latin1.encode("Token " + token)]]
+        }
+        response: handler(request(method, path, body, headers))
+        Assertions.require(response.status == status)
+        result: null
+        if(status == 204) { Assertions.require(response.body === null) } else { result = JSON.parse(Encoding.UTF8.decode(response.body)).value }
+        result
+    }
+    user: (name, email, password) => {
+        JSON.object("user", JSON.object("username", JSON.string(name),
+            "email", JSON.string(email), "password", JSON.string(password)))
+    }
+    login: (email, password) => {
+        JSON.object("user", JSON.object("email", JSON.string(email), "password", JSON.string(password)))
+    }
+    article: (title) => {
+        JSON.object("article", JSON.object("title", JSON.string(title),
+            "description", JSON.string("Description"), "body", JSON.string("Body"),
+            "tagList", JSON.array(JSON.string("protos"))))
+    }
+    comment: JSON.object("comment", JSON.object("body", JSON.string("Comment")))
+    publicOnly: (fields) => {
+        for(secret in ["id", "password", "verifier", "generation", "subject", "claims", "signingKey", "entropy"]) {
+            Assertions.require(!fields.containsKey(secret))
+        }
+        true
+    }
+    // Signing must precede identity/credential admission. A clock failure
+    // leaves both names free, and a restored clock permits the same request.
+    clockFails = true
+    call("POST", "/api/users", user("retry", "retry@example.test", "retry password"), null, 503)
+    Assertions.require(store.identityByUsername("retry") === null)
+    Assertions.require(store.identityByEmail("retry@example.test") === null)
+    clockFails = false
+    observationsBeforeRetry: clockObservations
+    retried: call("POST", "/api/users", user("retry", "retry@example.test", "retry password"), null, 201)["user"].value
+    Assertions.require(clockObservations == observationsBeforeRetry + 1)
+    Assertions.require(store.identityByUsername("retry").id == 1)
+    retryToken: retried["token"].value
+    retryClaims: JWT.verify(retryToken, key, Auth.policy(), current).value
+    Assertions.require(retryClaims["generation"].value.coefficient == 1)
+    call("GET", "/api/user", null, retryToken, 200)
+    call("POST", "/api/users/login", login("retry@example.test", "retry password"), null, 200)
+
+    alice: call("POST", "/api/users", user("alice", "alice@example.test", "password one"), null, 201)["user"].value
+    aliceToken: alice["token"].value
+    publicOnly(alice)
+    Assertions.require(alice.size() == 5)
+    Assertions.require(alice["bio"].kind == "null")
+    Assertions.require(alice["image"].kind == "null")
+    signed: JWT.verify(aliceToken, key, Auth.policy(), current).value
+    subject: signed["sub"].value
+    Assertions.require(subject != "alice")
+    Assertions.require(subject != "alice@example.test")
+    Assertions.require(signed["generation"].value.coefficient == 1)
+    Assertions.require(signed["exp"].value.coefficient - signed["iat"].value.coefficient == 3600)
+    call("POST", "/api/users/login", login("alice@example.test", "password one"), null, 200)
+    wrong: call("POST", "/api/users/login", login("alice@example.test", "wrong password"), null, 401)
+    Assertions.require(wrong["errors"].value["credentials"].value[0].value == "invalid")
+    unknown: call("POST", "/api/users/login", login("nobody@example.test", "wrong password"), null, 401)
+    Assertions.require(JSON.encode(JSON.object("errors", wrong["errors"])) ==
+        JSON.encode(JSON.object("errors", unknown["errors"])))
+    oversizedPassword: ""
+    for(index, 0, 4097) { oversizedPassword = oversizedPassword + "a" }
+    oversizedLogin: call("POST", "/api/users/login", login("alice@example.test", oversizedPassword), null, 401)
+    Assertions.require(oversizedLogin["errors"].value["credentials"].value[0].value == "invalid")
+    call("POST", "/api/users/login", login("alice@example.test", "password one"), null, 200)
+    call("POST", "/api/users", user("alice", "other@example.test", "password one"), null, 409)
+    call("POST", "/api/users", user("other", "alice@example.test", "password one"), null, 409)
+    Assertions.require(store.identityByUsername("other") === null)
+    call("POST", "/api/users", user("bad", "not-an-email", "password one"), null, 422)
+    call("POST", "/api/users", user("bad", "bad@example.test", "short"), null, 422)
+    call("POST", "/api/users", user("", "bad@example.test", "password one"), null, 422)
+    Assertions.require(store.identityByEmail("bad@example.test") === null)
+    longPassword: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789--"
+    Assertions.require(RequestJson.passwordAllowed(longPassword))
+    Assertions.require(!RequestJson.passwordAllowed("éééé"))
+    Assertions.require(RequestJson.passwordAllowed("éééééééé"))
+    for(email in ["a..b@example.test", ".a@example.test", "a.@example.test",
+        "a@example..test", "a@-example.test", "a@example-.test", "a b@example.test",
+        "a@@example.test", "a@example.test."]) {
+        Assertions.require(!RequestJson.emailAllowed(email))
+    }
+    bob: call("POST", "/api/users", user("bob", "bob@example.test", longPassword), null, 201)["user"].value
+    bobToken: bob["token"].value
+    call("GET", "/api/user", null, aliceToken, 200)
+    call("GET", "/api/user", null, null, 401)
+    call("GET", "/api/user", null, "a.b.c", 401)
+    call("GET", "/api/user", null, aliceToken + "a", 401)
+    malformed: ["", "Token", "Token ", "Bearer " + aliceToken,
+        "Token  " + aliceToken, "Token " + aliceToken + " ", "Token a..c"]
+    for(value in malformed) {
+        response: handler(request("GET", "/api/user", null,
+            [["Authorization", Encoding.Latin1.encode(value)]]))
+        Assertions.require(response.status == 401)
+    }
+    oversized: Encoding.Latin1.encode("Token ")
+    for(index, 0, 8193) { oversized.add(97) }
+    Assertions.require(handler(request("GET", "/api/user", null,
+        [["Authorization", oversized]])).status == 401)
+    duplicate: request("GET", "/api/user", null, [
+        ["Authorization", Encoding.Latin1.encode("Token " + aliceToken)],
+        ["aUtHoRiZaTiOn", Encoding.Latin1.encode("Token " + aliceToken)]
+    ])
+    Assertions.require(handler(duplicate).status == 401)
+    Assertions.require(handler(request("GET", "/api/user", null,
+        [["aUtHoRiZaTiOn", Encoding.Latin1.encode("Token " + aliceToken)]])).status == 200)
+
+    // Correctly signed but unacceptable issuer/audience/protected type.
+    claims: (issuer, audience, generation) => {
+        JSON.object("iss", JSON.string(issuer), "aud", JSON.string(audience),
+            "sub", JSON.string(subject), "iat", signed["iat"], "exp", signed["exp"],
+            "generation", generation)
+    }
+    for(which in ["issuer", "audience", "type"]) {
+        alternate: Auth.policy()
+        issuer: "protos-realworld"
+        audience: "protos-realworld"
+        if(which == "issuer") {
+            alternate.issuer = "other"
+            issuer = "other"
+        }
+        if(which == "audience") {
+            alternate.audience = "other"
+            audience = "other"
+        }
+        if(which == "type") { alternate.type = "other+jwt" }
+        rejected: JWT.issue(claims(issuer, audience, JSON.number(1, 0)), key, alternate, current)
+        call("GET", "/api/user", null, rejected, 401)
+    }
+    badGeneration: JWT.issue(claims("protos-realworld", "protos-realworld", JSON.string("1")), key, Auth.policy(), current)
+    call("GET", "/api/user", null, badGeneration, 401)
+    inventedSubject: JWT.issue(JSON.object("iss", JSON.string("protos-realworld"),
+        "aud", JSON.string("protos-realworld"), "sub", JSON.string("alice"),
+        "iat", signed["iat"], "exp", signed["exp"],
+        "generation", JSON.number(1, 0)), key, Auth.policy(), current)
+    call("GET", "/api/user", null, inventedSubject, 401)
+    call("GET", "/api/articles", null, inventedSubject, 401)
+    current = Instant(epoch + 3599000000000)
+    call("GET", "/api/user", null, aliceToken, 200)
+    current = Instant(epoch + 3600000000000)
+    call("GET", "/api/user", null, aliceToken, 401)
+    current = Instant(epoch)
+
+    // Reject protected bodies before parsing, including foreign-owner updates.
+    for(path in ["/api/articles", "/api/articles/unknown/comments", "/api/profiles/bob/follow"]) {
+        raw: request("POST", path, null, [])
+        raw.body = Encoding.UTF8.encode("{")
+        Assertions.require(handler(raw).status == 401)
+    }
+    Assertions.require(store.all().size() == 0)
+    call("GET", "/api/profiles/bob", null, null, 200)
+    followed: call("POST", "/api/profiles/bob/follow", null, aliceToken, 200)["profile"].value
+    Assertions.require(followed["following"].value)
+    Assertions.require(!call("GET", "/api/profiles/bob", null, null, 200)["profile"].value["following"].value)
+    Assertions.require(call("GET", "/api/profiles/bob", null, aliceToken, 200)["profile"].value["following"].value)
+    publicOnly(followed)
+    call("POST", "/api/profiles/unknown/follow", null, aliceToken, 404)
+    call("GET", "/api/profiles/unknown", null, aliceToken, 404)
+    call("GET", "/api/articles/unknown", null, aliceToken, 404)
+    call("DELETE", "/api/articles/unknown", null, aliceToken, 404)
+    first: call("POST", "/api/articles", article("Hello, Protos!"), bobToken, 201)["article"].value
+    slug: first["slug"].value
+    Assertions.require(slug == "hello-protos")
+    createdAt: first["createdAt"].value
+    Assertions.require(createdAt == auth.timestamp())
+    second: call("POST", "/api/articles", article("Hello, Protos!"), bobToken, 201)["article"].value
+    Assertions.require(second["slug"].value == "hello-protos-2")
+    Assertions.require(Slug.base("---") == "article")
+    Assertions.require(Slug.base("  A---B 12 ") == "a-b-12")
+    path: "/api/articles/" + slug
+    feed: call("GET", "/api/articles/feed?limit=1", null, aliceToken, 200)
+    Assertions.require(feed["articlesCount"].value.coefficient == 2)
+    Assertions.require(feed["articles"].value.size() == 1)
+    Assertions.require(!feed["articles"].value[0].value.containsKey("body"))
+    Assertions.require(feed["articles"].value[0].value["author"].value["following"].value)
+    Assertions.require(call("GET", "/api/articles/feed", null, bobToken, 200)["articlesCount"].value.coefficient == 0)
+    raw: request("PUT", path, null, [["Authorization", Encoding.Latin1.encode("Token " + aliceToken)]])
+    raw.body = Encoding.UTF8.encode("{")
+    Assertions.require(handler(raw).status == 403)
+    call("DELETE", path, null, aliceToken, 403)
+    Assertions.require(store.all().size() == 2)
+    hugeTitle: ""
+    for(index, 0, 1025) { hugeTitle = hugeTitle + "a" }
+    call("POST", "/api/articles", article(hugeTitle), bobToken, 422)
+    Assertions.require(store.all().size() == 2)
+    current = Instant(epoch + 1000000000)
+    patched: call("PUT", path, JSON.object("article", JSON.object("title", JSON.string("Changed"),
+        "tagList", JSON.array())), bobToken, 200)["article"].value
+    Assertions.require(patched["slug"].value == slug)
+    Assertions.require(patched["createdAt"].value == createdAt)
+    Assertions.require(patched["updatedAt"].value == auth.timestamp())
+    Assertions.require(patched["body"].value == "Body")
+    Assertions.require(patched["tagList"].value.size() == 0)
+    call("PUT", path, JSON.object("article", JSON.object("tagList", JSON.nullValue())), bobToken, 422)
+    call("PUT", path, JSON.object("article", JSON.object("title", JSON.string(""))), bobToken, 422)
+    call("POST", "/api/articles", JSON.object("article", JSON.object()), bobToken, 422)
+    favorite: call("POST", path + "/favorite", null, aliceToken, 200)["article"].value
+    Assertions.require(favorite["favorited"].value)
+    Assertions.require(favorite["favoritesCount"].value.coefficient == 1)
+    Assertions.require(favorite["author"].value["following"].value)
+    call("POST", path + "/favorite", null, aliceToken, 200)
+    Assertions.require(store.find(slug).favoritesCount == 1)
+    Assertions.require(!call("GET", path, null, null, 200)["article"].value["favorited"].value)
+    Assertions.require(call("GET", path, null, aliceToken, 200)["article"].value["favorited"].value)
+    call("POST", "/api/articles/unknown/favorite", null, aliceToken, 404)
+    c1: call("POST", path + "/comments", comment, aliceToken, 201)["comment"].value
+    c2: call("POST", path + "/comments", comment, bobToken, 201)["comment"].value
+    publicOnly(c1["author"].value)
+    id1: JSON.encode(c1["id"])
+    id2: JSON.encode(c2["id"])
+    call("DELETE", path + "/comments/" + id1, null, bobToken, 403)
+    Assertions.require(store.commentsFor(slug).size() == 2)
+    comments: call("GET", path + "/comments", null, aliceToken, 200)["comments"].value
+    Assertions.require(comments.size() == 2)
+    Assertions.require(comments[1].value["author"].value["following"].value)
+    call("DELETE", path + "/comments/999999", null, aliceToken, 404)
+    call("DELETE", path + "/comments/" + id1, null, aliceToken, 204)
+    Assertions.require(store.commentsFor(slug).size() == 1)
+    Assertions.require(store.commentsFor(slug)[0].id == c2["id"].value.coefficient)
+    call("DELETE", path + "/comments/" + id1, null, aliceToken, 404)
+    call("POST", "/api/articles/unknown/comments", comment, aliceToken, 404)
+    call("GET", "/api/articles/unknown/comments", null, null, 404)
+    call("DELETE", path + "/comments/" + id2, null, bobToken, 204)
+    unfavorite: call("DELETE", path + "/favorite", null, aliceToken, 200)["article"].value
+    Assertions.require(!unfavorite["favorited"].value)
+    Assertions.require(unfavorite["favoritesCount"].value.coefficient == 0)
+    call("DELETE", path + "/favorite", null, aliceToken, 200)
+    Assertions.require(store.find(slug).favoritesCount == 0)
+    call("DELETE", "/api/profiles/bob/follow", null, aliceToken, 200)
+    Assertions.require(call("GET", "/api/articles/feed", null, aliceToken, 200)["articlesCount"].value.coefficient == 0)
+
+    // Stable-ID ownership, follows and favorites survive an author's rename.
+    call("POST", "/api/profiles/bob/follow", null, aliceToken, 200)
+    call("POST", path + "/favorite", null, aliceToken, 200)
+    call("PUT", "/api/user", JSON.object("user", JSON.object("username", JSON.string("bob-new"),
+        "email", JSON.string("bob-new@example.test"))), bobToken, 200)
+    authorAfterRename: call("GET", path, null, aliceToken, 200)["article"].value
+    Assertions.require(authorAfterRename["author"].value["username"].value == "bob-new")
+    Assertions.require(authorAfterRename["author"].value["following"].value)
+    Assertions.require(authorAfterRename["favorited"].value)
+    Assertions.require(call("GET", "/api/articles/feed", null, aliceToken, 200)["articlesCount"].value.coefficient == 2)
+    call("PUT", path, JSON.object("article", JSON.object("description", JSON.string("Still owned"))), bobToken, 200)
+    call("DELETE", "/api/profiles/bob-new/follow", null, aliceToken, 200)
+    call("DELETE", path + "/favorite", null, aliceToken, 200)
+
+    renamed: call("PUT", "/api/user", JSON.object("user", JSON.object(
+        "username", JSON.string("alice-new"), "email", JSON.string("new@example.test"),
+        "bio", JSON.string("hello"))), aliceToken, 200)["user"].value
+    renamedToken: renamed["token"].value
+    Assertions.require(JWT.verify(renamedToken, key, Auth.policy(), current).value["sub"].value == subject)
+    Assertions.require(call("GET", "/api/user", null, aliceToken, 200)["user"].value["username"].value == "alice-new")
+    unchanged: call("PUT", "/api/user", JSON.object("user", JSON.object()), aliceToken, 200)["user"].value
+    Assertions.require(unchanged["bio"].value == "hello")
+    normalized: call("PUT", "/api/user", JSON.object("user", JSON.object("bio", JSON.string(""),
+        "image", JSON.nullValue())), aliceToken, 200)["user"].value
+    Assertions.require(normalized["bio"].kind == "null")
+    call("PUT", "/api/user", JSON.object("user", JSON.object("username", JSON.string("bob-new"),
+        "password", JSON.string("must not commit"))), aliceToken, 409)
+    call("POST", "/api/users/login", login("new@example.test", "password one"), null, 200)
+    call("PUT", "/api/user", JSON.object("user", JSON.object("email", JSON.nullValue())), aliceToken, 422)
+    call("PUT", "/api/user", JSON.object("user", JSON.object("bio", JSON.number(1, 0),
+        "image", JSON.string(""))), aliceToken, 422)
+    call("PUT", "/api/user", JSON.object("user", JSON.object("password", JSON.string("short"))), aliceToken, 422)
+    changed: call("PUT", "/api/user", JSON.object("user", JSON.object("password", JSON.string("password two"))), aliceToken, 200)["user"].value
+    newToken: changed["token"].value
+    publicOnly(changed)
+    call("GET", "/api/user", null, aliceToken, 401)
+    call("GET", "/api/user", null, renamedToken, 401)
+    call("GET", "/api/user", null, newToken, 200)
+    call("POST", "/api/users/login", login("new@example.test", "password one"), null, 401)
+    call("POST", "/api/users/login", login("new@example.test", "password two"), null, 200)
+    before: store.all().size()
+    call("DELETE", path, null, aliceToken, 401)
+    Assertions.require(store.all().size() == before)
+    call("DELETE", path, null, bobToken, 204)
+    call("GET", path, null, null, 404)
+    call("DELETE", "/api/articles/" + second["slug"].value, null, bobToken, 204)
+    call("GET", "/api/tags", null, null, 200)
+    Assertions.require(call("GET", "/api/articles", null, null, 200)["articlesCount"].value.coefficient == 0)
+
+    // Tokens cannot invent retained credentials, even with the same test key.
+    isolated: Store.create()
+    isolatedAuth: Auth.create(isolated, entropy, key, () => { current })
+    isolatedHandler: Api.make(isolated, isolatedAuth)
+    Assertions.require(isolatedHandler(request("GET", "/api/user", null,
+        [["Authorization", Encoding.Latin1.encode("Token " + newToken)]])).status == 401)
+    Assertions.require(isolated.identityByEmail("new@example.test") === null)
+    repository: AuthStore.create(isolated, entropy)
+    admitted: repository.register("isolated", "isolated@example.test", "isolated password",
+        (subject, generation) => {
+            observed: current
+            issued: Auth.seconds(observed)
+            JWT.issue(JSON.object(
+                "iss", JSON.string("protos-realworld"),
+                "aud", JSON.string("protos-realworld"),
+                "sub", JSON.string(subject),
+                "iat", JSON.number(issued, 0),
+                "exp", JSON.number(issued + 3600, 0),
+                "generation", JSON.number(generation, 0)
+            ), key, Auth.policy(), observed)
+        })
+    Assertions.require(admitted.ok)
+    immutableSubject: repository.subjectFor(admitted.value.id)
+    Assertions.require(JWT.verify(admitted.token, key, Auth.policy(), current).value["sub"].value == immutableSubject)
+    Assertions.require(!repository.authenticate("isolated@example.test", oversizedPassword).ok)
+    Assertions.require(!repository.authenticate("isolated@example.test", null).ok)
+    Assertions.require(!repository.authenticate("isolated@example.test", 123).ok)
+    Assertions.require(!repository.authenticate("isolated@example.test", "").ok)
+    Assertions.require(repository.generationFor(admitted.value.id) == 1)
+    Assertions.require(repository.changePassword(admitted.value.id, "replacement password").ok)
+    Assertions.require(repository.generationFor(admitted.value.id) == 2)
+    Assertions.require(!repository.changePassword(admitted.value.id, "short").ok)
+    Assertions.require(repository.generationFor(admitted.value.id) == 2)
+    Assertions.require(repository.subjectFor(admitted.value.id) == immutableSubject)
+    Assertions.require(repository.findSubject(immutableSubject).id == admitted.value.id)
+    Assertions.require(!repository.authenticate("isolated@example.test", "isolated password").ok)
+    Assertions.require(repository.authenticate("isolated@example.test", "replacement password").ok)
+    Assertions.require(store.identityByUsername("isolated") === null)
+
+    // Operational clock errors must remain 503, never incorrect credentials.
+    failing: Api.make(store, Auth.create(store, entropy, key, () => { Error().signal() }))
+    Assertions.require(failing(request("GET", "/api/user", null,
+        [["Authorization", Encoding.Latin1.encode("Token " + newToken)]])).status == 503)
+    Assertions.require(!RequestJson.updateUser(Encoding.UTF8.encode(
+        "{\"user\":{\"email\":\"a@example.test\",\"email\":\"b@example.test\"}}"
+    )).valid)
+    true
+}

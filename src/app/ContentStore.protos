@@ -1,4 +1,4 @@
-//! Credential-free article/comment mutations for trusted RootActor fixtures.
+//! Credential-free article/comment mutations inside the RootActor.
 //!
 //! All ownership is checked against stable identity IDs. No HTTP mutation or
 //! authentication capability is exposed here. Callers supply unique slugs and
@@ -6,6 +6,16 @@
 //!
 //! Managed articles/comments are copied on input and output. Legacy fixtures
 //! in MemoryStore remain readable but are not mutated by these operations.
+//!
+//! Each retained record stores authorId rather than a profile snapshot. Reads
+//! resolve current profile metadata from IdentityStore, so renames appear in
+//! older articles/comments without changing their ownership or creation times.
+//! The trusted Fixture methods are also called by MemoryStore's HTTP-facing
+//! wrappers. The caller must obtain actorId from Auth, never request JSON.
+//!
+//! Domain results are {ok, value, field, message}. "not found" and "not owned"
+//! stay distinct so Api/Responses can return 404 and 403. A rejected operation
+//! leaves retained records unchanged. This repository knows no HTTP status codes.
 
 Arrays: import("std:collections/array")
 
@@ -104,6 +114,19 @@ create: (identities) => {
     }
 
     store: {
+        articleOwnerId: (slug) => {
+            record: rawArticle(slug)
+            owner: null
+            if(record !== null) { owner = record.authorId }
+            owner
+        }
+        commentOwnerId: (slug, id) => {
+            record: rawComment(slug, id)
+            owner: null
+            if(record !== null) { owner = record.authorId }
+            owner
+        }
+
         has: (slug) => {
             rawArticle(slug) !== null
         }
@@ -185,6 +208,8 @@ create: (identities) => {
         /// Null arguments mean unchanged; [] explicitly clears tags.
         /// The slug and createdAt never change during an update.
         updateArticleFixture: (actorId, slug, title, description, body, tags, time) => {
+            // null here means "argument omitted" after RequestJson validation.
+            // It is distinct from [], which intentionally clears the tag list.
             record: rawArticle(slug)
             outcome: rejected("article", "not found")
             if(record !== null) {

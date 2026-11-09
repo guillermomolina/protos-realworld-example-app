@@ -1,0 +1,216 @@
+//! RootActor-local credentials, bound to exactly one application store.
+//! No getter returns a verifier or an alias of a retained credential record.
+//!
+//! IdentityStore contains profile/account metadata; this repository separately
+//! holds {id, subject, verifier, generation}. id links the two records. subject
+//! is public JWT identity; verifier is the opaque Argon2id password record.
+//! A verifier lets Password.verify check a secret without retaining plaintext.
+//!
+//! create returns Closures over records. Callers receive only the operations,
+//! not the retained Array. This is ordinary lexical scope, not a global database.
+//! All state disappears on restart; durable storage is a separate feature.
+//!
+//! .value() below observes a Future. While waiting, the current Actor turn may
+//! suspend and another message can change state. Re-read/check state after those
+//! waits. The final commit sections deliberately contain no suspension points.
+Password: import("std:crypto/password")
+Base64url: import("std:text/base64url")
+Arrays: import("std:collections/array")
+Identity: import("./IdentityStore.protos")
+Input: import("./RequestJson.protos")
+
+create: (identityStore, entropy) => {
+    records: []
+    byId: (id) => {
+        found: null
+        for(record in records) { if(record.id == id) { found = record } }
+        found
+    }
+    bySubject: (subject) => {
+        found: null
+        for(record in records) { if(record.subject == subject) { found = record } }
+        found
+    }
+    replace: (record, verifier) => {
+        // Keep id/subject unchanged, replace the verifier and advance generation.
+        // Old JWTs remain correctly signed but fail the generation comparison.
+        replacement: {
+            id: record.id
+            subject: record.subject
+            verifier: verifier
+            generation: record.generation + 1
+        }
+        records = Arrays.map(records, (entry) => {
+            result: entry
+            if(entry.id == record.id) { result = replacement }
+            result
+        })
+        true
+    }
+    conflict: (id, username, email) => {
+        failure: null
+        usernameOwner: identityStore.identityByUsername(username)
+        emailOwner: identityStore.identityByEmail(email)
+        if((usernameOwner !== null) && (usernameOwner.id != id)) {
+            failure = Identity.rejected("username", "has already been taken")
+        } else {
+            if((emailOwner !== null) && (emailOwner.id != id)) {
+                failure = Identity.rejected("email", "has already been taken")
+            }
+        }
+        failure
+    }
+    accountInput: (username, email, password) => {
+        failure: null
+        if(!String.recognizes(username)) {
+            failure = Identity.rejected("username", "is invalid")
+        } else {
+            if((username == "") || (Encoding.UTF8.encode(username).size() > 256)) {
+                failure = Identity.rejected("username", "is invalid")
+            }
+        }
+        if(!Input.emailAllowed(email)) { failure = Identity.rejected("email", "is invalid") }
+        if(!Input.passwordAllowed(password)) { failure = Identity.rejected("password", "is invalid") }
+        failure
+    }
+    repository: {
+        /// On success: {ok, value: identity snapshot, token, field, message}.
+        /// On validation/conflict: the ordinary rejected identity result.
+        /// Provider failures signal an Error to the HTTP operational boundary.
+        register: (username, email, password, issueToken) => {
+            outcome: accountInput(username, email, password)
+            if(outcome === null) { outcome = conflict(null, username, email) }
+            if(outcome === null) {
+                // Only invoked inside a suspendible RootActor turn. A failed
+                // hash or entropy operation has not changed application state.
+                verifier: Password.hash(password, entropy).value()
+                subject: Base64url.encode(entropy.bytes(16).value())
+                while(bySubject(subject) !== null) {
+                    subject = Base64url.encode(entropy.bytes(16).value())
+                }
+                // Hashing may have yielded: admission must check again.
+                outcome = conflict(null, username, email)
+                if(outcome === null) {
+                    // Clock/JWT failures must occur before either repository
+                    // commits. This callback performs synchronous issuance.
+                    token: issueToken(subject, 1)
+                    // No Future waits between these writes. A failed hash,
+                    // uniqueness check or token issuance has written neither.
+                    outcome = identityStore.admitIdentity(username, email)
+                    if(outcome.ok) {
+                        records = Arrays.append(records, {
+                            id: outcome.value.id
+                            subject: subject
+                            verifier: verifier
+                            generation: 1
+                        })
+                        outcome = {
+                            ok: true
+                            value: outcome.value
+                            token: token
+                            field: null
+                            message: null
+                        }
+                    }
+                }
+            }
+            outcome
+        }
+        authenticate: (email, password) => {
+            // Unknown email and incorrect password share this result to avoid
+            // explicitly disclosing which email addresses have accounts. This
+            // does not claim that the two paths have identical execution time.
+            outcome: Identity.rejected("credentials", "are invalid")
+            // Reject unsupported inputs before entering the password provider.
+            // Login does not impose registration's minimum password length.
+            if(String.recognizes(password)) {
+                passwordSize: Encoding.UTF8.encode(password).size()
+                if((passwordSize > 0) && (passwordSize <= 4096)) {
+                    identity: identityStore.identityByEmail(email)
+                    if(identity !== null) {
+                        retained: byId(identity.id)
+                        if(retained !== null) {
+                            verified: Password.verify(password, retained.verifier).value()
+                            // A concurrent replacement while verify yielded must not
+                            // authenticate an obsolete password or a renamed email.
+                            current: identityStore.identityById(identity.id)
+                            // === checks that this is still the same retained
+                            // record, not a replacement installed during verify.
+                            if(verified && (byId(identity.id) === retained) &&
+                               (current.email == email)) {
+                                outcome = Identity.accepted(current)
+                            }
+                        }
+                    }
+                }
+            }
+            outcome
+        }
+        findSubject: (subject) => {
+            record: bySubject(subject)
+            identity: null
+            if(record !== null) { identity = identityStore.identityById(record.id) }
+            identity
+        }
+        subjectFor: (id) => {
+            record: byId(id)
+            subject: null
+            if(record !== null) { subject = record.subject }
+            subject
+        }
+        generationFor: (id) => {
+            record: byId(id)
+            generation: null
+            if(record !== null) { generation = record.generation }
+            generation
+        }
+        changePassword: (id, password) => {
+            result: Identity.rejected("user", "not found")
+            if(byId(id) !== null) {
+                if(!Input.passwordAllowed(password)) {
+                    result = Identity.rejected("password", "is invalid")
+                } else {
+                    verifier: Password.hash(password, entropy).value()
+                    // Re-read after suspension, so concurrent replacements
+                    // each advance the retained generation.
+                    replace(byId(id), verifier)
+                    result = Identity.accepted(identityStore.identityById(id))
+                }
+            }
+            result
+        }
+        // Validate and hash first, then replace metadata and credentials with
+        // no suspension between commits. No partial user/password updates.
+        updateAccount: (id, expectedGeneration, fields) => {
+            // expectedGeneration comes from the verified request principal.
+            // It prevents a request suspended in hashing from overwriting a
+            // password changed by another turn. Omitted metadata is re-read
+            // after suspension so unrelated newer edits are preserved.
+            record: byId(id)
+            checked: Input.userFields(fields)
+            result: Identity.rejected("token", "is invalid")
+            if(!checked.valid) { result = Identity.rejected(checked.field, checked.message) }
+            if(checked.valid && (record !== null) && (record.generation == expectedGeneration)) {
+                verifier: null
+                if(fields.containsKey("password")) {
+                    verifier = Password.hash(fields["password"].value, entropy).value()
+                }
+                record = byId(id)
+                if(record.generation == expectedGeneration) {
+                    current: identityStore.identityById(id)
+                    username: Input.textOr(fields, "username", current.username)
+                    email: Input.textOr(fields, "email", current.email)
+                    result = conflict(id, username, email)
+                    if(result === null) {
+                        result = identityStore.replaceIdentity(id, username, email,
+                            Input.textOr(fields, "bio", current.bio),
+                            Input.textOr(fields, "image", current.image))
+                        if(result.ok && (verifier !== null)) { replace(record, verifier) }
+                    }
+                }
+            }
+            result
+        }
+    }
+    repository
+}

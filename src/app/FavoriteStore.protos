@@ -1,11 +1,17 @@
 //! Actor-local RealWorld favorite edges keyed by stable identity IDs.
 //!
-//! Fixture-only operations: the supplied user ID is not an HTTP principal.
+//! Trusted domain operations: the supplied user ID is not an HTTP principal.
 //! The caller provides identity lookup and article existence; no credentials,
 //! networking, or authorization are supplied by this module.
 //!
 //! Edges are unique per identity/article. Counts remain owned by MemoryStore,
 //! which adjusts them only when a new edge is inserted or removed.
+//!
+//! An edge is {actorId, slug}. It says that one account favorited one article.
+//! The historical Fixture method names remain for earlier tests; authenticated
+//! HTTP handlers use MemoryStore's favorite/unfavorite wrappers over this graph.
+//! ok=true/changed=false is a successful repeat, not a failure. Keeping those
+//! flags separate prevents repeated requests from inflating favoritesCount.
 
 Arrays: import("std:collections/array")
 

@@ -3,6 +3,15 @@
 //! A response is an ordinary object with status, headers and body slots.
 //! std:http/server converts that object into an HTTP/1.1 response.
 //! JSON encoding is kept separate from routing and domain logic.
+//!
+//! Presenters return JSON nodes, not HTTP responses. json(status, node) encodes
+//! those nodes into the response body Bytes and adds the Content-Type header.
+//! A deleted resource uses 204 with body=null, so no JSON text is transmitted.
+//!
+//! Failure categories matter: 401 means missing/rejected credentials; 403 means
+//! a known principal lacks ownership; 404 means the resource does not exist;
+//! 409 means an identity name conflicts; 422 means invalid input; 503 means an
+//! operational security failure. Only safe field/message pairs reach the wire.
 
 JSON: import("std:json/json")
 
@@ -38,7 +47,7 @@ notFound: (field) => {
     error(404, field, "not found")
 }
 
-/// Conduit 401: there is no authenticated principal in the current slice.
+/// Conduit 401 for absent credentials. Rejected tokens have a separate helper.
 unauthorized: () => {
     error(401, "token", "is missing")
 }
@@ -57,4 +66,28 @@ invalidQuery: () => {
             )
         )
     )
+}
+
+created: (node) => { json(201, node) }
+noContent: () => {
+    {
+        status: 204
+        headers: []
+        body: null
+    }
+}
+invalidCredentials: () => { error(401, "credentials", "invalid") }
+invalidToken: () => { error(401, "token", "is invalid") }
+forbidden: (field) => { error(403, field, "forbidden") }
+conflict: (field) => { error(409, field, "has already been taken") }
+validation: (result) => { error(422, result.field, result.message) }
+unavailable: () => { error(503, "service", "is unavailable") }
+
+/// Translate only application-level domain results, never provider exceptions.
+domainError: (result) => {
+    response: validation(result)
+    if(result.message == "not found") { response = notFound(result.field) }
+    if(result.message == "not owned") { response = forbidden(result.field) }
+    if(result.message == "has already been taken") { response = conflict(result.field) }
+    response
 }

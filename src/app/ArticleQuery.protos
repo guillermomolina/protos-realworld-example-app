@@ -3,8 +3,16 @@
 //! This module receives query text from the Router. It converts parameters
 //! into ordinary Protos values, filters articles and applies pagination.
 //! It does not access HTTP connections, storage or network capabilities.
+//!
+//! read(query) returns {parameters, limit, offset}. select then filters an Array,
+//! sorts matching articles newest first and returns {page, total}. total counts
+//! all matches before pagination. Sorting works on a new collection so a read
+//! cannot rearrange the store. Bad query text signals an Error; Api maps it to
+//! the standard HTTP 422 query response.
 
 Arrays: import("std:collections/array")
+ISO8601: import("std:datetime/iso8601")
+Instant: import("std:datetime/instant")
 
 hexValue: (octet) => {
     value: -1
@@ -104,6 +112,8 @@ parse: (query) => {
 }
 
 nonNegativeInteger: (text, minimum) => {
+    // Parse decimal digits exactly; signs, decimals and empty text are invalid.
+    // offset allows 0, whereas a useful page limit must be at least 1.
     digits: Encoding.UTF8.encode(text)
 
     if(digits.size() == 0) {
@@ -149,35 +159,12 @@ read: (query) => {
     }
 }
 
-// ISO UTC timestamps in the fixtures share a canonical format, so
-// lexicographic byte comparison also gives chronological ordering.
-// This assumption must be revisited if other timestamp formats are allowed.
+// Compare exact instants: valid ISO UTC strings may use different fractional
+// precision and cannot be ordered chronologically by their encoded bytes.
 laterThan: (left, right) => {
-    a: Encoding.UTF8.encode(left)
-    b: Encoding.UTF8.encode(right)
-
-    count: a.size()
-    if(b.size() < count) {
-        count = b.size()
-    }
-
-    index: 0
-    decided: false
-    later: false
-
-    while((index < count) && !decided) {
-        if(a[index] != b[index]) {
-            later = a[index] > b[index]
-            decided = true
-        }
-        index = index + 1
-    }
-
-    if(!decided) {
-        later = a.size() > b.size()
-    }
-
-    later
+    // compare returns an ordering; Arrays.sort below expects a Boolean predicate.
+    // For example .11Z is later than .1Z, and both are later than the whole second.
+    Instant.compare(ISO8601.parseInstant(left), ISO8601.parseInstant(right)) > 0
 }
 
 /// Filter, sort and paginate articles without modifying the input.

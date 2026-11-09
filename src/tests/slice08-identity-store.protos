@@ -140,7 +140,7 @@ registerAttempt: handler({
         "{\"user\":{\"username\":\"nope\",\"email\":\"nope@example.test\",\"password\":\"secretpassword\"}}"
     )
 })
-Assertions.require(registerAttempt.status == 501)
+Assertions.require(registerAttempt.status == 503)
 Assertions.require(appStore.identityByEmail("nope@example.test") === null)
 
 // A metadata-only replacement changes the public profile, but does not

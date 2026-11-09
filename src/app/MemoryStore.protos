@@ -2,12 +2,23 @@
 //!
 //! State is captured by closures created inside create(). Each store
 //! instance owns its own article, profile, comment and favorite collections.
-//! There is no database, persistence or authentication authority.
+//! There is no database or durable persistence; Auth owns security authority.
 //! An isolated identity repository holds only non-secret account metadata.
 //! A separate follow graph and article-author bindings use stable IDs.
 //!
 //! Fixture insertion methods support examples and tests. They are not
-//! replacements for authenticated RealWorld mutation endpoints.
+//! credential admission or HTTP authentication.
+//!
+//! This module is the application's store facade: Api calls these operations,
+//! which delegate to the smaller identity, content, follow and favorite stores.
+//! All of them live in the same RootActor. The closures share references only
+//! inside that Actor; Workers never receive this facade or its nested stores.
+//!
+//! Methods ending in Fixture predate HTTP authentication. They are trusted
+//! setup/domain operations, not security checks. Application-facing wrappers
+//! reuse them with IDs obtained from Auth. Tests can still seed data directly.
+//! "Managed" content is owned by ContentStore; legacy arrays retain older test
+//! fixtures. Both are readable without maintaining a second social graph.
 
 Arrays: import("std:collections/array")
 Identities: import("./IdentityStore.protos")
@@ -19,6 +30,8 @@ Favorites: import("./FavoriteStore.protos")
 /// Create an independent in-memory store.
 create: () => {
     items: []
+    // These first collections are legacy fixture data. The repository objects
+    // below retain the records and stable-ID relationships used by HTTP writes.
     profiles: []
     comments: []
     favorites: []
@@ -86,6 +99,34 @@ create: () => {
     }
 
     store: {
+        articleOwnerId: (slug) => { content.articleOwnerId(slug) }
+        commentOwnerId: (slug, id) => { content.commentOwnerId(slug, id) }
+        // RootActor application operations. HTTP callers never supply these IDs.
+        identityByUsername: (username) => { identities.findUsername(username) }
+        admitIdentity: (username, email) => {
+            store.addIdentityFixture(username, email, null, null)
+        }
+        replaceIdentity: (id, username, email, bio, image) => {
+            store.updateIdentityFixture(id, username, email, bio, image)
+        }
+        follow: (actorId, targetId) => { follows.followFixture(actorId, targetId) }
+        unfollow: (actorId, targetId) => { follows.unfollowFixture(actorId, targetId) }
+        createArticle: (id, slug, title, description, body, tags, time) => {
+            store.createOwnedArticleFixture(id, slug, title, description, body, tags, time)
+        }
+        updateArticle: (id, slug, title, description, body, tags, time) => {
+            store.updateOwnedArticleFixture(id, slug, title, description, body, tags, time)
+        }
+        deleteArticle: (id, slug) => { store.deleteOwnedArticleFixture(id, slug) }
+        createComment: (id, slug, body, time) => {
+            store.createOwnedCommentFixture(id, slug, body, time)
+        }
+        deleteComment: (id, slug, commentId) => {
+            store.deleteOwnedCommentFixture(id, slug, commentId)
+        }
+        favorite: (id, slug) => { store.favoriteIdentityFixture(id, slug) }
+        unfavorite: (id, slug) => { store.unfavoriteIdentityFixture(id, slug) }
+
         // A public profile may be registered explicitly, appear as
         // an article author, or appear only as a comment author.
         findProfile: (username) => {
@@ -120,8 +161,8 @@ create: () => {
             found
         }
 
-        // Credential-free identity metadata. Only trusted fixture calls may
-        // mutate this store; HTTP registration/login still return 422/501.
+        // Credential-free identity metadata. HTTP admission goes through
+        // AuthStore; trusted fixtures can also insert identities directly.
         identityById: (id) => {
             identities.findId(id)
         }
@@ -373,7 +414,7 @@ create: () => {
         }
 
         // Trusted ID-bearing content fixture mutations do not authorize
-        // clients; the protected HTTP routes must remain 401.
+        // clients; Auth supplies the actor ID to application-facing operations.
         // The caller provides collision-free slugs and explicit times.
         createOwnedArticleFixture: (authorId, slug, title, description, body, tags, time) => {
             outcome: null
@@ -417,7 +458,7 @@ create: () => {
             content.deleteCommentFixture(actorId, slug, id)
         }
 
-        // Fixture insertion only. Authenticated mutations arrive later.
+        // Fixture insertion only. HTTP uses the application-facing operations.
         addFixture: (article) => {
             author: identities.findUsername(article.author.username)
             if(author !== null) {

@@ -1,8 +1,10 @@
-//! Official RealWorld negative-contract regressions, without JWT support.
+//! RealWorld negative-contract regressions using the unconfigured API fixture.
 //!
 //! The assertions mirror missing-token and missing-resource observations from
 //! upstream specs/api/hurl/errors_{auth,articles,profiles,comments}.hurl.
 //! Full Hurl conformance is not claimed by these focused tests.
+//! The application supports JWTs; this construction deliberately omits Auth to
+//! check that public reads and missing-credential errors work independently.
 
 Assertions: import("std:test/assertions")
 JSON: import("std:json/json")

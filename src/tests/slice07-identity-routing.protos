@@ -1,7 +1,9 @@
 //! Registration/login HTTP routing for bounded JSON request bodies.
 //!
-//! No identity provider, password storage, JWT or implicit authorization.
-//! Invalid payloads receive 422; validated requests return an explicit 501.
+//! The single-store compatibility construction has no security service.
+//! Invalid payloads receive 422; validated requests return a fail-closed 503.
+//! This fixture checks missing configuration, not the real registration flow;
+//! slice12-secure-auth-http covers successful registration with actual providers.
 
 Assertions: import("std:test/assertions")
 JSON: import("std:json/json")
@@ -48,7 +50,7 @@ check("POST", "/api/users",
     422, "password", "can't be blank")
 check("POST", "/api/users",
     "{\"user\":{\"username\":\"alice\",\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
-    501, "service", "not implemented")
+    503, "service", "is unavailable")
 
 check("POST", "/api/users/login", "{", 422, "body", "is invalid")
 check("POST", "/api/users/login",
@@ -59,7 +61,7 @@ check("POST", "/api/users/login",
     422, "password", "can't be blank")
 check("POST", "/api/users/login",
     "{\"user\":{\"email\":\"a@b.test\",\"password\":\"eightchars\"}}",
-    501, "service", "not implemented")
+    503, "service", "is unavailable")
 
 // Authentication must still precede validation on protected operations.
 check("POST", "/api/articles", "{", 401, "token", "is missing")

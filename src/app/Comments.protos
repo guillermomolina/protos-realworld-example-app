@@ -2,26 +2,32 @@
 //!
 //! Comments reuse Articles.profile so author objects have the same JSON
 //! structure in article and comment responses.
+//! The *For variants accept an optional viewer ID and store for following;
+//! the shorter compatibility helpers produce anonymous author profiles.
 
 JSON: import("std:json/json")
 Arrays: import("std:collections/array")
 Articles: import("./Articles.protos")
 
 /// Convert one stored comment into its RealWorld JSON representation.
-comment: (value) => {
+comment: (value) => { commentFor(value, null, null) }
+
+commentFor: (value, viewerId, store) => {
     JSON.object(
         "id", JSON.number(value.id, 0),
         "createdAt", JSON.string(value.createdAt),
         "updatedAt", JSON.string(value.updatedAt),
         "body", JSON.string(value.body),
-        "author", Articles.profile(value.author)
+        "author", Articles.profileFor(value.author, viewerId, store)
     )
 }
 
 /// Convert an Array of comments into the {"comments": [...]} envelope.
-list: (values) => {
+list: (values) => { listFor(values, null, null) }
+
+listFor: (values, viewerId, store) => {
     nodes: Arrays.map(values, (value) => {
-        comment(value)
+        commentFor(value, viewerId, store)
     })
 
     JSON.object("comments", JSON.array(...nodes))

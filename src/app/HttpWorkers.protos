@@ -6,6 +6,12 @@
 //!
 //! drain: stop admitting connections and allow accepted sessions to finish.
 //! abort: stop admitting and cancel outstanding accepts and sessions.
+//!
+//! This module coordinates Workers; HttpWorker implements one Worker's loop.
+//! workers holds Actor references for sending control messages. services holds
+//! the reply Futures for their long-running serve requests. A serve request is
+//! not expected to reply at startup: it replies after its loop has retired.
+//! The separate ready request establishes that serving has actually begun.
 
 /// Start a fixed number of Workers and wait until they have entered service.
 /// The returned control object and listener never cross the Actor boundary.
@@ -20,6 +26,9 @@ start: (listener, application, workerCount) => {
         () => {
             for(index, 0, workerCount) {
                 worker: Actor.spawn(
+                    // The child loads this source and calls its start binding
+                    // with only the following explicit arguments. It receives
+                    // neither this Actor's globals nor its full listener.
                     "./HttpWorker.protos",
                     "start",
                     listener.acceptCapability(),
@@ -59,6 +68,9 @@ start: (listener, application, workerCount) => {
     // Stopping starts synchronously on the first shutdown call: admission
     // cutover and listener close precede the returned observation Future.
     control: {
+        // Return a Future so the RootActor can await all cleanup before exit.
+        // Keep a single shutdown operation in stopped: repeated observations
+        // must not start competing shutdowns or close resources a second time.
         shutdown: (mode) => {
             drain: String.recognizes(mode) && (mode == "drain")
             abort: String.recognizes(mode) && (mode == "abort")
@@ -70,6 +82,9 @@ start: (listener, application, workerCount) => {
                     worker.send(mode)
                 }
                 closing = listener.close()
+                // .future() starts an asynchronous Task in this Actor, not a
+                // new Worker Actor. value() calls inside it can suspend until
+                // other Actors reply, allowing their shutdown to make progress.
                 stopped = (() => {
                     failed: false
                     // Never stop a Worker while it owns an HTTP connection.

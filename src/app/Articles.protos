@@ -3,6 +3,10 @@
 //! Domain objects are ordinary Protos values. This module converts them
 //! into std:json nodes without changing the underlying data.
 //! HTTP status codes and storage concerns are handled elsewhere.
+//!
+//! The older entry points profile/article/list/single produce anonymous views.
+//! Their *For variants accept viewerId/store to project follows and favorites.
+//! They only read relationships; they neither authenticate nor change them.
 
 JSON: import("std:json/json")
 Arrays: import("std:collections/array")
@@ -19,19 +23,34 @@ nullableText: (value) => {
 
 /// Build the public profile representation.
 /// Without an authenticated viewer, following is always false.
-profile: (author) => {
+profile: (author) => { profileFor(author, null, null) }
+
+/// Resolve following through the current username's stable identity ID. null
+/// viewerId means anonymous and permits store=null in compatibility helpers.
+profileFor: (author, viewerId, store) => {
+    following: false
+    if(viewerId !== null) {
+        target: store.identityByUsername(author.username)
+        if(target !== null) { following = store.isFollowingIdentity(viewerId, target.id) }
+    }
     JSON.object(
         "username", JSON.string(author.username),
         "bio", nullableText(author.bio),
         "image", nullableText(author.image),
-        "following", JSON.boolean(false)
+        "following", JSON.boolean(following)
     )
 }
 
 /// Build an article representation.
 /// Lists omit the body; detail responses include it.
 /// Public requests have no viewer identity, so favorited is false.
-article: (value, detailed) => {
+article: (value, detailed) => { articleFor(value, detailed, null, null) }
+
+/// detailed=false omits body for list entries; detailed=true includes it.
+/// favoritesCount is the total for everyone; favorited is specific to the viewer.
+articleFor: (value, detailed, viewerId, store) => {
+    favorited: false
+    if(viewerId !== null) { favorited = store.isFavoritedByIdentity(viewerId, value.slug) }
     tags: []
     for(tag in value.tagList) {
         tags = Arrays.append(tags, JSON.string(tag))
@@ -44,9 +63,9 @@ article: (value, detailed) => {
         "tagList", JSON.array(...tags),
         "createdAt", JSON.string(value.createdAt),
         "updatedAt", JSON.string(value.updatedAt),
-        "favorited", JSON.boolean(false),
+        "favorited", JSON.boolean(favorited),
         "favoritesCount", JSON.number(value.favoritesCount, 0),
-        "author", profile(value.author)
+        "author", profileFor(value.author, viewerId, store)
     ]
 
     if(detailed) {
@@ -60,10 +79,12 @@ article: (value, detailed) => {
 /// Build the article-list envelope.
 /// total is the number of matching articles before pagination,
 /// not the number of articles included in this page.
-list: (values, total) => {
+list: (values, total) => { listFor(values, total, null, null) }
+
+listFor: (values, total, viewerId, store) => {
     nodes: []
     for(value in values) {
-        nodes = Arrays.append(nodes, article(value, false))
+        nodes = Arrays.append(nodes, articleFor(value, false, viewerId, store))
     }
 
     JSON.object(
@@ -82,4 +103,8 @@ tags: (values) => {
 
 single: (value) => {
     JSON.object("article", article(value, true))
+}
+
+singleFor: (value, viewerId, store) => {
+    JSON.object("article", articleFor(value, true, viewerId, store))
 }

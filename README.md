@@ -1,226 +1,169 @@
 # RealWorld backend in Protos
 
-A small, readable [RealWorld (Conduit)](https://docs.realworld.show/specifications/backend/introduction/) backend, written in [Protos](https://github.com/guillermomolina/protos).
+A Protos-first RealWorld HTTP backend with RootActor-owned, in-memory accounts,
+credentials, profiles, articles, comments, follows and favorites. Slice 12 adds
+secure authentication and authenticated domain routes. The maintainer has reported
+passing direct, native HTTP, HTTP lifecycle and adapted Hurl tests on Protos
+`0.3.459-SNAPSHOT`; the validation details and scope are recorded below.
 
-This project is **in development**. It is an example of composing ordinary Protos modules and its Standard Library, **not yet a fully conformant RealWorld backend**.
+## Required Protos capabilities
 
-## Requirements
+The verified development baseline is **Protos `0.3.459-SNAPSHOT`**, or a later
+version containing **I157, I159, I160, I161 and I163**, including the approved
+**D253-C1 RootActor-local Clock**. This snapshot is a development baseline, not
+a published stable release. Earlier snapshots used for public-route tests are
+not a sufficient authentication baseline.
 
-- Protos `0.3.452-SNAPSHOT` (includes the standard `Bytes` Actor-transfer fix required by the Worker server)
-- `make`
+The application consumes the public Standard Library password, JWT, Base64url,
+Instant, ISO8601, JSON and HTTP Router interfaces. Password hashing and verification
+use the Standard Library's Argon2id provider. There are no application-private
+cryptographic, Base64url or time implementations, and no Java launcher.
 
-## Source-tree layout
-
-All `.protos` files live below `src/`. Application modules are in `src/app/`,
-and test cases in `src/tests/`; `src/` also holds CLI entrypoints.
-Protos direct-file imports are confined to the entry file's directory: the
-test and lifecycle wrappers in `src/` allow tests to import `../app/`
-without escaping the authorized SOURCE root. Run the documented `make`
-targets rather than executing `src/tests/main.protos` directly.
-
-## Run the tests
-
-```sh
-make test
-```
-
-The Makefile invokes:
-
-```sh
-protos -Dpolyglot.engine.WarnInterpreterOnly=false src/test-main.protos
-```
-
-The Truffle option hides the interpreter-only diagnostic; it does not enable a compiler or suppress test failures. If using a different launcher, override `PROTOS` or `PROTOS_ARGS` on the `make` command line.
-
-These tests call the HTTP router directly and exercise one HTTP/1.1 exchange over an **in-memory** duplex. They do not start a TCP listener. The separate `make test-http` command tests the running native server over real loopback TCP, using a client written in Protos.
-
-## Run the native HTTP server
-
-The native Protos CLI can grant explicit TCP authority to the initial RootActor. From the repository root, start the learning server without a Java bootstrap:
+The server requires explicitly granted **Network, Entropy and Clock** authorities:
 
 ```sh
 make serve
+# Equivalent, retaining any desired PROTOS_ARGS:
+protos --allow-network --allow-entropy --allow-clock --service=service src/main.protos
 ```
 
-This runs `protos --allow-network --service=service src/main.protos` with the Makefile's configurable `PROTOS` and `PROTOS_ARGS`.
+Set `REALWORLD_JWT_KEY_BASE64URL` in the server process environment before starting.
+Its value must be a valid Base64url encoding of **32–4096 cryptographically random
+key octets**. Generate the key outside source code with a trusted secret-management
+or random-key tool. Keep it secret and stable across service starts; never commit
+it, place it in a URL, or include it in diagnostic output. Changing it rejects all
+previously signed tokens. The server neither embeds a production key nor generates
+a replacement when configuration is missing. Missing grants, absent/malformed
+keys and invalid key lengths prevent the readiness marker.
 
-After the listener has opened, the application prints `REALWORLD_HTTP_READY=127.0.0.1:3000`. In another terminal, try:
+JWTs use issuer and audience `protos-realworld`, protected type
+`realworld-access+jwt`, a maximum lifetime of 3600 seconds and zero clock skew.
+Subjects are immutable random public identifiers independent of username/email.
+The retained credential generation revokes earlier tokens after a password change.
+Every issuance and verification observes a fresh trusted Instant.
+
+Registration hashes the password, generates the subject and rechecks uniqueness
+before issuing its token. Token issuance completes before identity and credential
+admission, so a Clock or JWT failure leaves no account and the same username/email
+can be retried. The response uses that pre-issued token without signing again
+after commit. Invalid-credentials responses retain HTTP 401 and use the RealWorld
+message `invalid`; login passwords outside the provider's input domain or above
+4096 UTF-8 bytes are rejected before verification.
+
+Registration and password changes require at least eight Unicode characters and
+accept passwords of at least 64 characters without composition rules. The input
+limit is 4096 UTF-8 bytes. Usernames and emails are exactly unique. Profile `bio`
+and `image` accept null, and empty strings normalize to null. Omitted update fields
+remain unchanged. Article titles are limited to 1024 UTF-8 bytes; duplicate titles
+receive deterministic distinct slugs, and updates preserve existing slugs.
+
+## HTTP routes
+
+Send an authenticated request with exactly one header:
+`Authorization: Token <compact-jwt>`. Duplicate Authorization headers, malformed
+schemes/tokens, expired tokens and unverified claims never grant a principal.
+Public GETs support viewer-aware projections when valid credentials are supplied.
+
+| Method | Route | Behavior |
+| --- | --- | --- |
+| POST | `/api/users` | Register; 201 |
+| POST | `/api/users/login` | Login; 200 |
+| GET / PUT | `/api/user` | Read/update current account |
+| GET | `/api/profiles/{username}` | Public or viewer-aware profile |
+| POST / DELETE | `/api/profiles/{username}/follow` | Follow/unfollow |
+| GET | `/api/articles` | Filtered and paginated public article list |
+| GET | `/api/articles/feed` | Authenticated followed-author feed |
+| POST | `/api/articles` | Create article; 201 |
+| GET | `/api/articles/{slug}` | Article detail |
+| PUT / DELETE | `/api/articles/{slug}` | Owner update/delete; deletion returns 204 |
+| POST / DELETE | `/api/articles/{slug}/favorite` | Favorite/unfavorite |
+| GET / POST | `/api/articles/{slug}/comments` | List/create comments; creation returns 201 |
+| DELETE | `/api/articles/{slug}/comments/{id}` | Owner deletion; 204 |
+| GET | `/api/tags` | Distinct current article tags |
+
+Article lists and feeds sort newest first by parsing ISO8601 timestamps and
+comparing exact Instants, including timestamps with differing fractional-second
+precision. Filtering, pagination and counts before pagination are preserved.
+Article lists omit `body`; details include it. Profiles and authors derive
+`following` from the stable-ID follow graph, and articles derive `favorited` from
+the stable-ID favorite graph. Anonymous projections use false. Request JSON never
+selects an authenticated actor ID. Ownership checks remain mandatory after JWT
+verification. Missing/rejected credentials return 401, foreign-owner operations
+403, absent resources 404, username/email conflicts 409 and invalid input 422.
+Unconfigured security or operational provider failures produce sanitized 503
+responses rather than simulated authentication. The single-store `Api.make`
+construction remains available for anonymous fixtures and fails closed for writes.
+
+## Execution and validation
 
 ```sh
-curl -i http://127.0.0.1:3000/api/tags
-curl -i http://127.0.0.1:3000/api/articles
-curl -i http://127.0.0.1:3000/api/profiles/unknown
-curl -i 'http://127.0.0.1:3000/api/articles?limit=0'
+make test
+make serve                 # Separate terminal; temporary key if none is configured
+make test-http             # Requires a fresh running server for account fixtures
+make test-http-lifecycle    # Independent ephemeral lifecycle fixture
+make test-hurl              # Requires the running server, Hurl and the external spec
 ```
 
-With `make serve` still running, run the focused Protos HTTP integration test from a second terminal:
+`make serve` preserves a configured `REALWORLD_JWT_KEY_BASE64URL`. When the variable
+is unset, the Makefile uses OpenSSL to generate a temporary development key without
+printing or saving it. It changes on each start. Direct Protos invocation still
+requires the environment setting.
 
-```sh
-make test-http
-```
+`make test-hurl` uses the checkout at `/tmp/realworld-spec`; override it with
+`REALWORLD_SPEC=/path/to/realworld-spec` and the server origin with
+`HOST=http://127.0.0.1:3000` (without `/api`). The suite creates its own test
+accounts and passwords. A disposable copy receives the small tracked
+`src/tests/hurl-refresh-token.patch`: after changing a password, the next request
+uses the returned token because the previous one is revoked. The external checkout
+is not modified. Results from this adapted suite must be distinguished from an
+unmodified official-suite run.
 
-For a self-contained concurrency and shutdown regression, without a separately
-running `make serve`, run:
+`PROTOS` and `PROTOS_ARGS` remain overridable. Direct tests receive real Entropy
+and Clock grants and retain all eleven previous groups. The new secure-auth group
+prints `REALWORLD_SECURE_AUTH_HTTP=PASS` only after all its assertions complete.
+The native TCP test parses real response tokens and exercises registration, login,
+current user, article, favorite and comment creation/deletion.
 
-```sh
-make test-http-lifecycle
-```
+Validation reported by the maintainer on **2026-11-09**, using the Protos
+`0.3.459-SNAPSHOT` development baseline:
 
-The native Protos fixture uses an ephemeral loopback listener and the **same**
-`src/app/HttpWorker.protos` used by the server. It holds a request header incomplete
-until a Worker acknowledges accepting it, verifies a second Worker completes a
-real HTTP request meanwhile, then initiates drain **before** completing the
-first request. It also verifies cross-Actor HTTP headers and body transport, chunked body
-decoding, an empty request body and early HTTP 413 rejection, then exercises
-cancellation-based abort on a second listener.
-`timeout` bounds potential deadlocks in this native-only integration test.
-The native lifecycle run reports `REALWORLD_HTTP_ENVELOPE=PASS` and
-`REALWORLD_HTTP_LIMIT=PASS` when the new checks pass.
-
-On Protos `0.3.452-SNAPSHOT`, this test passed for four native loopback requests with statuses 200, 200, 404 and 422. The in-memory store starts empty, so articles and tags are empty until populated. The server listens only on `127.0.0.1:3000`. Two Worker Actors accept connections through delegated `TcpAcceptor` capabilities and run `std:http/server` for one HTTP/1.1 exchange per connection. Each Worker requests its response from the RootActor through a `GroupRef`; the RootActor exclusively owns the mutable `MemoryStore`. This is a bounded learning server, not a production HTTP host. Type `quit` and press Enter in the server terminal to request graceful drain: the RootActor closes the listener, waits for admitted sessions, stops both Workers, and then stops itself. Ctrl-C is host termination and is **not** guaranteed to drain. The current `make test-http` verifies HTTP correctness but does not itself establish simultaneous-request throughput or official RealWorld conformance.
-
-`--allow-network` is explicit and applies only to the initial RootActor; it does not grant filesystem access, DNS resolution or Network authority to imported modules and child Actors. Running without the flag does not authorize TCP listening.
-
-## Implemented so far
-
-| Route | Behavior |
+| Command | Reported result |
 | --- | --- |
-| `POST /api/users` | JSON validation (422), otherwise explicit 501 until secure registration exists |
-| `POST /api/users/login` | JSON validation (422), otherwise explicit 501 until secure login exists |
-| `GET /api/tags` | Distinct tags from the current in-memory articles |
-| `GET /api/articles` | Public article list, tag/author/favorited filters, ordering and pagination |
-| `GET /api/articles/:slug` | Public article details |
-| `GET /api/profiles/:username` | Public profile lookup |
-| `GET /api/articles/:slug/comments` | Public comments for an article |
+| `make test` | All 12 groups PASS, including `REALWORLD_SECURE_AUTH_HTTP=PASS` |
+| `make test-http` | `REALWORLD_NATIVE_HTTP=PASS`; complete authenticated TCP scenario |
+| `make test-http-lifecycle` | All five checks PASS: concurrent Workers, request envelope, body limit, drain and abort |
+| `make test-hurl` | All 13 files and 157 requests succeeded; zero failed files; 12.134 seconds |
 
-The native Worker now snapshots complete HTTP requests (method, raw target,
-version, ordered and duplicate-preserving header pairs, and decoded body bytes)
-before sending them to the RootActor. It reads the session-owned body locally
-and caps it at **1 MiB** using `std:http/server` limits; over-limit requests
-are rejected with HTTP 413. Only transferable data crosses the Actor boundary:
-no TCP connection, stream or mutable application store is transferred.
-Registration and login now validate these body bytes, but do not create users or issue tokens.
+The Hurl run used the tracked token-refresh patch on a temporary suite copy.
+The preceding unmodified run passed 12 of 13 files; `errors_auth.hurl` reused a
+revoked token after changing the password. The adapted run passed all 13 files
+without weakening token revocation. The external specification checkout revision
+has not been recorded. These results establish the reported checks, not unmodified
+official-suite conformance. The agent did not execute these validations.
 
-`src/app/RequestJson.protos` separately validates UTF-8 JSON `user`, `article` and
-`comment` envelopes, required non-empty string fields, and optional article
-`tagList` arrays. It returns structured validation results that existing
-`Responses.error` can render as Conduit-style 422 errors. These helpers were first tested independently; the public identity routes now
-validate request bodies without creating users, issuing tokens, or
-enabling authenticated writes.
-Registration and login now call these validators in the HTTP router. Invalid
-request bodies return Conduit-style HTTP 422 errors; structurally valid
-requests return an explicit HTTP 501 `errors.service` response without
-creating credentials or changing state. Protected routes continue to
-return HTTP 401 before interpreting untrusted mutation bodies. Email
-syntax/policy, password security, and successful mutation responses remain
-unimplemented.
+The service listens on `127.0.0.1:3000`. Two HTTP Worker Actors retain delegated
+TCP acceptors and send bounded request snapshots to the RootActor. Requests keep
+the raw target, ordered duplicate-preserving headers and body Bytes. The Standard
+Library HTTP server caps request bodies at 1 MiB. Workers never receive the mutable
+application store, security-service object, signing key, credential repository,
+Clock or Entropy capabilities. RootActor logs contain safe method/status metadata,
+not Authorization, bodies, query strings or credential material.
 
-An additional `src/app/IdentityStore.protos` keeps credential-free identity
-metadata (stable IDs, exact unique usernames/emails, nullable profile fields)
-in Actor-local memory. Its fixture-only insert/update operations reject
-collisions without partial writes and return independent snapshots; the
-public profile projection never includes email, password, token or ID.
-`MemoryStore` consults this identity repository for public profile reads,
-falling back to older article/comment fixtures. No HTTP identity write or
-authentication behavior is enabled by these internal methods. RealWorld
-email normalization and secure credentials remain future work.
+Type `quit` followed by Enter in the server terminal to request graceful drain.
+The RootActor closes the listener, waits for admitted work and stops the Workers.
+EOF leaves the service running. Ctrl-C is host termination and does not guarantee
+a graceful drain. The independent lifecycle fixture retains drain/abort coverage.
 
-`src/app/FollowStore.protos` holds fixture-only follow relationships by
-stable identity ID. It rejects unknown identities and self-follow, and
-makes repeated follow/unfollow operations idempotent. `MemoryStore`
-exposes internal following/follower queries and selects a feed from the
-articles of followed identities using `ArticleQuery` ordering and
-pagination. Article fixtures linked to existing identities retain a
-stable author association after username changes; old fixtures without
-a link can be matched by their author username when the identity appears.
-The public article author of legacy fixtures is still the historical
-snapshot. **This does not enable HTTP follow/unfollow or
-`/api/articles/feed`**: those routes remain HTTP 401 until an
-authenticated principal exists.
+## Storage and deployment limitations
 
-`src/app/ContentStore.protos` implements fixture-only ownership checks
-and article/comment creation, partial article updates and deletion. It
-uses stable identity IDs; managed article/comment snapshots resolve
-current public author names without exposing email or credentials.
-Managed content appears in existing public GETs, tag and author filters,
-and internal followed-author feed selection. Article deletion removes
-managed comments and favorite edges. Callers supply collision-free
-slugs and canonical timestamps; title duplicates are valid with
-different slugs. Legacy fixture records remain readable, but only
-managed content participates in the new mutation operations. No
-HTTP write route is enabled.
+All application state is **in memory**. Restarting loses every account, credential,
+article, comment, follow and favorite. A stable signing key does not make those
+records durable: a token whose credential subject has been lost cannot authorize.
+Durable persistence and restart recovery are separate remaining subsystems.
 
-`src/app/FavoriteStore.protos` retains fixture-only favorite edges by stable
-identity ID and provides idempotent favorite/unfavorite operations for both
-managed and legacy article fixtures. `MemoryStore` adjusts counters only when
-edges change, resolves the public `?favorited=username` filter through current
-identity metadata, migrates pre-identity legacy fixtures without double-counting,
-and removes both edge representations when an article is deleted. Identity
-renames preserve favorites. Public JSON still reports `favorited: false`
-without an authenticated viewer, and the HTTP favorite routes still return 401.
+The loopback HTTP listener has no TLS and is not a production deployment. Production
+requires transport protection, deployment hardening, durable recovery, operational
+controls and a defined key-custody/rotation policy. See [TODO.md](TODO.md).
 
-Public list responses omit the article body, as required by the current RealWorld contract. Public 404 responses identify the missing `article` or `profile` in a JSON `errors` envelope. Protected operations without an authenticated principal return the Conduit 401 `errors.token` envelope; this is not an implementation of token validation or authenticated mutations. The tests also cover missing resources and unauthenticated access to the feed route.
-
-All data currently comes from test fixtures. It is lost when the process ends. Public responses have not yet passed RealWorld's official Hurl test suite.
-
-## Code layout
-
-```text
-src/
-  main.protos                Native HTTP server entry
-  test-main.protos           Focused test suite entry
-  lifecycle-main.protos      Network-capable lifecycle test bootstrap
-  app/
-    Api.protos               HTTP route composition
-    ArticleQuery.protos      Public article query selection
-    Articles.protos          Article and profile JSON responses
-    Comments.protos          Comment JSON responses
-    MemoryStore.protos       Actor-local in-memory repository
-    IdentityStore.protos     Credential-free identity metadata repository
-    FollowStore.protos       Stable-ID follow relationships (fixtures only)
-    ContentStore.protos      Owned article/comment domain mutations (fixtures only)
-    FavoriteStore.protos     Stable-ID favorite edges (fixtures only)
-    HttpWorker.protos        Worker HTTP connection service
-    HttpWorkers.protos       Worker lifecycle controller
-    Responses.protos         HTTP response helpers
-    RequestJson.protos       Pure JSON envelope validation
-  tests/
-    main.protos              Imports focused test cases
-    slice01-smoke.protos
-    slice01-wire-smoke.protos
-    slice02-articles-query.protos
-    slice03-public-content.protos
-    slice04-public-errors.protos
-    slice06-json-contract.protos
-    slice07-identity-routing.protos
-    slice08-identity-store.protos
-    slice09-social-feed.protos
-    slice10-content-mutations.protos
-    slice11-favorites.protos
-    native-http.protos       Running-server integration client
-    native-http-lifecycle.protos  Native concurrency/drain/abort fixture
-
-Makefile                    Stable test, serve and integration commands
-```
-
-The application uses existing Protos facilities such as `std:http/router`, `std:http/server`, `std:json/json` and `std:collections/array`; it does not implement private replacements for those libraries.
-
-See [TODO.md](TODO.md) for the remaining work and upstream Protos blockers.
-
-## What is not implemented yet
-
-- User registration, login, signed tokens and authenticated operations
-- Authenticated HTTP following, favorites, article and comment writes
-- Durable storage
-- Signal-triggered graceful drain and optional integration with `std:http/host` (the current manual `quit` command uses native drain)
-- Official RealWorld Hurl conformance
-
-The native CLI now supports explicit TCP authority with `--allow-network` and the long-lived RootActor service entry with `--service=service` ([D247](https://github.com/guillermomolina/protos/issues/1073)). It does not grant Filesystem access; durable storage is still pending. The app currently composes delegated `TcpAcceptor` capabilities, two Worker Actors and `std:http/server` directly. It does not use `std:http/host`, whose Worker handler import contract is not wired to this standalone CLI application. Standard `Bytes` can cross the Actor boundary in the validated Protos version ([BUG035](https://github.com/guillermomolina/protos/issues/1081)).
-
-The authentication work is waiting for reusable, approved Protos security-library designs rather than adding application-local cryptography. See [D243](https://github.com/guillermomolina/protos/issues/1069), [D244](https://github.com/guillermomolina/protos/issues/1070), [D245](https://github.com/guillermomolina/protos/issues/1071) and [D246](https://github.com/guillermomolina/protos/issues/1072).
-
-## Contract and progress
-
-The external API contract belongs to the [RealWorld backend specification](https://docs.realworld.show/specifications/backend/introduction/). Its OpenAPI and Hurl tests are the conformance authority; passing the local smoke tests is not a claim of complete conformance.
-
-The corresponding Protos implementation work is tracked in [the RealWorld backend issue](https://github.com/guillermomolina/protos/issues/1068).
+The [RealWorld backend specification](https://docs.realworld.show/specifications/backend/introduction/)
+and its official Hurl suite define conformance. Local assertions do not establish it.
