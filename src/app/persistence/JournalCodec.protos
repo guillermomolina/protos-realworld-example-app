@@ -1,0 +1,280 @@
+//! Private binary framing for the RealWorld durable journal (format version 1).
+//!
+//! A journal file is a plain concatenation of frames, beginning at offset 0.
+//! There is no file header: every frame is self-describing. Every multi-octet
+//! integer is UNSIGNED BIG-ENDIAN with the fixed width given below. Nothing
+//! depends on host byte order or on implicit object serialization.
+//!
+//!   offset  width  field
+//!   0       4      magic        0x50 0x52 0x57 0x4A  ("PRWJ")
+//!   4       1      version      1
+//!   5       1      flags        0 (any other value is corruption)
+//!   6       2      reserved     0 (any other value is corruption)
+//!   8       8      sequence     1 .. 9007199254740991, consecutive per file
+//!   16      16     transaction  opaque ID, never all zero octets
+//!   32      4      length       payload octets, 0 .. limits.maxPayloadBytes
+//!   36      n      payload      DomainCodec transaction (UTF-8 JSON)
+//!   36+n    4      adler32      Adler-32 of octets [0, 36+n)
+//!   40+n    4      polyhash     sum-of-powers hash of octets [0, 36+n), see below
+//!
+//! frame size = 44 + n. The checksum covers the complete header and payload.
+//! It detects accidental damage (torn or bit-flipped writes). It is NOT a
+//! cryptographic MAC: anyone able to write the file can forge a valid frame.
+//!
+//! polyhash: h = 0; for each octet b: h = (h * 257 + b + 1) mod 4294967291.
+//! Adler-32 is the standard RFC 1950 definition (modulus 65521).
+//! Both use only Integer +, * and %, so no bitwise operator is required.
+//!
+//! decodeAt classifies the octets at an offset as exactly one of:
+//!   eof         offset is the end of the data (clean boundary)
+//!   frame       a complete, checksum-valid frame
+//!   incomplete  a strict prefix of a plausible frame, or an all-zero remainder
+//!               (a torn final append / preallocated-but-unwritten space)
+//!   corrupt     anything else, with a fixed reason label
+//! Lengths are validated before any payload copy, so a hostile length field
+//! cannot cause an allocation larger than limits.maxPayloadBytes.
+
+MAGIC: [80, 82, 87, 74]
+VERSION: 1
+HEADER_BYTES: 36
+TRAILER_BYTES: 8
+TRANSACTION_ID_BYTES: 16
+MAX_SEQUENCE: 9007199254740991
+MAX_U32: 4294967295
+ADLER_MODULUS: 65521
+POLY_MODULUS: 4294967291
+POLY_BASE: 257
+
+/// Conservative defaults. Every limit is an exact Integer count of octets
+/// or frames. Recovery and the Journal both enforce them.
+defaultLimits: () => {
+    {
+        maxPayloadBytes: 8388608
+        maxJournalBytes: 1073741824
+        maxFrames: 1000000
+    }
+}
+
+emptyBytes: () => { Encoding.Latin1.encode("") }
+
+/// An independently owned copy of octets [start, end). Never an alias.
+slice: (source, start, end) => {
+    if((start < 0) || (end < start) || (end > source.size())) { Error().signal() }
+    output: emptyBytes()
+    for(index, start, end) { output.add(source[index]) }
+    output
+}
+
+copyBytes: (source) => { slice(source, 0, source.size()) }
+
+sameBytes: (left, right) => {
+    same: left.size() == right.size()
+    if(same) {
+        for(index, 0, left.size()) {
+            if(left[index] != right[index]) { same = false }
+        }
+    }
+    same
+}
+
+/// Exact non-negative division; the remainder is removed first so `/` never
+/// produces a fractional value.
+floorDiv: (value, divisor) => {
+    (value - (value % divisor)) / divisor
+}
+
+/// Append value as exactly `width` big-endian octets. maximum is the largest
+/// accepted value for this field; out-of-range values signal before writing.
+putUnsigned: (output, value, width, maximum) => {
+    if((value < 0) || (value > maximum)) { Error().signal() }
+    octets: []
+    remaining: value
+    for(index, 0, width) {
+        octet: remaining % 256
+        octets = Array(octet, ...octets)
+        remaining = floorDiv(remaining, 256)
+    }
+    if(remaining != 0) { Error().signal() }
+    for(octet in octets) { output.add(octet) }
+    output
+}
+
+/// Read `width` big-endian octets at offset. Returns null when the value would
+/// exceed maximum (overflow is detected before multiplication can exceed it).
+getUnsigned: (source, offset, width, maximum) => {
+    value: 0
+    overflow: false
+    for(index, 0, width) {
+        octet: source[offset + index]
+        if(!overflow) {
+            if(value > floorDiv(maximum - octet, 256)) {
+                overflow = true
+            } else {
+                value = value * 256 + octet
+            }
+        }
+    }
+    result: value
+    if(overflow) { result = null }
+    result
+}
+
+/// Checksum of octets [start, end) as 8 octets: Adler-32 then polyhash.
+checksum: (source, start, end) => {
+    a: 1
+    b: 0
+    h: 0
+    for(index, start, end) {
+        octet: source[index]
+        a = (a + octet) % ADLER_MODULUS
+        b = (b + a) % ADLER_MODULUS
+        h = (h * POLY_BASE + octet + 1) % POLY_MODULUS
+    }
+    output: emptyBytes()
+    putUnsigned(output, b * 65536 + a, 4, MAX_U32)
+    putUnsigned(output, h, 4, MAX_U32)
+    output
+}
+
+validTransactionId: (id) => {
+    valid: false
+    if(id !== null) {
+        if(id.size() == TRANSACTION_ID_BYTES) {
+            for(octet in id) {
+                if(octet != 0) { valid = true }
+            }
+        }
+    }
+    valid
+}
+
+/// Deterministic transaction ID: an 8-octet random-per-process nonce supplied
+/// by the RootActor at startup, followed by the 8-octet sequence. The nonce
+/// separates IDs across restarts; the codec itself never consults Entropy.
+transactionId: (nonce, sequence) => {
+    if(nonce.size() != 8) { Error().signal() }
+    output: copyBytes(nonce)
+    putUnsigned(output, sequence, 8, MAX_SEQUENCE)
+    output
+}
+
+/// Encode one frame. Every argument is validated before any octet is produced;
+/// the returned Bytes are independent of the caller's payload Bytes.
+encodeFrame: (sequence, transaction, payload, limits) => {
+    if((sequence < 1) || (sequence > MAX_SEQUENCE)) { Error().signal() }
+    if(!validTransactionId(transaction)) { Error().signal() }
+    if(payload.size() > limits.maxPayloadBytes) { Error().signal() }
+    output: emptyBytes()
+    for(octet in MAGIC) { output.add(octet) }
+    output.add(VERSION)
+    output.add(0)
+    putUnsigned(output, 0, 2, 65535)
+    putUnsigned(output, sequence, 8, MAX_SEQUENCE)
+    for(octet in transaction) { output.add(octet) }
+    putUnsigned(output, payload.size(), 4, MAX_U32)
+    for(octet in payload) { output.add(octet) }
+    for(octet in checksum(output, 0, output.size())) { output.add(octet) }
+    output
+}
+
+frameSize: (payloadBytes) => { HEADER_BYTES + payloadBytes + TRAILER_BYTES }
+
+classified: (status, reason, frame, next) => {
+    {
+        status: status
+        reason: reason
+        frame: frame
+        next: next
+    }
+}
+
+allZero: (source, start, end) => {
+    zero: true
+    for(index, start, end) {
+        if(source[index] != 0) { zero = false }
+    }
+    zero
+}
+
+/// Classify the octets of `source` at `offset`; see the module comment.
+decodeAt: (source, offset, limits) => {
+    remaining: source.size() - offset
+    result: null
+    if(remaining == 0) {
+        result = classified("eof", null, null, offset)
+    } else {
+        if(allZero(source, offset, source.size())) {
+            result = classified("incomplete", "zero_tail", null, offset)
+        } else {
+            visible: remaining
+            if(visible > 4) { visible = 4 }
+            magicOk: true
+            for(index, 0, visible) {
+                if(source[offset + index] != MAGIC[index]) { magicOk = false }
+            }
+            if(!magicOk) {
+                result = classified("corrupt", "magic", null, offset)
+            } else {
+                if((remaining > 4) && (source[offset + 4] != VERSION)) {
+                    result = classified("corrupt", "unsupported_version", null, offset)
+                } else {
+                    if(remaining < HEADER_BYTES) {
+                        result = classified("incomplete", "header", null, offset)
+                    }
+                }
+            }
+        }
+    }
+    if(result === null) {
+        flags: source[offset + 5]
+        reserved: getUnsigned(source, offset + 6, 2, 65535)
+        sequence: getUnsigned(source, offset + 8, 8, MAX_SEQUENCE)
+        transaction: slice(source, offset + 16, offset + 32)
+        length: getUnsigned(source, offset + 32, 4, MAX_U32)
+        if((flags != 0) || (reserved != 0)) {
+            result = classified("corrupt", "reserved_bits", null, offset)
+        } else {
+            if(sequence === null) {
+                result = classified("corrupt", "sequence_overflow", null, offset)
+            } else {
+                if(sequence < 1) {
+                    result = classified("corrupt", "illegal_sequence", null, offset)
+                } else {
+                    if(!validTransactionId(transaction)) {
+                        result = classified("corrupt", "malformed_transaction_id", null, offset)
+                    } else {
+                        if(length > limits.maxPayloadBytes) {
+                            result = classified("corrupt", "oversized_frame", null, offset)
+                        } else {
+                            end: offset + frameSize(length)
+                            if(end > source.size()) {
+                                // Header fields are exposed so Recovery can
+                                // require the expected sequence for a torn tail.
+                                result = classified("incomplete", "payload", {
+                                    sequence: sequence
+                                }, offset)
+                            } else {
+                                expected: checksum(source, offset, offset + HEADER_BYTES + length)
+                                stored: slice(source, offset + HEADER_BYTES + length, end)
+                                if(!sameBytes(expected, stored)) {
+                                    result = classified("corrupt", "checksum", null, offset)
+                                } else {
+                                    result = classified("frame", null, {
+                                        sequence: sequence
+                                        transaction: transaction
+                                        payload: slice(source, offset + HEADER_BYTES,
+                                            offset + HEADER_BYTES + length)
+                                        checksum: stored
+                                        offset: offset
+                                        size: end - offset
+                                    }, end)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}

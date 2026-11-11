@@ -8,7 +8,13 @@
 //!
 //! create returns Closures over records. Callers receive only the operations,
 //! not the retained Array. This is ordinary lexical scope, not a global database.
-//! All state disappears on restart; durable storage is a separate feature.
+//! The retained credential records live in a `table`, owned by the same
+//! MemoryStore as the identity records, so one logical transaction can stage,
+//! export, validate and publish identities and credentials together. With a
+//! durable store, `create` is instantiated over a private CANDIDATE store
+//! inside DurableStore's transaction gate: hashing and token issuance happen
+//! before the candidate is journaled, and nothing becomes visible until the
+//! journal has synchronized the complete transaction.
 //!
 //! .value() below observes a Future. While waiting, the current Actor turn may
 //! suspend and another message can change state. Re-read/check state after those
@@ -19,34 +25,102 @@ Arrays: import("std:collections/array")
 Identity: import("./IdentityStore.protos")
 Input: import("./RequestJson.protos")
 
-create: (identityStore, entropy) => {
-    records: []
-    byId: (id) => {
-        found: null
-        for(record in records) { if(record.id == id) { found = record } }
-        found
+/// Copy one credential record; never hand out a retained alias.
+credentialCopy: (record) => {
+    {
+        id: record.id
+        subject: record.subject
+        verifier: record.verifier
+        generation: record.generation
     }
-    bySubject: (subject) => {
-        found: null
-        for(record in records) { if(record.subject == subject) { found = record } }
-        found
+}
+
+/// Opaque verifier prefix produced by the Standard Library password provider.
+/// Restoration checks only this framing; it never parses or rewrites the hash.
+VERIFIER_PREFIX: "protos-password-v1:"
+
+verifierShaped: (verifier) => {
+    shaped: false
+    if(String.recognizes(verifier)) {
+        prefix: Encoding.UTF8.encode(VERIFIER_PREFIX)
+        bytes: Encoding.UTF8.encode(verifier)
+        if(bytes.size() > prefix.size()) {
+            shaped = true
+            for(index, 0, prefix.size()) {
+                if(bytes[index] != prefix[index]) { shaped = false }
+            }
+        }
     }
-    replace: (record, verifier) => {
+    shaped
+}
+
+/// Validate a credential record set on its own (unique id and subject,
+/// generation >= 1, verifier framing). One-to-one consistency with identity
+/// records is checked by MemoryStore.validateDomain.
+validTable: (initialRecords) => {
+    ids: []
+    subjects: []
+    for(record in initialRecords) {
+        if(record.id < 1) { Error().signal() }
+        if(!String.recognizes(record.subject) || (record.subject == "")) { Error().signal() }
+        if(record.generation < 1) { Error().signal() }
+        if(!verifierShaped(record.verifier)) { Error().signal() }
+        if(Arrays.contains(ids, record.id)) { Error().signal() }
+        if(Arrays.contains(subjects, record.subject)) { Error().signal() }
+        ids = Arrays.append(ids, record.id)
+        subjects = Arrays.append(subjects, record.subject)
+    }
+    true
+}
+
+/// RootActor-private credential records {id, subject, verifier, generation}.
+/// Owned by MemoryStore; never reachable from an HTTP presenter.
+table: (initialRecords) => {
+    validTable(initialRecords)
+    records: Arrays.map(initialRecords, credentialCopy)
+    {
+        byId: (id) => {
+            found: null
+            for(record in records) { if(record.id == id) { found = record } }
+            found
+        }
+        bySubject: (subject) => {
+            found: null
+            for(record in records) { if(record.subject == subject) { found = record } }
+            found
+        }
+        append: (record) => {
+            records = Arrays.append(records, credentialCopy(record))
+            true
+        }
         // Keep id/subject unchanged, replace the verifier and advance generation.
         // Old JWTs remain correctly signed but fail the generation comparison.
-        replacement: {
-            id: record.id
-            subject: record.subject
-            verifier: verifier
-            generation: record.generation + 1
+        replaceVerifier: (id, verifier) => {
+            records = Arrays.map(records, (entry) => {
+                result: entry
+                if(entry.id == id) {
+                    result = {
+                        id: entry.id
+                        subject: entry.subject
+                        verifier: verifier
+                        generation: entry.generation + 1
+                    }
+                }
+                result
+            })
+            true
         }
-        records = Arrays.map(records, (entry) => {
-            result: entry
-            if(entry.id == record.id) { result = replacement }
-            result
-        })
-        true
+        exportState: () => { Arrays.map(records, credentialCopy) }
     }
+}
+
+create: (identityStore, entropy) => {
+    // Re-read the table on every use: a durable store publishes a new table
+    // object atomically when a transaction commits.
+    credentials: () => { identityStore.credentialTable() }
+    byId: (id) => { credentials().byId(id) }
+    bySubject: (subject) => { credentials().bySubject(subject) }
+    replace: (record, verifier) => { credentials().replaceVerifier(record.id, verifier) }
     conflict: (id, username, email) => {
         failure: null
         usernameOwner: identityStore.identityByUsername(username)
@@ -98,7 +172,7 @@ create: (identityStore, entropy) => {
                     // uniqueness check or token issuance has written neither.
                     outcome = identityStore.admitIdentity(username, email)
                     if(outcome.ok) {
-                        records = Arrays.append(records, {
+                        credentials().append({
                             id: outcome.value.id
                             subject: subject
                             verifier: verifier
@@ -134,9 +208,14 @@ create: (identityStore, entropy) => {
                             // A concurrent replacement while verify yielded must not
                             // authenticate an obsolete password or a renamed email.
                             current: identityStore.identityById(identity.id)
-                            // === checks that this is still the same retained
-                            // record, not a replacement installed during verify.
-                            if(verified && (byId(identity.id) === retained) &&
+                            // Require that the verified record is still current:
+                            // same verifier and generation after the suspension.
+                            // (Compared by value because a durable commit
+                            // publishes freshly restored record objects.)
+                            latest: byId(identity.id)
+                            if(verified && (latest !== null) && (current !== null) &&
+                               (latest.verifier == retained.verifier) &&
+                               (latest.generation == retained.generation) &&
                                (current.email == email)) {
                                 outcome = Identity.accepted(current)
                             }

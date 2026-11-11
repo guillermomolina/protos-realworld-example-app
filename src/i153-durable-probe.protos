@@ -1,0 +1,50 @@
+F: import("./tests/persistence-fixtures.protos")
+Store: import("./app/MemoryStore.protos")
+Codec: import("./app/persistence/JournalCodec.protos")
+Domain: import("./app/persistence/DomainCodec.protos")
+Journal: import("./app/persistence/Journal.protos")
+Durable: import("./app/persistence/DurableStore.protos")
+
+print("I153_DIAG=START")
+
+image: F.journalOf([F.twoAccounts()])
+mem: F.memoryFile(image, F.defaultFaults())
+journal: Journal.attach(mem.file, F.fakeLock(), F.limits())
+recovered: journal.recover()
+print("I153_DIAG=RECOVERY_OK")
+
+coordinator: Durable.create(
+    journal, recovered, F.nonce(42), { maxPending: 4 }
+)
+active: coordinator.store
+print("I153_DIAG=COORDINATOR_CREATED")
+
+candidate: active.stageCandidate()
+print("I153_DIAG=CANDIDATE_OK")
+
+result: candidate.followIdentityFixture(1, 2)
+print("I153_DIAG=MUTATION_OK")
+
+domain: candidate.exportDomain()
+print("I153_DIAG=EXPORT_OK")
+
+Store.validateDomain(domain)
+print("I153_DIAG=VALIDATE_OK")
+
+payload: Domain.encodeTransaction("follow", domain)
+print("I153_DIAG=ENCODE_OK")
+
+transaction: Codec.transactionId(F.nonce(42), journal.nextSequence())
+receipt: journal.appendCommit(transaction, payload)
+print("I153_DIAG=SYNC_OK")
+
+active.publish(candidate)
+print("I153_DIAG=PUBLISH_OK")
+
+if(!active.isFollowingIdentity(1, 2)) { Error().signal() }
+print("I153_DIAG=STATE_OK")
+
+followed: active.follow(2, 1)
+print("I153_DIAG=TRANSACTION_OK")
+
+print("I153_DIAG=PASS")

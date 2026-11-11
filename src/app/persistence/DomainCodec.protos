@@ -1,0 +1,298 @@
+//! Private, versioned representation of the complete persistent RealWorld domain.
+//!
+//! One journal payload is one logical transaction. Format version 1 records the
+//! COMPLETE committed domain after the transaction ("full-state transaction").
+//! This is deliberately simple: recovery never merges partial field updates,
+//! and each payload is bounded by JournalCodec limits. There is no generic
+//! serialization framework: only the fields listed here can ever be stored.
+//!
+//! Payload = UTF-8 JSON text of exactly this object (member order is fixed):
+//!   { "schema": "protos-realworld-domain", "version": 1,
+//!     "operation": <label>, "nextIdentityId": <int>, "nextCommentId": <int>,
+//!     "accounts":  [{id, username, email, bio, image, subject, verifier, generation}],
+//!     "articles":  [{slug, authorId, title, description, body, tagList,
+//!                    createdAt, updatedAt, favoritesCount}],
+//!     "comments":  [{id, slug, authorId, body, createdAt, updatedAt}],
+//!     "follows":   [{followerId, followedId}],
+//!     "favorites": [{actorId, slug}] }
+//!
+//! Collections keep repository Array order, which is itself deterministic
+//! (insertion order); no hash-map enumeration order is ever serialized.
+//! Integers are exact JSON numbers with no fraction or exponent. Strings keep
+//! Unicode, empty text and embedded NUL through standard JSON escaping. bio and
+//! image are JSON null when absent.
+//!
+//! Never stored: plaintext passwords, the JWT signing key, issued tokens,
+//! Closures, ActorRefs, Futures, capabilities, Files or HTTP responses.
+//! verifier is the Standard Library's opaque Argon2id record, unchanged.
+//!
+//! decodeTransaction signals an Error for ANY deviation: unknown/missing
+//! members, wrong JSON kinds, inexact integers, out-of-range values, or limits.
+//! Relationship invariants are checked separately by MemoryStore.validateDomain.
+
+JSON: import("std:json/json")
+Arrays: import("std:collections/array")
+
+SCHEMA: "protos-realworld-domain"
+VERSION: 1
+MAX_ID: 9007199254740991
+
+limits: () => {
+    {
+        maxAccounts: 100000
+        maxArticles: 100000
+        maxComments: 1000000
+        maxEdges: 1000000
+        maxTags: 1024
+        maxUsernameBytes: 256
+        maxEmailBytes: 1024
+        maxSubjectBytes: 256
+        maxVerifierBytes: 4096
+        maxTitleBytes: 1024
+        maxSlugBytes: 2048
+        maxTagBytes: 1024
+        maxTimestampBytes: 64
+        maxOperationBytes: 64
+        maxTextBytes: 1048576
+    }
+}
+
+/// A fresh empty domain: the replay starting point and a new store's state.
+emptyDomain: () => {
+    {
+        nextIdentityId: 1
+        nextCommentId: 1
+        accounts: []
+        articles: []
+        comments: []
+        follows: []
+        favorites: []
+    }
+}
+
+integer: (value) => { JSON.number(value, 0) }
+text: (value) => { JSON.string(value) }
+nullable: (value) => {
+    node: JSON.nullValue()
+    if(value !== null) { node = JSON.string(value) }
+    node
+}
+textArray: (values) => {
+    nodes: []
+    for(value in values) { nodes = Arrays.append(nodes, JSON.string(value)) }
+    JSON.array(...nodes)
+}
+nodeArray: (values, encode) => {
+    nodes: []
+    for(value in values) { nodes = Arrays.append(nodes, encode(value)) }
+    JSON.array(...nodes)
+}
+
+encodeAccount: (record) => {
+    JSON.object(
+        "id", integer(record.id),
+        "username", text(record.username),
+        "email", text(record.email),
+        "bio", nullable(record.bio),
+        "image", nullable(record.image),
+        "subject", text(record.subject),
+        "verifier", text(record.verifier),
+        "generation", integer(record.generation)
+    )
+}
+
+encodeArticle: (record) => {
+    JSON.object(
+        "slug", text(record.slug),
+        "authorId", integer(record.authorId),
+        "title", text(record.title),
+        "description", text(record.description),
+        "body", text(record.body),
+        "tagList", textArray(record.tagList),
+        "createdAt", text(record.createdAt),
+        "updatedAt", text(record.updatedAt),
+        "favoritesCount", integer(record.favoritesCount)
+    )
+}
+
+encodeComment: (record) => {
+    JSON.object(
+        "id", integer(record.id),
+        "slug", text(record.slug),
+        "authorId", integer(record.authorId),
+        "body", text(record.body),
+        "createdAt", text(record.createdAt),
+        "updatedAt", text(record.updatedAt)
+    )
+}
+
+encodeFollow: (edge) => {
+    JSON.object("followerId", integer(edge.followerId), "followedId", integer(edge.followedId))
+}
+
+encodeFavorite: (edge) => {
+    JSON.object("actorId", integer(edge.actorId), "slug", text(edge.slug))
+}
+
+/// Deterministic UTF-8 Bytes for one complete logical transaction.
+encodeTransaction: (operation, domain) => {
+    node: JSON.object(
+        "schema", text(SCHEMA),
+        "version", integer(VERSION),
+        "operation", text(operation),
+        "nextIdentityId", integer(domain.nextIdentityId),
+        "nextCommentId", integer(domain.nextCommentId),
+        "accounts", nodeArray(domain.accounts, encodeAccount),
+        "articles", nodeArray(domain.articles, encodeArticle),
+        "comments", nodeArray(domain.comments, encodeComment),
+        "follows", nodeArray(domain.follows, encodeFollow),
+        "favorites", nodeArray(domain.favorites, encodeFavorite)
+    )
+    Encoding.UTF8.encode(JSON.encode(node))
+}
+
+// ---- strict decoding --------------------------------------------------------
+
+/// Require an object node with exactly the listed members (no extras).
+members: (node, names) => {
+    if(node.kind != "object") { Error().signal() }
+    fields: node.value
+    if(fields.size() != names.size()) { Error().signal() }
+    for(name in names) {
+        if(!fields.containsKey(name)) { Error().signal() }
+    }
+    fields
+}
+
+/// Exact Integer within [minimum, maximum]. 1, not 1.0, 1e0 or "1".
+readInteger: (fields, name, minimum, maximum) => {
+    node: fields[name]
+    if(node.kind != "number") { Error().signal() }
+    value: node.value.coefficient
+    if(JSON.encode(node) != JSON.encode(JSON.number(value, 0))) { Error().signal() }
+    if((value < minimum) || (value > maximum)) { Error().signal() }
+    value
+}
+
+checkedText: (node, maxBytes, allowEmpty) => {
+    if(node.kind != "string") { Error().signal() }
+    value: node.value
+    if(!allowEmpty && (value == "")) { Error().signal() }
+    if(Encoding.UTF8.encode(value).size() > maxBytes) { Error().signal() }
+    value
+}
+
+readText: (fields, name, maxBytes, allowEmpty) => {
+    checkedText(fields[name], maxBytes, allowEmpty)
+}
+
+/// null or non-empty text (IdentityStore normalizes "" to null).
+readNullable: (fields, name, maxBytes) => {
+    node: fields[name]
+    value: null
+    if(node.kind != "null") { value = checkedText(node, maxBytes, false) }
+    value
+}
+
+readArray: (fields, name, maxItems) => {
+    node: fields[name]
+    if(node.kind != "array") { Error().signal() }
+    items: node.value
+    if(items.size() > maxItems) { Error().signal() }
+    items
+}
+
+decodeAccount: (node, bounds) => {
+    fields: members(node, ["id", "username", "email", "bio", "image",
+        "subject", "verifier", "generation"])
+    {
+        id: readInteger(fields, "id", 1, MAX_ID)
+        username: readText(fields, "username", bounds.maxUsernameBytes, false)
+        email: readText(fields, "email", bounds.maxEmailBytes, false)
+        bio: readNullable(fields, "bio", bounds.maxTextBytes)
+        image: readNullable(fields, "image", bounds.maxTextBytes)
+        subject: readText(fields, "subject", bounds.maxSubjectBytes, false)
+        verifier: readText(fields, "verifier", bounds.maxVerifierBytes, false)
+        generation: readInteger(fields, "generation", 1, MAX_ID)
+    }
+}
+
+decodeArticle: (node, bounds) => {
+    fields: members(node, ["slug", "authorId", "title", "description", "body",
+        "tagList", "createdAt", "updatedAt", "favoritesCount"])
+    tags: []
+    for(tag in readArray(fields, "tagList", bounds.maxTags)) {
+        tags = Arrays.append(tags, checkedText(tag, bounds.maxTagBytes, true))
+    }
+    {
+        slug: readText(fields, "slug", bounds.maxSlugBytes, false)
+        authorId: readInteger(fields, "authorId", 1, MAX_ID)
+        title: readText(fields, "title", bounds.maxTitleBytes, false)
+        description: readText(fields, "description", bounds.maxTextBytes, false)
+        body: readText(fields, "body", bounds.maxTextBytes, false)
+        tagList: tags
+        createdAt: readText(fields, "createdAt", bounds.maxTimestampBytes, false)
+        updatedAt: readText(fields, "updatedAt", bounds.maxTimestampBytes, false)
+        favoritesCount: readInteger(fields, "favoritesCount", 0, MAX_ID)
+    }
+}
+
+decodeComment: (node, bounds) => {
+    fields: members(node, ["id", "slug", "authorId", "body", "createdAt", "updatedAt"])
+    {
+        id: readInteger(fields, "id", 1, MAX_ID)
+        slug: readText(fields, "slug", bounds.maxSlugBytes, false)
+        authorId: readInteger(fields, "authorId", 1, MAX_ID)
+        body: readText(fields, "body", bounds.maxTextBytes, false)
+        createdAt: readText(fields, "createdAt", bounds.maxTimestampBytes, false)
+        updatedAt: readText(fields, "updatedAt", bounds.maxTimestampBytes, false)
+    }
+}
+
+decodeFollow: (node, bounds) => {
+    fields: members(node, ["followerId", "followedId"])
+    {
+        followerId: readInteger(fields, "followerId", 1, MAX_ID)
+        followedId: readInteger(fields, "followedId", 1, MAX_ID)
+    }
+}
+
+decodeFavorite: (node, bounds) => {
+    fields: members(node, ["actorId", "slug"])
+    {
+        actorId: readInteger(fields, "actorId", 1, MAX_ID)
+        slug: readText(fields, "slug", bounds.maxSlugBytes, false)
+    }
+}
+
+decodeList: (fields, name, maxItems, decode, bounds) => {
+    result: []
+    for(node in readArray(fields, name, maxItems)) {
+        result = Arrays.append(result, decode(node, bounds))
+    }
+    result
+}
+
+/// Strictly decode payload Bytes into {operation, domain}. Signals on any
+/// malformed, unsupported or out-of-bounds content; never returns partial data.
+decodeTransaction: (payload) => {
+    bounds: limits()
+    root: JSON.parse(Encoding.UTF8.decode(payload))
+    fields: members(root, ["schema", "version", "operation", "nextIdentityId",
+        "nextCommentId", "accounts", "articles", "comments", "follows", "favorites"])
+    if(readText(fields, "schema", 64, false) != SCHEMA) { Error().signal() }
+    // Unsupported versions are rejected, never interpreted as version 1.
+    readInteger(fields, "version", VERSION, VERSION)
+    {
+        operation: readText(fields, "operation", bounds.maxOperationBytes, false)
+        domain: {
+            nextIdentityId: readInteger(fields, "nextIdentityId", 1, MAX_ID)
+            nextCommentId: readInteger(fields, "nextCommentId", 1, MAX_ID)
+            accounts: decodeList(fields, "accounts", bounds.maxAccounts, decodeAccount, bounds)
+            articles: decodeList(fields, "articles", bounds.maxArticles, decodeArticle, bounds)
+            comments: decodeList(fields, "comments", bounds.maxComments, decodeComment, bounds)
+            follows: decodeList(fields, "follows", bounds.maxEdges, decodeFollow, bounds)
+            favorites: decodeList(fields, "favorites", bounds.maxEdges, decodeFavorite, bounds)
+        }
+    }
+}

@@ -1,0 +1,182 @@
+//! Authenticated HTTP persistence scenario through the genuine Standard Library
+//! Argon2id, JWT and Router stack, with the durable store over an injected
+//! in-memory File. "Restart" = close the coordinator, then rebuild journal,
+//! recovery, store, Auth and Api from the last SYNCED image only.
+//!
+//! The signing key below is public test data and is never written to the
+//! journal; the scenario asserts that neither it nor any plaintext password
+//! appears in the journal octets.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Instant: import("std:datetime/instant")
+Auth: import("../app/Auth.protos")
+Api: import("../app/Api.protos")
+Journal: import("../app/persistence/Journal.protos")
+DurableStore: import("../app/persistence/DurableStore.protos")
+Codec: import("../app/persistence/JournalCodec.protos")
+F: import("./persistence-fixtures.protos")
+
+contains: (haystack, needle) => {
+    found: false
+    if(needle.size() <= haystack.size()) {
+        for(start, 0, haystack.size() - needle.size() + 1) {
+            if(!found) {
+                same: true
+                for(index, 0, needle.size()) {
+                    if(same && (haystack[start + index] != needle[index])) { same = false }
+                }
+                if(same) { found = true }
+            }
+        }
+    }
+    found
+}
+
+run: (entropy, clock) => {
+    Assertions.require(clock.epochNanoseconds() > 0)
+    key: Encoding.UTF8.encode("durable-http-public-test-key-32-bytes")
+    current: Instant(1800000000000000000)
+
+    boot: (image, faults) => {
+        mem: F.memoryFile(image, faults)
+        lock: F.fakeLock()
+        journal: Journal.attach(mem.file, lock, F.limits())
+        recovered: journal.recover()
+        durable: DurableStore.create(journal, recovered, entropy.bytes(8).value(),
+            DurableStore.defaultOptions())
+        auth: Auth.create(durable.store, entropy, key, () => { current })
+        {
+            mem: mem
+            lock: lock
+            durable: durable
+            store: durable.store
+            handler: Api.make(durable.store, auth)
+        }
+    }
+    call: (app, method, path, body, token, status) => {
+        headers: []
+        if(token !== null) {
+            headers = [["Authorization", Encoding.Latin1.encode("Token " + token)]]
+        }
+        bytes: Encoding.UTF8.encode("")
+        if(body !== null) { bytes = Encoding.UTF8.encode(JSON.encode(body)) }
+        response: app.handler({
+            method: method
+            target: Encoding.Latin1.encode(path)
+            headers: headers
+            body: bytes
+        })
+        Assertions.require(response.status == status)
+        result: null
+        if((status != 204) && (response.body !== null)) {
+            result = JSON.parse(Encoding.UTF8.decode(response.body)).value
+        }
+        result
+    }
+    user: (name, password) => {
+        JSON.object("user", JSON.object("username", JSON.string(name),
+            "email", JSON.string(name + "@example.test"), "password", JSON.string(password)))
+    }
+    login: (name, password) => {
+        JSON.object("user", JSON.object("email", JSON.string(name + "@example.test"),
+            "password", JSON.string(password)))
+    }
+
+    // 1-2. Register two accounts and log in.
+    app: boot(Codec.emptyBytes(), F.defaultFaults())
+    aliceToken: call(app, "POST", "/api/users", user("alice", "alice password one"), null, 201)["user"].value["token"].value
+    bobOld: call(app, "POST", "/api/users", user("bob", "bob password one"), null, 201)["user"].value["token"].value
+    call(app, "POST", "/api/users/login", login("alice", "alice password one"), null, 200)
+    // A conflicting registration is a domain rejection: nothing journaled.
+    sequenceBefore: app.durable.lastReceipt().sequence
+    call(app, "POST", "/api/users", user("alice", "alice password one"), null, 409)
+    Assertions.require(app.durable.lastReceipt().sequence == sequenceBefore)
+
+    // 3. Article and comment.
+    article: JSON.object("article", JSON.object("title", JSON.string("Durable"),
+        "description", JSON.string("D"), "body", JSON.string("B"),
+        "tagList", JSON.array(JSON.string("persist"))))
+    createdArticle: call(app, "POST", "/api/articles", article, aliceToken, 201)["article"].value
+    slug: createdArticle["slug"].value
+    Assertions.require(slug == "durable")
+    commentBody: JSON.object("comment", JSON.object("body", JSON.string("First")))
+    firstComment: call(app, "POST", "/api/articles/durable/comments", commentBody, bobOld, 201)["comment"].value
+    Assertions.require(firstComment["id"].value.coefficient == 1)
+
+    // 4-5. Follow and favorite.
+    Assertions.require(call(app, "POST", "/api/profiles/alice/follow", null, bobOld, 200)["profile"].value["following"].value)
+    Assertions.require(call(app, "POST", "/api/articles/durable/favorite", null, bobOld, 200)["article"].value["favoritesCount"].value.coefficient == 1)
+
+    // 6. Metadata update.
+    call(app, "PUT", "/api/user", JSON.object("user", JSON.object("bio", JSON.string("Durable bio ✓"))), aliceToken, 200)
+
+    // 7-8. Password change and revocation.
+    bobNew: call(app, "PUT", "/api/user", JSON.object("user", JSON.object("password",
+        JSON.string("bob password two"))), bobOld, 200)["user"].value["token"].value
+    call(app, "GET", "/api/user", null, bobOld, 401)
+    call(app, "GET", "/api/user", null, bobNew, 200)
+
+    // Never persisted: signing key, plaintext passwords, tokens.
+    image: app.mem.synced()
+    Assertions.require(!contains(image, key))
+    for(secret in ["alice password one", "bob password one", "bob password two"]) {
+        Assertions.require(!contains(image, Encoding.UTF8.encode(secret)))
+    }
+    Assertions.require(!contains(image, Encoding.UTF8.encode(bobNew)))
+
+    // 9-10. Persist, close, restore.
+    app.durable.close()
+    Assertions.require(app.lock.releases() == 1)
+    app = boot(image, F.defaultFaults())
+
+    // 11. Identity, ownership, comments, follows, favorites, counters.
+    me: call(app, "GET", "/api/user", null, aliceToken, 200)["user"].value
+    Assertions.require((me["username"].value == "alice") && (me["bio"].value == "Durable bio ✓"))
+    profile: call(app, "GET", "/api/profiles/alice", null, bobNew, 200)["profile"].value
+    Assertions.require(profile["following"].value)
+    restored: call(app, "GET", "/api/articles/durable", null, bobNew, 200)["article"].value
+    Assertions.require(restored["favorited"].value)
+    Assertions.require(restored["favoritesCount"].value.coefficient == 1)
+    Assertions.require(restored["author"].value["username"].value == "alice")
+    // Timestamps are restored verbatim, never regenerated.
+    Assertions.require(restored["createdAt"].value == createdArticle["createdAt"].value)
+    Assertions.require(restored["updatedAt"].value == createdArticle["updatedAt"].value)
+    comments: call(app, "GET", "/api/articles/durable/comments", null, null, 200)["comments"].value
+    Assertions.require((comments.size() == 1) && (comments[0].value["author"].value["username"].value == "bob"))
+    call(app, "PUT", "/api/articles/durable", article, bobNew, 403)
+
+    // 12-13. Same key: new token valid, revoked token still rejected.
+    call(app, "GET", "/api/user", null, bobNew, 200)
+    call(app, "GET", "/api/user", null, bobOld, 401)
+    call(app, "POST", "/api/users/login", login("bob", "bob password two"), null, 200)
+    call(app, "POST", "/api/users/login", login("bob", "bob password one"), null, 401)
+
+    // 14. New IDs continue after restored ones.
+    call(app, "POST", "/api/users", user("carol", "carol password"), null, 201)
+    Assertions.require(app.store.identityByUsername("carol").id == 3)
+    second: call(app, "POST", "/api/articles/durable/comments", commentBody, aliceToken, 201)["comment"].value
+    Assertions.require(second["id"].value.coefficient == 2)
+
+    // 15. Delete with cascades, then restore again.
+    call(app, "DELETE", "/api/articles/durable", null, aliceToken, 204)
+    image = app.mem.synced()
+    app.durable.close()
+    app = boot(image, F.defaultFaults())
+    call(app, "GET", "/api/articles/durable", null, null, 404)
+    call(app, "GET", "/api/articles/durable/comments", null, null, 404)
+    Assertions.require(app.store.favoriteSlugsForIdentity(2).size() == 0)
+    Assertions.require(call(app, "GET", "/api/profiles/alice", null, bobNew, 200)["profile"].value["following"].value)
+    Assertions.require(app.store.exportDomain().nextCommentId == 3)
+
+    // Storage failure: sanitized 503, never a success built on uncommitted state.
+    faults: F.defaultFaults()
+    app = boot(image, faults)
+    faults.failSync = true
+    call(app, "DELETE", "/api/profiles/alice/follow", null, bobNew, 503)
+    faults.failSync = false
+    Assertions.require(app.durable.isFaulted())
+    Assertions.require(call(app, "GET", "/api/profiles/alice", null, bobNew, 200)["profile"].value["following"].value)
+    call(app, "POST", "/api/articles", article, aliceToken, 503)
+    true
+}

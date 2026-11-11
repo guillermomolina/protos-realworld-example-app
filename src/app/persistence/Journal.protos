@@ -1,0 +1,322 @@
+//! RootActor-owned append-only journal over an explicitly granted Filesystem.
+//!
+//!   open(filesystem, journalPath, lockPath, limits, ...reporter)
+//!       acquire the cooperative lock with createNew, then open the
+//!       PREPROVISIONED journal for read+write (no creation, no truncation).
+//!   attach(file, lock, limits, ...reporter)
+//!       the same journal over an already acquired File/lock pair; used by
+//!       open and by deterministic in-memory fault-injection tests.
+//!   journal.recover()                     bounded replay; enables commits
+//!   journal.appendCommit(transaction, payload) -> receipt after sync()
+//!   journal.close()
+//!
+//! Paths are built only with Path.relative().child(name) below the Filesystem's
+//! confined root; no host-native path text is parsed or constructed.
+//!
+//! Commit protocol (one in flight; DurableStore's gate also serializes):
+//!   1. Encode and bound-check the frame. Failure here touches nothing.
+//!   2. seek(endOffset) on this journal's own File (an absolute position, so
+//!      another independently opened File cannot redirect it; the lock is the
+//!      cooperative guard against other writers, see docs/persistence.md).
+//!   3. write the frame in bounded chunks. A chunk's write Future completing
+//!      successfully is the only evidence used that the chunk was accepted;
+//!      its result value is NOT interpreted as a byte count. A failed write may
+//!      still have committed a prefix of that chunk, so it is never retried
+//!      and the file position is never advanced from a guessed count.
+//!   4. sync(). Only its successful completion yields a receipt; flush() and
+//!      close() are never substitutes.
+//! Any failure once step 3 has begun is UNCERTAIN: some octets may be on disk.
+//! The journal then becomes permanently `faulted` for this process. Nothing is
+//! rolled back or truncated; the next startup's recovery classifies the tail.
+//! A failure in step 2 (before any write) leaves the journal `ready`.
+//!
+//! The lock is a cooperative exclusion among processes that use this protocol.
+//! It is not distributed fencing and cannot stop arbitrary external writers.
+//! A lock left by a crashed process is NEVER stolen automatically; an operator
+//! removes it after confirming no server is running (docs/persistence.md).
+//! File.sync() makes this one File's contents durable; it does not promise the
+//! durability of directory entries (lock creation/removal).
+//!
+//! `filesystem` is a bootstrap-local RootActor capability: main.protos passes
+//! it explicitly. This module never names an ambient `filesystem` global.
+
+Codec: import("./JournalCodec.protos")
+Recovery: import("./Recovery.protos")
+
+READ_CHUNK_BYTES: 65536
+WRITE_CHUNK_BYTES: 65536
+LOCK_MARKER: "protos-realworld journal lock v1\n"
+
+/// Fixed confined names below the granted Filesystem root.
+journalPath: () => { Path.relative().child("realworld.journal") }
+lockPath: () => { Path.relative().child("realworld.journal.lock") }
+
+/// Write `bytes` as consecutive bounded chunks. Each chunk is complete only
+/// when its write Future succeeds; any failure signals immediately (the
+/// caller treats it as uncertain). No retry, no inferred byte count.
+writeFully: (file, bytes) => {
+    start: 0
+    while(start < bytes.size()) {
+        end: start + WRITE_CHUNK_BYTES
+        if(end > bytes.size()) { end = bytes.size() }
+        file.write(Codec.slice(bytes, start, end)).value()
+        start = end
+    }
+    bytes.size()
+}
+
+reporterFrom: (options) => {
+    report: (reason) => { reason }
+    if(options.size() > 0) { report = options[0] }
+    report
+}
+
+open: (filesystem, journalFile, lockFile, limits, ...options) => {
+    report: reporterFrom(options)
+    lockHandle: null
+    Error.handle(
+        () => { lockHandle = filesystem.open(lockFile, read: true, write: true, createNew: true).value() },
+        (failure) => {
+            // Existing lock: another server, or a stale lock after a crash.
+            // Both fail closed; nothing is deleted here.
+            report("lock_unavailable")
+            failure.signal()
+        }
+    )
+    // From here on this process owns the lock file and must release it on
+    // every failed startup path, through the same explicit authority.
+    // Only the lock this call created is ever removed (never a pre-existing
+    // lock of another cooperative writer: acquisition failed above for that).
+    lockReleased: false
+    releaseLock: () => {
+        if(!lockReleased) {
+            Error.handle(
+                () => { lockHandle.close().value() },
+                (failure) => { failure }
+            )
+            filesystem.remove(lockFile).value()
+            lockReleased = true
+        }
+        true
+    }
+    abandon: (reason, failure) => {
+        report(reason)
+        Error.handle(
+            () => { releaseLock() },
+            (cleanup) => {
+                report("lock_release_failed")
+                cleanup
+            }
+        )
+        failure.signal()
+    }
+    Error.handle(
+        () => {
+            writeFully(lockHandle, Encoding.UTF8.encode(LOCK_MARKER))
+            lockHandle.sync().value()
+        },
+        (failure) => { abandon("lock_marker_failed", failure) }
+    )
+    // Preprovisioned journal: read+write, no createNew, no truncation.
+    file: null
+    Error.handle(
+        () => { file = filesystem.open(journalFile, read: true, write: true).value() },
+        (failure) => { abandon("journal_unavailable", failure) }
+    )
+    attach(file, { release: releaseLock }, limits, report)
+}
+
+/// limits: JournalCodec.defaultLimits() plus optional repairIncompleteTail.
+attach: (file, lock, limits, ...options) => {
+    report: reporterFrom(options)
+    phase: "opened"
+    reason: null
+    frontier: 0
+    sequence: 1
+    repair: false
+    Error.handle(
+        () => { repair = limits.repairIncompleteTail == true },
+        (failure) => { failure }
+    )
+
+    fail: (label) => {
+        reason = label
+        report(label)
+        Error().signal()
+    }
+
+    readAll: () => {
+        file.seek(0).value()
+        bytes: Codec.emptyBytes()
+        chunk: file.read(READ_CHUNK_BYTES).value()
+        while(chunk !== null) {
+            // read(max) returns 1..max octets or null at EOF; never assume max.
+            if((chunk.size() < 1) || (chunk.size() > READ_CHUNK_BYTES)) {
+                phase = "faulted"
+                fail("journal_read_protocol")
+            }
+            if(bytes.size() + chunk.size() > limits.maxJournalBytes) {
+                phase = "faulted"
+                fail("journal_quota")
+            }
+            for(octet in chunk) { bytes.add(octet) }
+            chunk = file.read(READ_CHUNK_BYTES).value()
+        }
+        bytes
+    }
+
+    journal: {
+        state: () => { phase }
+        failureReason: () => { reason }
+        isAvailable: () => { phase == "ready" }
+        nextSequence: () => { sequence }
+        endOffset: () => { frontier }
+
+        /// Replay the complete file once. Returns
+        /// {domain, nextSequence, frames, applied, duplicates, tail}.
+        /// Corruption, schema errors and unauthorized tails fail closed.
+        recover: () => {
+            if(phase != "opened") { fail("recover_state") }
+            phase = "recovering"
+            image: null
+            Error.handle(
+                () => { image = readAll() },
+                (failure) => {
+                    phase = "faulted"
+                    if(reason === null) { reason = "journal_read_failed" }
+                    report(reason)
+                    failure.signal()
+                }
+            )
+            replayed: Recovery.replay(image, limits)
+            if(!replayed.ok) {
+                phase = "faulted"
+                fail(replayed.reason)
+            }
+            if(replayed.tail == "incomplete") {
+                if(!repair) {
+                    phase = "faulted"
+                    fail("incomplete_tail_requires_repair")
+                }
+                // Explicitly authorized repair. endOffset is the end of the last
+                // completely VALIDATED frame; Recovery reports an incomplete
+                // tail only for a strict prefix whose header (if present) is
+                // valid and carries the expected sequence, or for zero fill.
+                // Corrupt/unsupported/invalid frames never reach this point.
+                // Truncate+sync is not claimed to be power-loss atomic.
+                Error.handle(
+                    () => {
+                        file.truncate(replayed.endOffset).value()
+                        file.sync().value()
+                    },
+                    (failure) => {
+                        phase = "faulted"
+                        report("tail_repair_failed")
+                        failure.signal()
+                    }
+                )
+            }
+            // Exercise sync() before admitting any commit: a File without a
+            // working synchronization operation fails startup closed.
+            Error.handle(
+                () => { file.sync().value() },
+                (failure) => {
+                    phase = "faulted"
+                    report("sync_unsupported")
+                    failure.signal()
+                }
+            )
+            frontier = replayed.endOffset
+            sequence = replayed.nextSequence
+            phase = "ready"
+            {
+                domain: replayed.domain
+                nextSequence: replayed.nextSequence
+                frames: replayed.frames
+                applied: replayed.applied
+                duplicates: replayed.duplicates
+                tail: replayed.tail
+            }
+        }
+
+        /// Durably append one complete logical transaction. Returns a receipt
+        /// only after sync() completed. See the module comment for faults.
+        appendCommit: (transaction, payload) => {
+            if(phase != "ready") { Error().signal() }
+            // Capture and validate before any I/O.
+            frame: Codec.encodeFrame(sequence, transaction, Codec.copyBytes(payload), limits)
+            if(frontier + frame.size() > limits.maxJournalBytes) {
+                reason = "journal_quota"
+                report(reason)
+                Error().signal()
+            }
+            phase = "writing"
+            writeStarted: false
+            completed: false
+            Error.handle(
+                () => {
+                    file.seek(frontier).value()
+                    writeStarted = true
+                    writeFully(file, frame)
+                    file.sync().value()
+                    completed = true
+                },
+                (failure) => {
+                    if(writeStarted) {
+                        // Physical persistence is now unknown. No rollback.
+                        phase = "faulted"
+                        reason = "uncertain_commit"
+                    } else {
+                        phase = "ready"
+                        reason = "seek_failed"
+                    }
+                    report(reason)
+                    failure
+                }
+            )
+            if(!completed) { Error().signal() }
+            receipt: {
+                sequence: sequence
+                transaction: Codec.copyBytes(transaction)
+                offset: frontier
+                size: frame.size()
+            }
+            frontier = frontier + frame.size()
+            sequence = sequence + 1
+            phase = "ready"
+            receipt
+        }
+
+        /// Close the File, then release the lock. close() is not assumed to
+        /// synchronize anything: every acknowledged frame was already synced.
+        /// If a write is in flight or the File cannot be closed, the lock is
+        /// kept so that an operator inspects the store before a restart.
+        close: () => {
+            if(phase != "closed") {
+                inFlight: phase == "writing"
+                phase = "closing"
+                closed: false
+                Error.handle(
+                    () => {
+                        file.close().value()
+                        closed = true
+                    },
+                    (failure) => {
+                        report("journal_close_failed")
+                        failure
+                    }
+                )
+                if(closed && !inFlight) {
+                    lock.release()
+                    phase = "closed"
+                } else {
+                    phase = "faulted"
+                    if(reason === null) { reason = "close_incomplete" }
+                    Error().signal()
+                }
+            }
+            true
+        }
+    }
+    journal
+}

@@ -6,6 +6,13 @@
 //! AuthStore keeps credentials; this module keeps the signing key and connects
 //! verified JWT claims to those retained accounts. It never trusts decoded JSON
 //! claims without the Standard Library's signature and policy verification.
+//!
+//! Persistence: subjects and generations are restored from the durable domain;
+//! this module never creates a new subject for an existing account. The signing
+//! key, Entropy and the now Closure are never serialized. Registration and
+//! account updates run inside store.transact: on a durable store the AuthStore
+//! operation executes against a private candidate (hashing and token issuance
+//! included) and the response is produced only after the journal commit.
 JWT: import("std:auth/jwt")
 JSON: import("std:json/json")
 ISO8601: import("std:datetime/iso8601")
@@ -96,9 +103,17 @@ create: (store, entropy, signingKey, now) => {
     }
     service: {
         register: (fields) => {
-            accountResponse(credentials.register(fields["username"].value,
-                fields["email"].value, fields["password"].value,
-                issueForSubject), 201, true)
+            result: store.transact("register", (candidate) => {
+                // Same AuthStore logic, bound to the staged candidate.
+                value: Credentials.create(candidate, entropy).register(
+                    fields["username"].value, fields["email"].value,
+                    fields["password"].value, issueForSubject)
+                {
+                    result: value
+                    changed: value.ok
+                }
+            })
+            accountResponse(result, 201, true)
         }
         login: (fields) => {
             accountResponse(credentials.authenticate(fields["email"].value,
@@ -167,8 +182,17 @@ create: (store, entropy, signingKey, now) => {
             Users.single(store.identityById(principal.id), principal.token)
         }
         update: (principal, fields) => {
-            accountResponse(credentials.updateAccount(principal.id,
-                principal.generation, fields), 200, false)
+            // Metadata and a new verifier/generation commit as ONE transaction.
+            // The response token is issued from the published credentials.
+            result: store.transact("updateAccount", (candidate) => {
+                value: Credentials.create(candidate, entropy).updateAccount(
+                    principal.id, principal.generation, fields)
+                {
+                    result: value
+                    changed: value.ok
+                }
+            })
+            accountResponse(result, 200, false)
         }
         timestamp: () => { ISO8601.formatInstant(now()) }
     }

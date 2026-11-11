@@ -1,0 +1,228 @@
+//! Application-level transaction coordinator for the durable RealWorld store.
+//!
+//! The RootActor owns exactly one coordinator, one journal and one committed
+//! MemoryStore. The coordinator mediates state transitions; the domain model
+//! stays in MemoryStore and its repositories.
+//!
+//! One transaction (store.transact / any MemoryStore application mutation):
+//!   1. admit      take the transaction gate (bounded FIFO of waiters)
+//!   2. stage      candidate = committed.stageCandidate(), an independent copy
+//!   3. prepare    run the domain operation on the candidate: validation,
+//!                 Argon2id hashing, Entropy, token issuance (may suspend)
+//!   4. classify   rejected / unchanged -> return the result, journal nothing
+//!   5. validate   export the complete candidate and validate all invariants
+//!   6. serialize  DomainCodec.encodeTransaction
+//!   7. append     journal.appendCommit (writes, then sync())
+//!   8. publish    committed.publish(candidate), no suspension point
+//!   9. release    hand the gate to the next waiter; return the prepared result
+//!
+//! Future.value() inside steps 3 and 7 may suspend this Actor turn and let other
+//! messages run. The gate is held across those suspensions, so a competing
+//! write waits instead of validating against the same obsolete state. Reads go
+//! to the committed store, which changes only at step 8: they never see a
+//! candidate. Every terminal path releases or retires the gate.
+//!
+//! Failure before step 7: the committed state is unchanged; the Error reaches
+//! Api's sanitized 503 boundary (or the domain rejection is returned).
+//! Failure during step 7: the outcome is UNCERTAIN. The candidate is not
+//! published, the coordinator becomes permanently faulted and every later
+//! write fails closed until a restart lets recovery decide. Reads continue to
+//! serve the last known committed state. No rollback is claimed.
+//!
+//! Transaction IDs (nonce + sequence) identify journal records, not HTTP
+//! requests. A client retry after an uncertain 503 is a NEW transaction; no
+//! exactly-once network delivery is promised.
+
+Arrays: import("std:collections/array")
+Codec: import("./JournalCodec.protos")
+Domain: import("./DomainCodec.protos")
+Store: import("../MemoryStore.protos")
+
+defaultOptions: () => {
+    { maxPending: 64 }
+}
+
+/// A one-shot wake-up built only from Core Futures and cancellation (the same
+/// technique as the HTTP lifecycle tests): no sleep, no busy loop.
+makeGate: () => {
+    blocker: (() => { Actor.current().termination().value() }).future()
+    opened: (() => {
+        Error.handle(
+            () => { blocker.value() },
+            (error) => { error }
+        )
+        true
+    }).future()
+    gate: {
+        granted: false
+        abandoned: false
+        wait: () => { opened.value() }
+        open: () => {
+            gate.granted = true
+            blocker.cancel()
+            true
+        }
+    }
+    gate
+}
+
+/// journal: {nextSequence, appendCommit, isAvailable, close} (Journal.attach
+/// or an injected test double). recovered: {domain} from journal.recover().
+/// nonce: 8 Bytes chosen by the RootActor at startup.
+create: (journal, recovered, nonce, options) => {
+    if(nonce.size() != 8) { Error().signal() }
+    retainedNonce: Codec.copyBytes(nonce)
+    maxPending: options.maxPending
+    if((maxPending < 0) || (maxPending > 4096)) { Error().signal() }
+    gateHeld: false
+    waiters: []
+    closing: false
+    closed: false
+    faulted: false
+    faultLabel: null
+    commitCount: 0
+    receiptValue: null
+    idleGate: null
+
+    // Hand ownership to the next live waiter, or mark the gate free.
+    release: () => {
+        handed: false
+        while(!handed && (waiters.size() > 0)) {
+            next: waiters[0]
+            waiters = Arrays.slice(waiters, 1, waiters.size())
+            if(!next.abandoned) {
+                next.open()
+                handed = true
+            }
+        }
+        if(!handed) {
+            gateHeld = false
+            if(idleGate !== null) {
+                gate: idleGate
+                idleGate = null
+                gate.open()
+            }
+        }
+        true
+    }
+
+    admit: () => {
+        if(closing || faulted) { Error().signal() }
+        if(!gateHeld) {
+            gateHeld = true
+        } else {
+            // Bounded queue: overload fails closed (HTTP 503), never unbounded.
+            if(waiters.size() >= maxPending) { Error().signal() }
+            gate: makeGate()
+            waiters = Arrays.append(waiters, gate)
+            interrupted: null
+            Error.handle(
+                () => { gate.wait() },
+                (failure) => {
+                    interrupted = failure
+                    failure
+                }
+            )
+            if(interrupted !== null) {
+                // Defensive only: correctness does not depend on cancellation
+                // being delivered. If the wait failed, never hold the gate:
+                // pass ownership on if it was granted, else mark the entry so
+                // release skips it.
+                gate.abandoned = true
+                if(gate.granted) { release() }
+                interrupted.signal()
+            }
+            // Ownership was transferred by release(); state may have changed.
+            if(closing || faulted) {
+                release()
+                Error().signal()
+            }
+        }
+        true
+    }
+
+    coordinator: {
+        transact: (active, operation, stage) => {
+            admit()
+            outcome: null
+            Error.handle(
+                () => {
+                    if(faulted || !journal.isAvailable()) {
+                        faulted = true
+                        Error().signal()
+                    }
+                    candidate: active.stageCandidate()
+                    staged: stage(candidate)
+                    if(staged.changed) {
+                        domain: candidate.exportDomain()
+                        Store.validateDomain(domain)
+                        payload: Domain.encodeTransaction(operation, domain)
+                        transaction: Codec.transactionId(retainedNonce, journal.nextSequence())
+                        receipt: null
+                        Error.handle(
+                            () => { receipt = journal.appendCommit(transaction, payload) },
+                            (failure) => {
+                                // Pre-write failures leave the journal ready;
+                                // any uncertain write poisons this process.
+                                if(!journal.isAvailable()) {
+                                    faulted = true
+                                    faultLabel = "uncertain_commit"
+                                }
+                                failure.signal()
+                            }
+                        )
+                        // Durable: publish atomically, then answer. A publish
+                        // failure after a durable commit means memory and
+                        // journal disagree: poison writes until a restart.
+                        Error.handle(
+                            () => { active.publish(candidate) },
+                            (failure) => {
+                                faulted = true
+                                faultLabel = "publish_after_commit_failed"
+                                failure.signal()
+                            }
+                        )
+                        receiptValue = receipt
+                        commitCount = commitCount + 1
+                    }
+                    outcome = staged.result
+                },
+                (failure) => {
+                    release()
+                    failure.signal()
+                }
+            )
+            release()
+            outcome
+        }
+    }
+
+    store: Store.durable(recovered.domain, coordinator)
+
+    {
+        store: store
+        isFaulted: () => { faulted }
+        faultReason: () => { faultLabel }
+        pending: () => { waiters.size() }
+        busy: () => { gateHeld }
+        commits: () => { commitCount }
+        lastReceipt: () => { receiptValue }
+
+        /// Stop admitting transactions, wait for the one in progress (if any)
+        /// to classify its outcome, then close the journal (which releases the
+        /// lock only when that is safe). Queued waiters are refused.
+        close: () => {
+            // Re-entrant calls during the wait return without closing twice.
+            if(!closing) {
+                closing = true
+                if(gateHeld) {
+                    idleGate = makeGate()
+                    idleGate.wait()
+                }
+                closed = true
+                journal.close()
+            }
+            true
+        }
+    }
+}

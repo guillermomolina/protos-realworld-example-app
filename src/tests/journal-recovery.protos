@@ -1,0 +1,182 @@
+//! Deterministic replay tests over in-memory journal images.
+//! These images are frame fixtures, not a claim about disk durability.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Codec: import("../app/persistence/JournalCodec.protos")
+Domain: import("../app/persistence/DomainCodec.protos")
+Recovery: import("../app/persistence/Recovery.protos")
+Store: import("../app/MemoryStore.protos")
+F: import("./persistence-fixtures.protos")
+
+limits: F.limits()
+replay: (bytes) => { Recovery.replay(bytes, limits) }
+reasonOf: (bytes) => {
+    result: replay(bytes)
+    Assertions.require(!result.ok)
+    result.reason
+}
+
+// Empty journal: a fresh empty domain, sequence 1.
+empty: replay(Codec.emptyBytes())
+Assertions.require(empty.ok && (empty.frames == 0) && (empty.nextSequence == 1))
+Assertions.require((empty.tail == "clean") && (empty.domain.accounts.size() == 0))
+
+// Multiple transactions: the last complete state wins, every frame validated.
+first: F.twoAccounts()
+second: F.richDomain()
+image: F.journalOf([first, second])
+two: replay(image)
+Assertions.require(two.ok && (two.frames == 2) && (two.applied == 2) && (two.nextSequence == 3))
+Assertions.require(two.endOffset == image.size())
+restored: Store.restore(two.domain)
+Assertions.require(restored.isFollowingIdentity(2, 1))
+Assertions.require(restored.find("hello").favoritesCount == 1)
+Assertions.require(restored.commentsFor("hello")[0].id == 1)
+Assertions.require(restored.credentialTable().bySubject("subject-bob").id == 2)
+
+// Exact retransmission of the previous transaction: consumed, not reapplied.
+f1: F.frame(1, 9, first)
+f2: F.frame(2, 9, second)
+f2Tx: Codec.transactionId(F.nonce(9), 2)
+f2Payload: Domain.encodeTransaction("fixture", second)
+retransmitted: Codec.encodeFrame(3, f2Tx, f2Payload, limits)
+dup: replay(F.concat([f1, f2, retransmitted]))
+Assertions.require(dup.ok && (dup.applied == 2) && (dup.duplicates == 1) && (dup.nextSequence == 4))
+// Same ID with a different payload, or an older ID reappearing: conflict.
+conflicting: Codec.encodeFrame(3, f2Tx, Domain.encodeTransaction("other", second), limits)
+Assertions.require(reasonOf(F.concat([f1, f2, conflicting])) == "transaction_conflict")
+olderId: Codec.encodeFrame(3, Codec.transactionId(F.nonce(9), 1),
+    Domain.encodeTransaction("fixture", second), limits)
+Assertions.require(reasonOf(F.concat([f1, f2, olderId])) == "transaction_conflict")
+
+// Sequence gaps and repetitions.
+Assertions.require(reasonOf(F.concat([f1, F.frame(3, 9, second)])) == "sequence_gap")
+Assertions.require(reasonOf(F.frame(2, 9, first)) == "sequence_gap")
+
+// Interior corruption is never skipped, even when later frames are valid.
+damaged: Codec.emptyBytes()
+for(index, 0, image.size()) {
+    octet: image[index]
+    if(index == Codec.HEADER_BYTES + 3) { octet = (octet + 1) % 256 }
+    damaged.add(octet)
+}
+corrupt: replay(damaged)
+Assertions.require((!corrupt.ok) && (corrupt.reason == "corrupt_checksum") && (corrupt.offset == 0))
+
+// Incomplete trailing record: earlier confirmed transactions are preserved and
+// the tail is reported (never silently appended after).
+third: F.frame(3, 9, second)
+for(cut in [1, 20, Codec.HEADER_BYTES + 1, third.size() - 1]) {
+    torn: replay(F.concat([image, Codec.slice(third, 0, cut)]))
+    Assertions.require(torn.ok && (torn.tail == "incomplete"))
+    Assertions.require((torn.frames == 2) && (torn.endOffset == image.size()))
+    Assertions.require(Store.restore(torn.domain).isFollowingIdentity(2, 1))
+}
+zeroTail: Codec.copyBytes(image)
+for(index, 0, 64) { zeroTail.add(0) }
+Assertions.require(replay(zeroTail).tail == "incomplete")
+
+// Complete potentially committed tail (sync may never have been acknowledged):
+// a checksum-valid final frame is applied, never discarded.
+uncertain: F.richDomain()
+uncertain.follows = []
+withTail: replay(F.concat([image, F.frame(3, 9, uncertain)]))
+Assertions.require(withTail.ok && (withTail.tail == "clean") && (withTail.applied == 3))
+Assertions.require(!Store.restore(withTail.domain).isFollowingIdentity(2, 1))
+
+// Simulated interrupted transaction: frame 3 torn after frame 2 committed.
+interrupted: replay(F.concat([image, Codec.slice(F.frame(3, 9, uncertain), 0, 50)]))
+Assertions.require(interrupted.ok && (interrupted.domain.follows.size() == 1))
+
+// Unsupported schema / malformed payload inside a checksum-valid frame.
+badSchema: Codec.encodeFrame(1, Codec.transactionId(F.nonce(9), 1),
+    Encoding.UTF8.encode(JSON.encode(JSON.object(
+        "schema", JSON.string("protos-realworld-domain"),
+        "version", JSON.number(2, 0)))), limits)
+Assertions.require(reasonOf(badSchema) == "domain_schema")
+
+// Replay limits.
+tight: F.limits()
+tight.maxFrames = 1
+Assertions.require(Recovery.replay(image, tight).reason == "frame_limit")
+quota: F.limits()
+quota.maxJournalBytes = image.size() - 1
+Assertions.require(Recovery.replay(image, quota).reason == "journal_quota")
+
+// Domain invariants checked after each complete logical transaction.
+invariant: (domain) => { reasonOf(F.journalOf([domain])) }
+duplicateName: F.twoAccounts()
+duplicateName.accounts = [F.account(1, "alice"), F.account(2, "alice")]
+Assertions.require(invariant(duplicateName) == "domain_invariant")
+duplicateId: F.twoAccounts()
+duplicateId.accounts = [F.account(1, "alice"), F.account(1, "bob")]
+Assertions.require(invariant(duplicateId) == "domain_invariant")
+duplicateSubject: F.twoAccounts()
+bobSameSubject: F.account(2, "bob")
+bobSameSubject.subject = "subject-alice"
+duplicateSubject.accounts = [F.account(1, "alice"), bobSameSubject]
+Assertions.require(invariant(duplicateSubject) == "domain_invariant")
+missingEndpoint: F.twoAccounts()
+missingEndpoint.follows = [{
+    followerId: 1
+    followedId: 7
+}]
+Assertions.require(invariant(missingEndpoint) == "domain_invariant")
+selfFollow: F.twoAccounts()
+selfFollow.follows = [{
+    followerId: 1
+    followedId: 1
+}]
+Assertions.require(invariant(selfFollow) == "domain_invariant")
+orphanComment: F.richDomain()
+orphanComment.comments = [F.comment(1, "missing", 1)]
+Assertions.require(invariant(orphanComment) == "domain_invariant")
+badCount: F.richDomain()
+badCount.articles = [F.article("hello", 1, 2)]
+Assertions.require(invariant(badCount) == "domain_invariant")
+badNextId: F.twoAccounts()
+badNextId.nextIdentityId = 2
+Assertions.require(invariant(badNextId) == "domain_invariant")
+badNextComment: F.richDomain()
+badNextComment.nextCommentId = 1
+Assertions.require(invariant(badNextComment) == "domain_invariant")
+badVerifier: F.twoAccounts()
+plain: F.account(2, "bob")
+plain.verifier = "plaintext-password"
+badVerifier.accounts = [F.account(1, "alice"), plain]
+Assertions.require(invariant(badVerifier) == "domain_invariant")
+badTime: F.richDomain()
+late: F.article("hello", 1, 1)
+late.createdAt = "yesterday"
+badTime.articles = [late]
+Assertions.require(invariant(badTime) == "domain_invariant")
+
+// Identity continuity across transactions: no account loss, no subject change,
+// no generation rollback (revocation survives), no ID reuse.
+transitionReason: (before, after) => { reasonOf(F.journalOf([before, after])) }
+lost: F.twoAccounts()
+lost.accounts = [F.account(1, "alice")]
+Assertions.require(transitionReason(F.twoAccounts(), lost) == "domain_transition")
+resubject: F.twoAccounts()
+changed: F.account(2, "bob")
+changed.subject = "subject-new"
+resubject.accounts = [F.account(1, "alice"), changed]
+Assertions.require(transitionReason(F.twoAccounts(), resubject) == "domain_transition")
+advanced: F.twoAccounts()
+bob2: F.account(2, "bob")
+bob2.generation = 2
+advanced.accounts = [F.account(1, "alice"), bob2]
+Assertions.require(transitionReason(advanced, F.twoAccounts()) == "domain_transition")
+Assertions.require(replay(F.journalOf([F.twoAccounts(), advanced])).ok)
+withComment: F.richDomain()
+reused: F.richDomain()
+reused.comments = [F.comment(1, "hello", 2)]
+deletedComment: F.richDomain()
+deletedComment.comments = []
+reusedAgain: F.richDomain()
+reusedAgain.comments = [F.comment(1, "hello", 1)]
+// Deleting comment 1 keeps nextCommentId at 2; reintroducing id 1 afterwards
+// is still a new comment below the counter: rejected.
+Assertions.require(transitionReason(deletedComment, reusedAgain) == "domain_transition")
+true

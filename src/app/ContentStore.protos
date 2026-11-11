@@ -16,6 +16,10 @@
 //! Domain results are {ok, value, field, message}. "not found" and "not owned"
 //! stay distinct so Api/Responses can return 404 and 403. A rejected operation
 //! leaves retained records unchanged. This repository knows no HTTP status codes.
+//!
+//! restore/exportState support durable recovery. Article deletion removes its
+//! comments inside this repository; MemoryStore removes favorite edges in the
+//! same staged candidate, so one journal transaction contains the whole cascade.
 
 Arrays: import("std:collections/array")
 
@@ -72,10 +76,77 @@ commentCopy: (record, identities) => {
     }
 }
 
-create: (identities) => {
-    articles: []
-    comments: []
-    nextCommentId: 1
+articleRecord: (record) => {
+    {
+        slug: record.slug
+        authorId: record.authorId
+        title: record.title
+        description: record.description
+        body: record.body
+        tagList: Array(...record.tagList)
+        createdAt: record.createdAt
+        updatedAt: record.updatedAt
+        favoritesCount: record.favoritesCount
+    }
+}
+
+commentRecord: (record) => {
+    {
+        id: record.id
+        slug: record.slug
+        authorId: record.authorId
+        body: record.body
+        createdAt: record.createdAt
+        updatedAt: record.updatedAt
+    }
+}
+
+nonBlank: (value) => { String.recognizes(value) && (value != "") }
+
+/// Validate a complete managed-content record set against `identities`.
+/// Timestamps are kept verbatim (never regenerated); IDs are never reassigned.
+validRecords: (identities, initialArticles, initialComments, initialNextCommentId) => {
+    if(initialNextCommentId < 1) { Error().signal() }
+    slugs: []
+    for(record in initialArticles) {
+        if(!nonBlank(record.slug)) { Error().signal() }
+        if(Arrays.contains(slugs, record.slug)) { Error().signal() }
+        if(identities.findId(record.authorId) === null) { Error().signal() }
+        if(!nonBlank(record.title) || !nonBlank(record.description) || !nonBlank(record.body)) {
+            Error().signal()
+        }
+        for(tag in record.tagList) {
+            if(!String.recognizes(tag)) { Error().signal() }
+        }
+        if(!nonBlank(record.createdAt) || !nonBlank(record.updatedAt)) { Error().signal() }
+        if(record.favoritesCount < 0) { Error().signal() }
+        slugs = Arrays.append(slugs, record.slug)
+    }
+    ids: []
+    for(record in initialComments) {
+        if((record.id < 1) || (record.id >= initialNextCommentId)) { Error().signal() }
+        if(Arrays.contains(ids, record.id)) { Error().signal() }
+        if(!Arrays.contains(slugs, record.slug)) { Error().signal() }
+        if(identities.findId(record.authorId) === null) { Error().signal() }
+        if(!nonBlank(record.body)) { Error().signal() }
+        if(!nonBlank(record.createdAt) || !nonBlank(record.updatedAt)) { Error().signal() }
+        ids = Arrays.append(ids, record.id)
+    }
+    true
+}
+
+/// Durable restoration through validation plus direct construction.
+restore: (identities, initialArticles, initialComments, initialNextCommentId) => {
+    validRecords(identities, initialArticles, initialComments, initialNextCommentId)
+    build(identities, initialArticles, initialComments, initialNextCommentId)
+}
+
+create: (identities) => { build(identities, [], [], 1) }
+
+build: (identities, initialArticles, initialComments, initialNextCommentId) => {
+    articles: Arrays.map(initialArticles, articleRecord)
+    comments: Arrays.map(initialComments, commentRecord)
+    nextCommentId: initialNextCommentId
 
     rawArticle: (slug) => {
         found: null
@@ -114,6 +185,15 @@ create: (identities) => {
     }
 
     store: {
+        /// Durable export: fresh records in repository (insertion) order.
+        exportState: () => {
+            {
+                articles: Arrays.map(articles, articleRecord)
+                comments: Arrays.map(comments, commentRecord)
+                nextCommentId: nextCommentId
+            }
+        }
+
         articleOwnerId: (slug) => {
             record: rawArticle(slug)
             owner: null

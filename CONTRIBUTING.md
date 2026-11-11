@@ -13,10 +13,11 @@ For proposed architectural changes, open an issue before undertaking a large ref
 - `make test`: app module and endpoint tests.
 - `make test-http`: authenticated TCP HTTP checks, requiring a separately running fresh `make serve`.
 - `make test-http-lifecycle`: independent Worker/concurrency/shutdown checks.
+- `make test-restart`: real restart, SIGKILL, lock and corruption checks in a disposable directory (Python 3 test driver, installed Protos).
 - `make test-hurl`: requires Hurl and an external RealWorld checkout. The local command applies a documented token-refresh adjustment to a temporary copy of one Hurl file; do not represent its result as an unmodified official-suite pass.
 
 Preserve the distinctions between local tests, externally adapted tests and upstream official conformance. Avoid application-specific cryptography, automatic ambient authority, and sharing mutable application state across Actors.
 
 ## Scope and licensing
 
-Durable storage, restart recovery and production deployment hardening are future work. This independent example application is distributed under the MIT license (see LICENSE).
+Durable storage is implemented as an application-owned Protos journal (see docs/persistence.md) and still awaits validation; keep it free of database dependencies and ambient filesystem authority. Production deployment hardening is future work. This independent example application is distributed under the MIT license (see LICENSE).

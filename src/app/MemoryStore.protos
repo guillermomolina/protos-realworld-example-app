@@ -1,8 +1,25 @@
-//! Minimal Actor-local data store for the learning application.
+//! Actor-local domain-state composition boundary for the learning application.
 //!
-//! State is captured by closures created inside create(). Each store
+//! State is captured by closures created inside build(). Each store
 //! instance owns its own article, profile, comment and favorite collections.
-//! There is no database or durable persistence; Auth owns security authority.
+//! Auth owns security authority. Durable persistence is optional and explicit:
+//!
+//!   create()                 in-memory store; mutations apply in place
+//!                            (unit tests, anonymous fixtures).
+//!   restore(domain)          validated reconstruction of the complete
+//!                            persistent domain, without a committer.
+//!   durable(domain, commit)  the committed state of the persistent service.
+//!                            Every application mutation is staged on an
+//!                            independent candidate (restore(exportDomain())),
+//!                            validated, journaled by `commit` (DurableStore)
+//!                            and only then published by swapping repository
+//!                            references in one non-suspending step. Direct
+//!                            fixture mutation of a durable store is refused.
+//!
+//! The persistent domain is exactly: identities + credentials (AuthStore
+//! table) + managed content + follow edges + favorite edges + both counters.
+//! Legacy fixture-only collections (items/profiles/comments/favorites below)
+//! are never exported, and a durable store never admits them.
 //! An isolated identity repository holds only non-secret account metadata.
 //! A separate follow graph and article-author bindings use stable IDs.
 //!
@@ -26,18 +43,102 @@ Follows: import("./FollowStore.protos")
 ArticleQuery: import("./ArticleQuery.protos")
 Content: import("./ContentStore.protos")
 Favorites: import("./FavoriteStore.protos")
+Credentials: import("./AuthStore.protos")
+Slug: import("./Slug.protos")
+ISO8601: import("std:datetime/iso8601")
 
 /// Create an independent in-memory store.
-create: () => {
+create: () => { build(null, null) }
+
+identityRecords: (domain) => {
+    Arrays.map(domain.accounts, (account) => {
+        {
+            id: account.id
+            username: account.username
+            email: account.email
+            bio: account.bio
+            image: account.image
+        }
+    })
+}
+
+credentialRecords: (domain) => {
+    Arrays.map(domain.accounts, (account) => {
+        {
+            id: account.id
+            subject: account.subject
+            verifier: account.verifier
+            generation: account.generation
+        }
+    })
+}
+
+/// Cross-repository invariants that no single repository can check alone.
+/// Repository restore operations check their own uniqueness/references.
+crossChecks: (domain) => {
+    // Every timestamp must be a valid ISO8601 instant (parse signals otherwise).
+    for(article in domain.articles) {
+        ISO8601.parseInstant(article.createdAt)
+        ISO8601.parseInstant(article.updatedAt)
+        // A stored counter must equal the number of favorite edges.
+        count: 0
+        for(edge in domain.favorites) {
+            if(edge.slug == article.slug) { count = count + 1 }
+        }
+        if(count != article.favoritesCount) { Error().signal() }
+    }
+    for(comment in domain.comments) {
+        ISO8601.parseInstant(comment.createdAt)
+        ISO8601.parseInstant(comment.updatedAt)
+    }
+    true
+}
+
+/// Validate and reconstruct a complete persistent domain. Signals on any
+/// violation; never returns a partially restored store.
+restore: (domain) => {
+    crossChecks(domain)
+    build(domain, null)
+}
+
+/// Committed state of the durable service. commit is DurableStore's
+/// transaction coordinator; see transact below.
+durable: (domain, committer) => {
+    if(committer === null) { Error().signal() }
+    crossChecks(domain)
+    build(domain, committer)
+}
+
+/// Complete invariant validator: true, or an Error. Builds a throwaway store.
+validateDomain: (domain) => {
+    restore(domain)
+    true
+}
+
+/// Private constructor. domain === null means an empty store.
+build: (domain, committer) => {
     items: []
     // These first collections are legacy fixture data. The repository objects
     // below retain the records and stable-ID relationships used by HTTP writes.
     profiles: []
     comments: []
     favorites: []
-    identities: Identities.create()
-    follows: Follows.create(identities)
-    content: Content.create(identities)
+    identities: null
+    credentialRepo: null
+    follows: null
+    content: null
+    if(domain === null) {
+        identities = Identities.create()
+        credentialRepo = Credentials.table([])
+        follows = Follows.create(identities)
+        content = Content.create(identities)
+    } else {
+        identities = Identities.restore(identityRecords(domain), domain.nextIdentityId)
+        credentialRepo = Credentials.table(credentialRecords(domain))
+        follows = Follows.restore(identities, domain.follows)
+        content = Content.restore(identities, domain.articles, domain.comments,
+            domain.nextCommentId)
+    }
     // Fixture article objects are linked to their author IDs when
     // identities exist. Links survive later username changes.
     articleAuthors: []
@@ -54,7 +155,54 @@ create: () => {
         found
     }
 
-    favoritesById: Favorites.create(identities, articleExists)
+    favoritesById: null
+    if(domain === null) {
+        favoritesById = Favorites.create(identities, articleExists)
+    } else {
+        favoritesById = Favorites.restore(identities, articleExists, domain.favorites)
+    }
+
+    // A durable store refuses direct fixture mutation: the only write path is
+    // transact, so no entry point can bypass a pending journal commit.
+    guardDirect: () => {
+        if(committer !== null) { Error().signal() }
+        true
+    }
+
+    // Read-only credential view for the durable committed state.
+    readOnlyCredentials: () => {
+        current: credentialRepo
+        {
+            byId: (id) => { current.byId(id) }
+            bySubject: (subject) => { current.bySubject(subject) }
+            append: (record) => { Error().signal() }
+            replaceVerifier: (id, verifier) => { Error().signal() }
+            exportState: () => { current.exportState() }
+        }
+    }
+
+    // stage(candidate) returns {result, changed}. In-memory stores apply the
+    // stage to themselves; durable stores delegate to the committer.
+    transactWith: (operation, stage) => {
+        answer: null
+        if(committer === null) {
+            answer = stage(store).result
+        } else {
+            answer = committer.transact(store, operation, stage)
+        }
+        answer
+    }
+    okChanged: (result) => { result.ok && result.changed }
+    okOnly: (result) => { result.ok }
+    mutate: (operation, changed, apply) => {
+        transactWith(operation, (candidate) => {
+            value: apply(candidate)
+            {
+                result: value
+                changed: changed(value)
+            }
+        })
+    }
 
     // Only a new/deleted favorite edge changes the stored counter.
     // For managed content, copies returned by ContentStore are never mutated.
@@ -99,33 +247,151 @@ create: () => {
     }
 
     store: {
+        // ---- durable-state boundary (RootActor transaction coordinator only)
+
+        /// True only for the committed state of the persistent service.
+        isDurable: () => { committer !== null }
+
+        /// The private credential table used by AuthStore. A durable committed
+        /// store exposes a read-only view: writes must go through transact.
+        credentialTable: () => {
+            view: credentialRepo
+            if(committer !== null) { view = readOnlyCredentials() }
+            view
+        }
+
+        /// One logical transaction. stage(candidate) -> {result, changed}.
+        transact: (operation, stage) => { transactWith(operation, stage) }
+
+        /// Complete persistent domain as fresh, independently owned records.
+        /// Signals if an identity lacks its credential (never exports a subset).
+        exportDomain: () => {
+            identityState: identities.exportState()
+            credentialState: credentialRepo.exportState()
+            contentState: content.exportState()
+            accounts: []
+            for(record in identityState.records) {
+                credential: null
+                for(entry in credentialState) {
+                    if(entry.id == record.id) { credential = entry }
+                }
+                if(credential === null) { Error().signal() }
+                accounts = Arrays.append(accounts, {
+                    id: record.id
+                    username: record.username
+                    email: record.email
+                    bio: record.bio
+                    image: record.image
+                    subject: credential.subject
+                    verifier: credential.verifier
+                    generation: credential.generation
+                })
+            }
+            if(credentialState.size() != accounts.size()) { Error().signal() }
+            {
+                nextIdentityId: identityState.nextId
+                nextCommentId: contentState.nextCommentId
+                accounts: accounts
+                articles: contentState.articles
+                comments: contentState.comments
+                follows: follows.exportState()
+                favorites: favoritesById.exportState()
+            }
+        }
+
+        /// A fresh, validated, completely independent candidate. Mutating it
+        /// can never change this store.
+        stageCandidate: () => { restore(store.exportDomain()) }
+
+        /// The candidate's live repositories, for publication only.
+        repositories: () => {
+            {
+                identities: identities
+                credentialTable: credentialRepo
+                follows: follows
+                content: content
+                favoritesById: favoritesById
+            }
+        }
+
+        /// Publish an already validated and journaled candidate. Contains no
+        /// suspension point, so readers observe either all or none of it.
+        publish: (candidate) => {
+            if(committer === null) { Error().signal() }
+            parts: candidate.repositories()
+            // Rebuild the favorite graph over THIS store's articleExists so no
+            // published repository keeps a Closure from the candidate's scope.
+            // All other repositories only reference each other (by object).
+            nextFavorites: Favorites.restore(parts.identities,
+                (slug) => { parts.content.has(slug) },
+                parts.favoritesById.exportState())
+            identities = parts.identities
+            credentialRepo = parts.credentialTable
+            follows = parts.follows
+            content = parts.content
+            favoritesById = nextFavorites
+            true
+        }
+
+        // ---- application operations
+
         articleOwnerId: (slug) => { content.articleOwnerId(slug) }
         commentOwnerId: (slug, id) => { content.commentOwnerId(slug, id) }
         // RootActor application operations. HTTP callers never supply these IDs.
         identityByUsername: (username) => { identities.findUsername(username) }
+        // admit/replace run on the store AuthStore was created over: the
+        // store itself in memory mode, or a staged candidate when durable.
         admitIdentity: (username, email) => {
             store.addIdentityFixture(username, email, null, null)
         }
         replaceIdentity: (id, username, email, bio, image) => {
             store.updateIdentityFixture(id, username, email, bio, image)
         }
-        follow: (actorId, targetId) => { follows.followFixture(actorId, targetId) }
-        unfollow: (actorId, targetId) => { follows.unfollowFixture(actorId, targetId) }
+        // Each application mutation is one logical transaction. Rejections and
+        // idempotent repeats (changed=false) are never journaled.
+        follow: (actorId, targetId) => {
+            mutate("follow", okChanged, (s) => { s.followIdentityFixture(actorId, targetId) })
+        }
+        unfollow: (actorId, targetId) => {
+            mutate("unfollow", okChanged, (s) => { s.unfollowIdentityFixture(actorId, targetId) })
+        }
         createArticle: (id, slug, title, description, body, tags, time) => {
-            store.createOwnedArticleFixture(id, slug, title, description, body, tags, time)
+            mutate("createArticle", okOnly, (s) => {
+                s.createOwnedArticleFixture(id, slug, title, description, body, tags, time)
+            })
+        }
+        /// Allocate the slug against the same state that receives the article,
+        /// so concurrent creations cannot allocate the same slug.
+        createArticleWithTitle: (id, title, description, body, tags, time) => {
+            mutate("createArticle", okOnly, (s) => {
+                s.createOwnedArticleFixture(id, Slug.allocate(s, title), title,
+                    description, body, tags, time)
+            })
         }
         updateArticle: (id, slug, title, description, body, tags, time) => {
-            store.updateOwnedArticleFixture(id, slug, title, description, body, tags, time)
+            mutate("updateArticle", okOnly, (s) => {
+                s.updateOwnedArticleFixture(id, slug, title, description, body, tags, time)
+            })
         }
-        deleteArticle: (id, slug) => { store.deleteOwnedArticleFixture(id, slug) }
+        deleteArticle: (id, slug) => {
+            mutate("deleteArticle", okOnly, (s) => { s.deleteOwnedArticleFixture(id, slug) })
+        }
         createComment: (id, slug, body, time) => {
-            store.createOwnedCommentFixture(id, slug, body, time)
+            mutate("createComment", okOnly, (s) => {
+                s.createOwnedCommentFixture(id, slug, body, time)
+            })
         }
         deleteComment: (id, slug, commentId) => {
-            store.deleteOwnedCommentFixture(id, slug, commentId)
+            mutate("deleteComment", okOnly, (s) => {
+                s.deleteOwnedCommentFixture(id, slug, commentId)
+            })
         }
-        favorite: (id, slug) => { store.favoriteIdentityFixture(id, slug) }
-        unfavorite: (id, slug) => { store.unfavoriteIdentityFixture(id, slug) }
+        favorite: (id, slug) => {
+            mutate("favorite", okChanged, (s) => { s.favoriteIdentityFixture(id, slug) })
+        }
+        unfavorite: (id, slug) => {
+            mutate("unfavorite", okChanged, (s) => { s.unfavoriteIdentityFixture(id, slug) })
+        }
 
         // A public profile may be registered explicitly, appear as
         // an article author, or appear only as a comment author.
@@ -172,6 +438,7 @@ create: () => {
         }
 
         addIdentityFixture: (username, email, bio, image) => {
+            guardDirect()
             result: identities.addFixture(username, email, bio, image)
             if(result.ok) {
                 migrateLegacyFavorites(result.value.id, username)
@@ -180,6 +447,7 @@ create: () => {
         }
 
         updateIdentityFixture: (id, username, email, bio, image) => {
+            guardDirect()
             previous: identities.findId(id)
             result: identities.updateFixture(id, username, email, bio, image)
             if(result.ok) {
@@ -193,10 +461,12 @@ create: () => {
 
         // Fixture-only social operations: they do not authenticate a caller.
         followIdentityFixture: (followerId, followedId) => {
+            guardDirect()
             follows.followFixture(followerId, followedId)
         }
 
         unfollowIdentityFixture: (followerId, followedId) => {
+            guardDirect()
             follows.unfollowFixture(followerId, followedId)
         }
 
@@ -274,6 +544,7 @@ create: () => {
         }
 
         addProfileFixture: (profile) => {
+            guardDirect()
             profiles = Arrays.append(profiles, profile)
             profile
         }
@@ -293,6 +564,7 @@ create: () => {
         }
 
         addCommentFixture: (slug, value) => {
+            guardDirect()
             comments = Arrays.append(
                 comments,
                 {
@@ -306,6 +578,7 @@ create: () => {
         // Stable-ID favorite operations are internal trusted fixtures.
         // These IDs cannot be supplied by an unauthenticated HTTP request.
         favoriteIdentityFixture: (actorId, slug) => {
+            guardDirect()
             result: favoritesById.favoriteFixture(actorId, slug)
             if(result.ok && result.changed) {
                 changeFavoriteCount(slug, 1)
@@ -314,6 +587,7 @@ create: () => {
         }
 
         unfavoriteIdentityFixture: (actorId, slug) => {
+            guardDirect()
             result: favoritesById.unfavoriteFixture(actorId, slug)
             if(result.ok && result.changed) {
                 changeFavoriteCount(slug, -1)
@@ -350,6 +624,7 @@ create: () => {
         // Legacy fixture API remains available. Known identities are routed
         // through the stable-ID graph; unknown usernames remain string edges.
         addFavoriteFixture: (username, slug) => {
+            guardDirect()
             article: store.find(slug)
             if(article === null) {
                 Error().signal()
@@ -417,6 +692,7 @@ create: () => {
         // clients; Auth supplies the actor ID to application-facing operations.
         // The caller provides collision-free slugs and explicit times.
         createOwnedArticleFixture: (authorId, slug, title, description, body, tags, time) => {
+            guardDirect()
             outcome: null
             if(store.find(slug) !== null) {
                 outcome = Content.rejected("slug", "has already been taken")
@@ -429,12 +705,14 @@ create: () => {
         }
 
         updateOwnedArticleFixture: (actorId, slug, title, description, body, tags, time) => {
+            guardDirect()
             content.updateArticleFixture(
                 actorId, slug, title, description, body, tags, time
             )
         }
 
         deleteOwnedArticleFixture: (actorId, slug) => {
+            guardDirect()
             outcome: content.deleteArticleFixture(actorId, slug)
             if(outcome.ok) {
                 // Remove both stable-ID and legacy edges when content is gone.
@@ -451,15 +729,18 @@ create: () => {
         }
 
         createOwnedCommentFixture: (actorId, slug, body, time) => {
+            guardDirect()
             content.createCommentFixture(actorId, slug, body, time)
         }
 
         deleteOwnedCommentFixture: (actorId, slug, id) => {
+            guardDirect()
             content.deleteCommentFixture(actorId, slug, id)
         }
 
         // Fixture insertion only. HTTP uses the application-facing operations.
         addFixture: (article) => {
+            guardDirect()
             author: identities.findUsername(article.author.username)
             if(author !== null) {
                 articleAuthors = Arrays.append(articleAuthors, {

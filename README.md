@@ -2,9 +2,9 @@
 
 A complete *HTTP route implementation* of the [RealWorld (Conduit) backend API](https://docs.realworld.show/specifications/backend/introduction/), written in [Protos](https://github.com/guillermomolina/protos), an experimental prototype-based programming language implemented on GraalVM/Truffle.
 
-This project demonstrates that Protos can build a nontrivial application with **real TCP networking, two HTTP Worker Actors, RootActor-owned state, Argon2id passwords and HS256 JWT authentication**, using Protos modules and its Standard Library rather than an application-specific Java server.
+This project demonstrates that Protos can build a nontrivial application with **real TCP networking, two HTTP Worker Actors, RootActor-owned state, Argon2id passwords, HS256 JWT authentication and an application-owned durable journal**, using Protos modules and its Standard Library rather than an application-specific Java server or a database dependency.
 
-**Status:** All 19 required application routes are implemented. Local unit/integration and HTTP lifecycle tests have been reported passing. The official Hurl suite passes **12/13 files unmodified**, and **13/13 files (157 requests)** with a documented token-refresh adjustment. **State is in memory and is lost at restart**; this is not a production-ready or fully conformant, persistent backend.
+**Status:** All 19 required application routes are implemented. Local unit/integration and HTTP lifecycle tests have been reported passing. The official Hurl suite passes **12/13 files unmodified**, and **13/13 files (157 requests)** with a documented token-refresh adjustment. **Durable persistence (I153-H1) is implemented in the source but not yet validated**: its new tests and the real restart/crash harness have not been run. Until they have, treat state as unproven across restarts. This is not a production-ready or fully conformant backend.
 
 ## Quick start
 
@@ -12,6 +12,7 @@ Requires **Protos `0.3.459-SNAPSHOT`** (development baseline) or a newer compati
 
 ```sh
 # Terminal 1: from this repository's root
+make init-data   # once: creates var/realworld-data/ and an empty journal
 make serve
 # Look for: REALWORLD_HTTP_READY=127.0.0.1:3000
 ```
@@ -22,7 +23,7 @@ curl -i http://127.0.0.1:3000/api/tags
 curl -i http://127.0.0.1:3000/api/articles
 ```
 
-Type `quit` and Enter in terminal 1 for graceful shutdown. `make serve` generates an ephemeral **development-only** JWT signing key using OpenSSL when no key is configured; set `REALWORLD_JWT_KEY_BASE64URL` explicitly when you need a stable key. The listener binds to `127.0.0.1`, not the public Internet.
+Type `quit` and Enter in terminal 1 for graceful shutdown. `make init-data` never resets an existing journal; override the location with `REALWORLD_DATA_DIR=...`. `make serve` generates an ephemeral **development-only** JWT signing key using OpenSSL when no key is configured; set `REALWORLD_JWT_KEY_BASE64URL` explicitly when you need a stable key. The listener binds to `127.0.0.1`, not the public Internet.
 
 ## Architecture
 
@@ -39,30 +40,36 @@ Type `quit` and Enter in terminal 1 for graceful shutdown. `make serve` generate
                             |
                          RootActor
                     /       |        \
-                Router   Auth/JWT    MemoryStore
-                            |             |
-                       Argon2id       Users, articles,
-                       + Entropy       follows, favorites
+                Router   Auth/JWT    DurableStore ── Journal ── realworld.journal
+                            |             |             (lock, append, sync)
+                       Argon2id      MemoryStore
+                       + Entropy    (users, articles, follows, favorites)
 ```
 
 Workers handle their own TCP sessions and transfer bounded HTTP request snapshots; they never receive the mutable store, credentials, signing key, Clock or Entropy grants. The RootActor owns authentication, authorization and all application mutations. There is no custom application-private crypto implementation.
+
+Every successful write is one logical transaction: it is prepared on an independent candidate state, appended as one checksummed journal frame, synchronized with `File.sync()`, and only then published and answered. See [Persistence](#persistence) and [`docs/persistence.md`](docs/persistence.md).
 
 **Suggested source reading order:** [`src/main.protos`](src/main.protos) → [`HttpWorker.protos`](src/app/HttpWorker.protos) → [`Api.protos`](src/app/Api.protos) → [`Auth.protos`](src/app/Auth.protos) → [`AuthStore.protos`](src/app/AuthStore.protos) → [`MemoryStore.protos`](src/app/MemoryStore.protos).
 
 ## Tests and compatibility
 
-| Command | Reported outcome |
+Historical outcomes reported on 2026-11-09, **before** the persistence slice:
+
+| Command | Historical reported outcome |
 | --- | --- |
 | `make test` | 12 test groups passed, including secure authentication |
 | `make test-http` | Authenticated HTTP over real TCP passed |
 | `make test-http-lifecycle` | Workers, request limits, drain and abort passed |
 | `make test-hurl` | 13 files / 157 requests passed **with an explicit test adjustment** |
 
+The persistence slice adds five `make test` groups and `make test-restart`; none has been run yet, and the earlier groups have not been re-run against the changed code.
+
 The **unmodified** official RealWorld Hurl suite passed 12 of 13 files. Its remaining case reused a JWT after a password change, while this implementation revokes old tokens. The tracked [`hurl-refresh-token.patch`](src/tests/hurl-refresh-token.patch) updates the test's token in a temporary copy; it does not modify the official checkout. **An adjusted Hurl pass is not an unmodified official conformance claim.** Details and prerequisites follow below.
 
 ## Project status and contributions
 
-The remaining major application feature is **durable persistence and restart recovery**. SQLite/portable database access is separate Protos ecosystem work; it is not included or silently simulated here. The backend has no HTTPS, public hosting or production operational hardening.
+The remaining major application work is **validating durable persistence**: running the new test groups and the real restart/crash harness. Persistence is implemented in Protos itself with no SQLite or other database dependency. SQLite/portable database access is separate Protos ecosystem work and is not used here. The backend has no HTTPS, public hosting or production operational hardening.
 
 See [`TODO.md`](TODO.md) for outstanding work, [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution guidance, and [GitHub Issues](https://github.com/guillermomolina/protos-realworld-example-app/issues) to report a reproducible problem or propose an improvement. For the language itself, see the [Protos repository](https://github.com/guillermomolina/protos) and [language website](https://protos.guillermomolina.com/).
 
@@ -81,13 +88,16 @@ Instant, ISO8601, JSON and HTTP Router interfaces. Password hashing and verifica
 use the Standard Library's Argon2id provider. There are no application-private
 cryptographic, Base64url or time implementations, and no Java launcher.
 
-The server requires explicitly granted **Network, Entropy and Clock** authorities:
+The server requires explicitly granted **Network, Entropy, Clock and Filesystem** authorities. The Filesystem grant is confined to the data directory:
 
 ```sh
-make serve
+make init-data && make serve
 # Equivalent, retaining any desired PROTOS_ARGS:
-protos --allow-network --allow-entropy --allow-clock --service=service src/main.protos
+protos --allow-network --allow-entropy --allow-clock \
+  --allow-filesystem=var/realworld-data --service=service src/main.protos
 ```
+
+A missing Filesystem grant, missing journal, held lock or unrecoverable journal prevents the readiness marker; there is no in-memory fallback.
 
 For a stable signing key, set `REALWORLD_JWT_KEY_BASE64URL` in the server process environment before starting; `make serve` otherwise supplies a temporary development key.
 Its value must be a valid Base64url encoding of **32–4096 cryptographically random
@@ -160,11 +170,16 @@ construction remains available for anonymous fixtures and fails closed for write
 
 ```sh
 make test
+make init-data             # Once per data directory; never resets existing data
 make serve                 # Separate terminal; temporary key if none is configured
-make test-http             # Requires a fresh running server for account fixtures
+make test-http             # Requires a server on a FRESH data directory (fixed accounts)
 make test-http-lifecycle    # Independent ephemeral lifecycle fixture
 make test-hurl              # Requires the running server, Hurl and the external spec
+make test-persistence       # Alias of make test (persistence groups are in-memory)
+make test-restart           # Real restart/SIGKILL/lock/corruption harness (Python driver)
 ```
+
+`make test-http` and `make test-hurl` register fixed or generated accounts. Run them against a server started on a disposable data directory, for example `REALWORLD_DATA_DIR=var/http-test make init-data serve`, so that stored accounts from earlier runs do not cause conflicts.
 
 `make serve` preserves a configured `REALWORLD_JWT_KEY_BASE64URL`. When the variable
 is unset, the Makefile uses OpenSSL to generate a temporary development key without
@@ -186,7 +201,7 @@ prints `REALWORLD_SECURE_AUTH_HTTP=PASS` only after all its assertions complete.
 The native TCP test parses real response tokens and exercises registration, login,
 current user, article, favorite and comment creation/deletion.
 
-Validation reported by the maintainer on **2026-11-09**, using the Protos
+Historical validation reported by the maintainer on **2026-11-09** (before the persistence slice), using the Protos
 `0.3.459-SNAPSHOT` development baseline:
 
 | Command | Reported result |
@@ -216,16 +231,56 @@ The RootActor closes the listener, waits for admitted work and stops the Workers
 EOF leaves the service running. Ctrl-C is host termination and does not guarantee
 a graceful drain. The independent lifecycle fixture retains drain/abort coverage.
 
+## Persistence
+
+State is kept in a Protos-first, application-owned journal. There is no SQLite, ORM,
+Java storage provider or other persistence dependency, and no change to the language
+runtime. The design is the ratified D255-H1 (E+A): one cooperative writer, one
+RootActor that owns all mutable state and the journal, an explicit confined
+Filesystem grant, and an append-only file of versioned, checksummed domain
+transactions.
+
+- **Data directory and files.** `make init-data` creates `REALWORLD_DATA_DIR`
+  (default `var/realworld-data`) and an empty `realworld.journal`. It never truncates
+  existing data. The server only opens the preprovisioned journal; it never creates
+  or resets it.
+- **Lock.** On startup the server creates `realworld.journal.lock` with `createNew`.
+  A second server is refused. A lock left by a crash is **never** removed
+  automatically. Remove it manually after confirming that no server is running
+  (see [stale-lock recovery](docs/persistence.md#stale-lock-recovery-procedure)).
+- **Commit.** prepare → append → `File.sync()` → publish → respond. A success
+  response is never sent based on unsynchronized state.
+- **Crashes and uncertain commits.** If a write or sync fails, the process stops
+  accepting writes (503) and serves the last committed state. Nothing is rolled
+  back. At the next start, a complete final frame is applied even if its client saw
+  an error, and a torn final frame is refused. The torn frame is removed only with
+  explicit `REALWORLD_JOURNAL_REPAIR=truncate-incomplete-tail`. Interior corruption
+  always fails closed.
+- **Restart.** Recovery replays and validates every frame before the listener
+  opens. Accounts, subjects, credential generations (revocation), articles,
+  comments, follows, favorites and counters are restored exactly.
+- **Signing key.** The key is never persisted. Restart authentication needs the
+  same `REALWORLD_JWT_KEY_BASE64URL`. A new key keeps all data but invalidates all
+  issued tokens.
+- **Limitations.** Single writer only. Each transaction stores the full domain, so
+  the journal grows quickly. It is bounded at 1 GiB and has no compaction, which
+  suits a learning example. Durability is only as strong as `File.sync()` on the
+  host. No durability is claimed for directory entries (the lock file), and there
+  is no cross-file ACID. Fault-injection tests do not prove power-loss durability.
+  JVM and Native support are claimed only once validated; neither has been yet.
+
+The full protocol, limits and operator contract are in
+[`docs/persistence.md`](docs/persistence.md).
+
 ## Storage and deployment limitations
 
-All application state is **in memory**. Restarting loses every account, credential,
-article, comment, follow and favorite. A stable signing key does not make those
-records durable: a token whose credential subject has been lost cannot authorize.
-Durable persistence and restart recovery are separate remaining subsystems.
+Persistence is implemented but **not yet validated** by running its tests or the
+restart harness. Until then, do not rely on it for data you cannot lose. The journal
+contains Argon2id verifiers: protect the data directory like a password database.
 
 The loopback HTTP listener has no TLS and is not a production deployment. Production
-requires transport protection, deployment hardening, durable recovery, operational
-controls and a defined key-custody/rotation policy. See [TODO.md](TODO.md).
+requires transport protection, deployment hardening, validated durable recovery and
+backups, operational controls and a defined key-custody/rotation policy. See [TODO.md](TODO.md).
 
 The [RealWorld backend specification](https://docs.realworld.show/specifications/backend/introduction/)
 and its official Hurl suite define conformance. Local assertions do not establish it.

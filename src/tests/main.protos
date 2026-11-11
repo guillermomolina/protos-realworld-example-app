@@ -61,5 +61,28 @@ run: (report, entropy, clock) => {
     import("./slice12-secure-auth-http.protos").run(entropy, clock)
     report("REALWORLD_SECURE_AUTH_HTTP=PASS")
 
+    // Persistence groups use injected in-memory Files only: no Filesystem
+    // grant is needed. Real files, restarts and SIGKILL are exercised by the
+    // separate external harness (make test-restart).
+    report("REALWORLD_JOURNAL_CODEC=START")
+    import("./journal-codec.protos")
+    report("REALWORLD_JOURNAL_CODEC=PASS")
+
+    report("REALWORLD_JOURNAL_RECOVERY=START")
+    import("./journal-recovery.protos")
+    report("REALWORLD_JOURNAL_RECOVERY=PASS")
+
+    report("REALWORLD_DURABLE_STORE=START")
+    import("./durable-store.protos")
+    report("REALWORLD_DURABLE_STORE=PASS")
+
+    report("REALWORLD_PERSISTENCE_FAULTS=START")
+    import("./persistence-faults.protos")
+    report("REALWORLD_PERSISTENCE_FAULTS=PASS")
+
+    report("REALWORLD_DURABLE_HTTP=START")
+    import("./durable-http.protos").run(entropy, clock)
+    report("REALWORLD_DURABLE_HTTP=PASS")
+
     true
 }

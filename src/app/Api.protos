@@ -10,6 +10,14 @@
 //! A principal is a small account reference obtained from a verified token.
 //! A viewer is its ID, or null for anonymous presentation. Neither comes from
 //! a user-supplied JSON ID. Domain stores still check ownership after login.
+//!
+//! Durability: every domain-changing route calls one store/auth operation that
+//! is a single logical transaction (MemoryStore.transact). On the durable store
+//! that call returns only after the journal record is synchronized and the new
+//! state is published, so a success response is never built from uncommitted
+//! state. Storage failures signal an Error, which `route` maps to the existing
+//! sanitized 503 response. Read-only routes never touch the journal. Domain
+//! rejections (400/401/403/404/409/422) are returned without journaling.
 Router: import("std:http/router").Router
 JSON: import("std:json/json")
 Articles: import("./Articles.protos")
@@ -17,7 +25,6 @@ Comments: import("./Comments.protos")
 ArticleQuery: import("./ArticleQuery.protos")
 Responses: import("./Responses.protos")
 RequestJson: import("./RequestJson.protos")
-Slug: import("./Slug.protos")
 
 /// A single-store call is deliberately fail closed. It never simulates crypto.
 /// make(store) supports anonymous fixtures; make(store, auth) enables real auth.
@@ -230,8 +237,9 @@ make: (store, ...services) => {
             if(!input.valid) { response = Responses.validation(input) } else {
                 fields: input.fields
                 time: auth.timestamp()
-                slug: Slug.allocate(store, fields["title"].value)
-                result: store.createArticle(principal.id, slug, fields["title"].value,
+                // The store allocates the slug inside the same transaction that
+                // inserts the article (Slug.allocate against the staged state).
+                result: store.createArticleWithTitle(principal.id, fields["title"].value,
                     fields["description"].value, fields["body"].value,
                     RequestJson.tagsOr(fields, []), time)
                 if(result.ok) {

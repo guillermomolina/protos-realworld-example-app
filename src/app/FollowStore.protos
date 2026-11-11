@@ -30,9 +30,41 @@ rejected: (field, message) => {
     }
 }
 
+edgeCopy: (edge) => {
+    {
+        followerId: edge.followerId
+        followedId: edge.followedId
+    }
+}
+
+/// Validate restored edges: both identities exist, no self-follow, unique.
+/// Edges are restored only from stable IDs, never rebuilt from usernames.
+validEdges: (identities, initialEdges) => {
+    seen: []
+    for(edge in initialEdges) {
+        if(identities.findId(edge.followerId) === null) { Error().signal() }
+        if(identities.findId(edge.followedId) === null) { Error().signal() }
+        if(edge.followerId == edge.followedId) { Error().signal() }
+        for(other in seen) {
+            if((other.followerId == edge.followerId) && (other.followedId == edge.followedId)) {
+                Error().signal()
+            }
+        }
+        seen = Arrays.append(seen, edge)
+    }
+    true
+}
+
+restore: (identities, initialEdges) => {
+    validEdges(identities, initialEdges)
+    build(identities, initialEdges)
+}
+
 /// Each instance is independent and receives its identity lookup explicitly.
-create: (identities) => {
-    edges: []
+create: (identities) => { build(identities, []) }
+
+build: (identities, initialEdges) => {
+    edges: Arrays.map(initialEdges, edgeCopy)
 
     contains: (followerId, followedId) => {
         found: false
@@ -46,6 +78,9 @@ create: (identities) => {
     }
 
     graph: {
+        /// Durable export: fresh directed edges in insertion order.
+        exportState: () => { Arrays.map(edges, edgeCopy) }
+
         isFollowing: (followerId, followedId) => {
             contains(followerId, followedId)
         }

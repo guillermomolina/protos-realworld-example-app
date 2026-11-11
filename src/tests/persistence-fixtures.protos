@@ -1,0 +1,288 @@
+//! Shared deterministic fixtures for the persistence test groups.
+//!
+//! memoryFile models the File operations the Journal uses (read, seek, write,
+//! sync, truncate, close) with genuine Core Futures and injectable faults. It
+//! keeps two images: `written` (everything accepted by write) and `synced`
+//! (the state at the last successful sync). Reopening `synced` models what a
+//! crash may preserve at minimum; reopening `written` models a crash after the
+//! octets reached the device without an acknowledged sync. This exercises the
+//! journal PROTOCOL only. It proves nothing about real device durability or
+//! power loss; the separate restart harness uses real processes and files.
+
+Assertions: import("std:test/assertions")
+Codec: import("../app/persistence/JournalCodec.protos")
+Domain: import("../app/persistence/DomainCodec.protos")
+
+/// True when operation signals an Error (the Error is consumed).
+fails: (operation) => {
+    failed: false
+    Error.handle(
+        () => { operation() },
+        (failure) => {
+            failed = true
+            failure
+        }
+    )
+    failed
+}
+
+later: (operation) => { operation.future() }
+
+bytesOf: (text) => { Encoding.UTF8.encode(text) }
+
+concat: (parts) => {
+    output: Codec.emptyBytes()
+    for(part in parts) {
+        for(octet in part) { output.add(octet) }
+    }
+    output
+}
+
+/// faults (all optional, mutable by the test at any time):
+///   failSeek, failRead, failSync, failClose, failTruncate: Boolean
+///   failWriteAt: Integer index of the write call that fails (0-based), or -1
+///   prefixOnFailure: octets of the failing chunk committed before it fails
+///                    (models a failed write that still contributed a prefix)
+///   onSync: optional Closure run (and awaited) inside sync before it succeeds
+defaultFaults: () => {
+    {
+        failSeek: false
+        failRead: false
+        failSync: false
+        failClose: false
+        failTruncate: false
+        failWriteAt: -1
+        prefixOnFailure: 0
+        onSync: null
+    }
+}
+
+memoryFile: (initial, faults) => {
+    writtenImage: Codec.copyBytes(initial)
+    syncedImage: Codec.copyBytes(initial)
+    position: 0
+    writeCount: 0
+    syncCount: 0
+    isShut: false
+    put: (bytes, count) => {
+        next: Codec.emptyBytes()
+        for(index, 0, position) {
+            if(index < writtenImage.size()) { next.add(writtenImage[index]) } else { next.add(0) }
+        }
+        for(index, 0, count) { next.add(bytes[index]) }
+        if(position + count < writtenImage.size()) {
+            for(index, position + count, writtenImage.size()) {
+                next.add(writtenImage[index])
+            }
+        }
+        writtenImage = next
+        position = position + count
+        count
+    }
+    file: {
+        read: (count) => {
+            later(() => {
+                if(isShut || faults.failRead) { Error().signal() }
+                chunk: null
+                if(position < writtenImage.size()) {
+                    end: position + count
+                    if(end > writtenImage.size()) { end = writtenImage.size() }
+                    chunk = Codec.slice(writtenImage, position, end)
+                    position = end
+                }
+                chunk
+            })
+        }
+        seek: (offset) => {
+            later(() => {
+                if(isShut || faults.failSeek) { Error().signal() }
+                position = offset
+                offset
+            })
+        }
+        write: (bytes) => {
+            later(() => {
+                index: writeCount
+                writeCount = writeCount + 1
+                if(isShut) { Error().signal() }
+                if(faults.failWriteAt == index) {
+                    prefix: faults.prefixOnFailure
+                    if(prefix > bytes.size()) { prefix = bytes.size() }
+                    put(bytes, prefix)
+                    Error().signal()
+                }
+                // Success means the whole chunk was accepted. The result is
+                // deliberately not a count: the Journal must not rely on one.
+                put(bytes, bytes.size())
+                true
+            })
+        }
+        sync: () => {
+            later(() => {
+                if(isShut || faults.failSync) { Error().signal() }
+                if(faults.onSync !== null) { faults.onSync() }
+                if(faults.failSync) { Error().signal() }
+                syncedImage = Codec.copyBytes(writtenImage)
+                syncCount = syncCount + 1
+                true
+            })
+        }
+        truncate: (size) => {
+            later(() => {
+                if(isShut || faults.failTruncate) { Error().signal() }
+                writtenImage = Codec.slice(writtenImage, 0, size)
+                true
+            })
+        }
+        close: () => {
+            later(() => {
+                if(faults.failClose) { Error().signal() }
+                isShut = true
+                true
+            })
+        }
+    }
+    {
+        file: file
+        written: () => { Codec.copyBytes(writtenImage) }
+        synced: () => { Codec.copyBytes(syncedImage) }
+        writes: () => { writeCount }
+        syncs: () => { syncCount }
+        isClosed: () => { isShut }
+    }
+}
+
+/// A File whose synchronization is unavailable: sync signals an ordinary
+/// Error synchronously (no runtime-specific exception type is assumed).
+unsyncableFile: (initial) => {
+    inner: memoryFile(initial, defaultFaults()).file
+    {
+        read: (count) => { inner.read(count) }
+        seek: (offset) => { inner.seek(offset) }
+        write: (bytes) => { inner.write(bytes) }
+        sync: () => { Error().signal() }
+        close: () => { inner.close() }
+    }
+}
+
+fakeLock: () => {
+    releaseCount: 0
+    {
+        release: () => {
+            releaseCount = releaseCount + 1
+            true
+        }
+        releases: () => { releaseCount }
+    }
+}
+
+limits: () => {
+    {
+        maxPayloadBytes: 1048576
+        maxJournalBytes: 67108864
+        maxFrames: 100000
+        repairIncompleteTail: false
+    }
+}
+
+repairLimits: () => {
+    answer: limits()
+    answer.repairIncompleteTail = true
+    answer
+}
+
+nonce: (seed) => {
+    output: Codec.emptyBytes()
+    for(index, 0, 7) { output.add(0) }
+    output.add(seed)
+    output
+}
+
+/// Opaque placeholder with the provider's framing. Recovery checks only the
+/// framing; these fixtures never authenticate with it.
+VERIFIER: "protos-password-v1:nfc:$argon2id$fixture-not-a-real-hash"
+
+account: (id, username) => {
+    {
+        id: id
+        username: username
+        email: username + "@example.test"
+        bio: null
+        image: null
+        subject: "subject-" + username
+        verifier: VERIFIER
+        generation: 1
+    }
+}
+
+article: (slug, authorId, favoritesCount) => {
+    {
+        slug: slug
+        authorId: authorId
+        title: "Title " + slug
+        description: "Description"
+        body: "Body"
+        tagList: ["protos"]
+        createdAt: "2026-11-11T00:00:00.000Z"
+        updatedAt: "2026-11-11T00:00:00.000Z"
+        favoritesCount: favoritesCount
+    }
+}
+
+comment: (id, slug, authorId) => {
+    {
+        id: id
+        slug: slug
+        authorId: authorId
+        body: "Comment"
+        createdAt: "2026-11-11T00:00:01.000Z"
+        updatedAt: "2026-11-11T00:00:01.000Z"
+    }
+}
+
+/// Two accounts, one article by alice favorited by bob, one comment, one follow.
+richDomain: () => {
+    {
+        nextIdentityId: 3
+        nextCommentId: 2
+        accounts: [account(1, "alice"), account(2, "bob")]
+        articles: [article("hello", 1, 1)]
+        comments: [comment(1, "hello", 2)]
+        follows: [{
+            followerId: 2
+            followedId: 1
+        }]
+        favorites: [{
+            actorId: 2
+            slug: "hello"
+        }]
+    }
+}
+
+twoAccounts: () => {
+    {
+        nextIdentityId: 3
+        nextCommentId: 1
+        accounts: [account(1, "alice"), account(2, "bob")]
+        articles: []
+        comments: []
+        follows: []
+        favorites: []
+    }
+}
+
+frame: (sequence, seed, domain) => {
+    Codec.encodeFrame(sequence, Codec.transactionId(nonce(seed), sequence),
+        Domain.encodeTransaction("fixture", domain), limits())
+}
+
+/// A journal image holding the given domains as consecutive transactions.
+journalOf: (domains) => {
+    parts: []
+    sequence: 1
+    for(domain in domains) {
+        parts = Array(...parts, frame(sequence, 9, domain))
+        sequence = sequence + 1
+    }
+    concat(parts)
+}

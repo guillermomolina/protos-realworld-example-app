@@ -1,9 +1,15 @@
 //! Native HTTP entry point for the RealWorld learning application.
 //!
-//! Run with:
-//!   protos --allow-network --allow-entropy --allow-clock --service=service src/main.protos
+//! Run with (the data directory must be initialized first: make init-data):
+//!   protos --allow-network --allow-entropy --allow-clock \
+//!     --allow-filesystem=<data-directory> --service=service src/main.protos
 //!
-//! The RootActor owns Network authority and the single mutable MemoryStore.
+//! The RootActor owns Network and Filesystem authority, the durable journal
+//! and the single committed MemoryStore. Startup order: Clock/Entropy/JWT key
+//! -> Filesystem -> journal lock -> journal File -> complete recovery ->
+//! restored store + Auth -> Api -> listener -> Workers -> REALWORLD_HTTP_READY.
+//! There is no fallback to an ephemeral store: any persistence failure stops
+//! startup before the listener exists.
 //! Two Worker Actors accept connections through explicitly delegated
 //! TcpAcceptor capabilities. Workers request responses from the RootActor;
 //! they cannot access its store or inherit its Network authority.
@@ -43,6 +49,9 @@ Store: import("./app/MemoryStore.protos")
 Api: import("./app/Api.protos")
 HttpWorkers: import("./app/HttpWorkers.protos")
 Auth: import("./app/Auth.protos")
+Journal: import("./app/persistence/Journal.protos")
+JournalCodec: import("./app/persistence/JournalCodec.protos")
+DurableStore: import("./app/persistence/DurableStore.protos")
 Base64url: import("std:text/base64url")
 Instant: import("std:datetime/instant")
 
@@ -64,7 +73,10 @@ service: () => {
         %{ "component": "realworld" }
     )
 
-    store: Store.create()
+    // The committed durable store exists only after successful recovery.
+    store: null
+    journal: null
+    durable: null
     handler: null
 
     // A GroupRef grants request/reply communication with this service
@@ -80,6 +92,21 @@ service: () => {
         writer.writeLine("REALWORLD_HTTP_STARTUP_FAILED=" + reason).value()
         Error().signal()
     }
+    // A failed startup after the journal is open closes it, which releases
+    // the cooperative lock (no write can be in flight before readiness).
+    abandonJournal: () => {
+        if(journal !== null) {
+            Error.handle(
+                () => { journal.close() },
+                (failure) => {
+                    writer.writeLine("REALWORLD_JOURNAL_FAILURE=close_after_startup_failure").value()
+                    failure
+                }
+            )
+            journal = null
+        }
+        true
+    }
     startupStep: (name, operation) => {
         // Error.handle evaluates the first Closure and invokes the second if
         // an Error is signaled. Re-signaling keeps startup unsuccessful; the
@@ -89,10 +116,16 @@ service: () => {
             () => { result = operation() },
             (failure) => {
                 writer.writeLine("REALWORLD_HTTP_STARTUP_FAILED=" + name).value()
+                abandonJournal()
                 failure.signal()
             }
         )
         result
+    }
+    // Journal diagnostics are fixed labels: never paths, payloads or errors.
+    journalReport: (label) => {
+        writer.writeLine("REALWORLD_JOURNAL_FAILURE=" + label).value()
+        label
     }
 
     behavior: {
@@ -117,6 +150,39 @@ service: () => {
             // first registration. These bytes are not a replacement key.
             entropyProbe: startupStep("entropy", () => { entropy.bytes(16).value() })
             if(entropyProbe.size() != 16) { failStartup("invalid_entropy_result") }
+            // Explicit Filesystem grant (--allow-filesystem=<dir>). Absence is
+            // fatal: the durable service never runs without its journal.
+            granted: startupStep("filesystem", () => { filesystem })
+            if(granted === null) { failStartup("missing_filesystem_authority") }
+            // An incomplete final frame is never removed implicitly. The
+            // operator may authorize this single repair for one start.
+            repairTail: false
+            startupStep("journal_repair_setting", () => {
+                setting: process.environment().get("REALWORLD_JOURNAL_REPAIR")
+                repairTail = (setting !== null) && (setting == "truncate-incomplete-tail")
+            })
+            limits: JournalCodec.defaultLimits()
+            journalLimits: {
+                maxPayloadBytes: limits.maxPayloadBytes
+                maxJournalBytes: limits.maxJournalBytes
+                maxFrames: limits.maxFrames
+                repairIncompleteTail: repairTail
+            }
+            journal = startupStep("journal_open", () => {
+                Journal.open(granted, Journal.journalPath(), Journal.lockPath(),
+                    journalLimits, journalReport)
+            })
+            recovered: startupStep("journal_recovery", () => { journal.recover() })
+            // Separates this process's transaction IDs from earlier runs'.
+            nonce: startupStep("transaction_nonce", () => { entropy.bytes(8).value() })
+            durable = startupStep("durable_store", () => {
+                DurableStore.create(journal, recovered, nonce, DurableStore.defaultOptions())
+            })
+            store = durable.store
+            log.info("journal recovered", %{
+                "frames": recovered.frames
+                "applied": recovered.applied
+            })
             // Never captured by a Worker or included in request/reply data.
             // now is a zero-argument Closure, not a cached startup timestamp.
             // Auth invokes it whenever it needs the current trusted time.
@@ -207,6 +273,19 @@ service: () => {
             log.info("http shutdown requested", %{ "mode": mode })
             host.shutdown(mode).value()
             log.info("http shutdown complete", %{ "mode": mode })
+            // Workers are retired: no request can be admitted any more. Settle
+            // the in-progress transaction (if any), close the journal and
+            // release the lock only when that is safe.
+            Error.handle(
+                () => {
+                    durable.close()
+                    log.info("journal closed")
+                },
+                (failure) => {
+                    log.error("journal close incomplete; lock retained")
+                    failure
+                }
+            )
             Actor.current().stop()
             null
         }

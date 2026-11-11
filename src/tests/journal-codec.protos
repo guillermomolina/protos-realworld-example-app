@@ -1,0 +1,197 @@
+//! Deterministic journal frame and domain payload codec tests.
+//! Pure in-memory: no Filesystem authority is required or used.
+//! Importing this module runs its assertions; Assertions.require(false)
+//! signals before the runner can print the group's PASS marker.
+
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+Codec: import("../app/persistence/JournalCodec.protos")
+Domain: import("../app/persistence/DomainCodec.protos")
+F: import("./persistence-fixtures.protos")
+
+limits: F.limits()
+tx: Codec.transactionId(F.nonce(1), 1)
+
+// ---- fixed-width integers -------------------------------------------------
+for(value in [0, 1, 255, 256, 65535, 65536, Codec.MAX_U32]) {
+    out: Codec.putUnsigned(Codec.emptyBytes(), value, 4, Codec.MAX_U32)
+    Assertions.require(out.size() == 4)
+    Assertions.require(Codec.getUnsigned(out, 0, 4, Codec.MAX_U32) == value)
+}
+big: Codec.putUnsigned(Codec.emptyBytes(), 258, 2, 65535)
+Assertions.require((big[0] == 1) && (big[1] == 2))  // big-endian, not host order
+maxSeq: Codec.putUnsigned(Codec.emptyBytes(), Codec.MAX_SEQUENCE, 8, Codec.MAX_SEQUENCE)
+Assertions.require(Codec.getUnsigned(maxSeq, 0, 8, Codec.MAX_SEQUENCE) == Codec.MAX_SEQUENCE)
+Assertions.require(F.fails(() => { Codec.putUnsigned(Codec.emptyBytes(), -1, 4, Codec.MAX_U32) }))
+Assertions.require(F.fails(() => { Codec.putUnsigned(Codec.emptyBytes(), Codec.MAX_U32 + 1, 4, Codec.MAX_U32) }))
+allOnes: Codec.emptyBytes()
+for(index, 0, 8) { allOnes.add(255) }
+Assertions.require(Codec.getUnsigned(allOnes, 0, 8, Codec.MAX_SEQUENCE) === null)
+
+// ---- frame round trips ----------------------------------------------------
+roundTrip: (payload) => {
+    encoded: Codec.encodeFrame(7, tx, payload, limits)
+    Assertions.require(encoded.size() == Codec.frameSize(payload.size()))
+    again: Codec.encodeFrame(7, tx, payload, limits)
+    Assertions.require(Codec.sameBytes(encoded, again))  // byte-for-byte deterministic
+    decoded: Codec.decodeAt(encoded, 0, limits)
+    Assertions.require(decoded.status == "frame")
+    Assertions.require(decoded.next == encoded.size())
+    Assertions.require(decoded.frame.sequence == 7)
+    Assertions.require(Codec.sameBytes(decoded.frame.transaction, tx))
+    Assertions.require(Codec.sameBytes(decoded.frame.payload, payload))
+    // Returned Bytes are independent of both the source and each other.
+    Assertions.require(!(decoded.frame.payload === payload))
+    if(payload.size() > 0) {
+        decoded.frame.payload.add(1)
+        Assertions.require(Codec.decodeAt(encoded, 0, limits).frame.payload.size() == payload.size())
+    }
+    Assertions.require(Codec.decodeAt(encoded, encoded.size(), limits).status == "eof")
+    encoded
+}
+emptyFrame: roundTrip(Codec.emptyBytes())
+textFrame: roundTrip(F.bytesOf("héllo, Protos ✓"))
+nulPayload: Codec.emptyBytes()
+nulPayload.add(65)
+nulPayload.add(0)
+nulPayload.add(66)
+roundTrip(nulPayload)
+mutablePayload: F.bytesOf("abc")
+captured: Codec.encodeFrame(1, tx, mutablePayload, limits)
+mutablePayload.add(100)
+Assertions.require(Codec.decodeAt(captured, 0, limits).frame.payload.size() == 3)
+
+// ---- rejection classes ----------------------------------------------------
+Assertions.require(F.fails(() => { Codec.encodeFrame(0, tx, Codec.emptyBytes(), limits) }))
+Assertions.require(F.fails(() => { Codec.encodeFrame(Codec.MAX_SEQUENCE + 1, tx, Codec.emptyBytes(), limits) }))
+zeroTx: Codec.emptyBytes()
+for(index, 0, 16) { zeroTx.add(0) }
+Assertions.require(F.fails(() => { Codec.encodeFrame(1, zeroTx, Codec.emptyBytes(), limits) }))
+Assertions.require(F.fails(() => { Codec.encodeFrame(1, F.bytesOf("short"), Codec.emptyBytes(), limits) }))
+Assertions.require(F.fails(() => { Codec.transactionId(F.bytesOf("bad"), 1) }))
+small: {
+    maxPayloadBytes: 4
+    maxJournalBytes: 1024
+    maxFrames: 10
+}
+Assertions.require(F.fails(() => { Codec.encodeFrame(1, tx, F.bytesOf("12345"), small) }))
+
+mutate: (source, index, value) => {
+    copy: Codec.copyBytes(source)
+    output: Codec.emptyBytes()
+    for(position, 0, copy.size()) {
+        if(position == index) { output.add(value) } else { output.add(copy[position]) }
+    }
+    output
+}
+status: (bytes, lim) => {
+    d: Codec.decodeAt(bytes, 0, lim)
+    label: d.status
+    if(d.reason !== null) { label = d.status + ":" + d.reason }
+    label
+}
+Assertions.require(status(mutate(textFrame, 0, 81), limits) == "corrupt:magic")
+Assertions.require(status(mutate(textFrame, 4, 2), limits) == "corrupt:unsupported_version")
+Assertions.require(status(mutate(textFrame, 5, 1), limits) == "corrupt:reserved_bits")
+overflowFrame: textFrame
+for(index, 8, 16) { overflowFrame = mutate(overflowFrame, index, 255) }
+Assertions.require(status(overflowFrame, limits) == "corrupt:sequence_overflow")
+zeroSequence: textFrame
+for(index, 8, 16) { zeroSequence = mutate(zeroSequence, index, 0) }
+Assertions.require(status(zeroSequence, limits) == "corrupt:illegal_sequence")
+zeroId: textFrame
+for(index, 16, 32) { zeroId = mutate(zeroId, index, 0) }
+Assertions.require(status(zeroId, limits) == "corrupt:malformed_transaction_id")
+// Oversized length is rejected from the header, before any payload copy.
+Assertions.require(status(textFrame, small) == "corrupt:oversized_frame")
+huge: mutate(mutate(textFrame, 32, 255), 33, 255)
+Assertions.require(status(huge, limits) == "corrupt:oversized_frame")
+lastPayload: Codec.HEADER_BYTES + 1
+Assertions.require(status(mutate(textFrame, lastPayload, 0), limits) == "corrupt:checksum")
+Assertions.require(status(mutate(textFrame, textFrame.size() - 1, 0), limits) == "corrupt:checksum")
+// Truncation: header, payload, trailer; and a preallocated zero tail.
+Assertions.require(status(Codec.slice(textFrame, 0, 3), limits) == "incomplete:header")
+Assertions.require(status(Codec.slice(textFrame, 0, 20), limits) == "incomplete:header")
+Assertions.require(status(Codec.slice(textFrame, 0, Codec.HEADER_BYTES + 2), limits) == "incomplete:payload")
+Assertions.require(status(Codec.slice(textFrame, 0, textFrame.size() - 1), limits) == "incomplete:payload")
+zeros: Codec.emptyBytes()
+for(index, 0, 50) { zeros.add(0) }
+Assertions.require(status(zeros, limits) == "incomplete:zero_tail")
+Assertions.require(Codec.decodeAt(Codec.emptyBytes(), 0, limits).status == "eof")
+
+// ---- domain payload codec ---------------------------------------------------
+nul: Encoding.UTF8.decode(nulPayload)
+domain: {
+    nextIdentityId: Domain.MAX_ID
+    nextCommentId: 3
+    accounts: [{
+        id: Domain.MAX_ID - 1
+        username: "zoë ✓"
+        email: "z@example.test"
+        bio: nul
+        image: null
+        subject: "s"
+        verifier: F.VERIFIER
+        generation: 9007199254740991
+    }]
+    articles: [{
+        slug: "a"
+        authorId: Domain.MAX_ID - 1
+        title: "Ünïcode"
+        description: "d"
+        body: "b"
+        tagList: ["", "tag"]
+        createdAt: "2026-11-11T00:00:00Z"
+        updatedAt: "2026-11-11T00:00:00.123456789Z"
+        favoritesCount: 0
+    }]
+    comments: [F.comment(2, "a", Domain.MAX_ID - 1)]
+    follows: []
+    favorites: []
+}
+payload: Domain.encodeTransaction("op", domain)
+Assertions.require(Codec.sameBytes(payload, Domain.encodeTransaction("op", domain)))
+decoded: Domain.decodeTransaction(payload)
+Assertions.require(decoded.operation == "op")
+Assertions.require(decoded.domain.accounts[0].username == "zoë ✓")
+Assertions.require(decoded.domain.accounts[0].bio == nul)
+Assertions.require(Encoding.UTF8.encode(decoded.domain.accounts[0].bio).size() == 3)
+Assertions.require(decoded.domain.accounts[0].image === null)
+Assertions.require(decoded.domain.accounts[0].generation == 9007199254740991)
+Assertions.require(decoded.domain.articles[0].tagList[0] == "")
+Assertions.require(decoded.domain.articles[0].updatedAt == "2026-11-11T00:00:00.123456789Z")
+Assertions.require(Codec.sameBytes(Domain.encodeTransaction("op", decoded.domain), payload))
+
+encodedWith: (name, node) => {
+    // Rebuild a payload with one top-level member replaced.
+    root: JSON.parse(Encoding.UTF8.decode(payload)).value
+    pairs: []
+    for(key in ["schema", "version", "operation", "nextIdentityId", "nextCommentId",
+        "accounts", "articles", "comments", "follows", "favorites"]) {
+        value: root[key]
+        if(key == name) { value = node }
+        pairs = Array(...pairs, key, value)
+    }
+    Encoding.UTF8.encode(JSON.encode(JSON.object(...pairs)))
+}
+Assertions.require(!F.fails(() => { Domain.decodeTransaction(encodedWith("version", JSON.number(1, 0))) }))
+Assertions.require(F.fails(() => { Domain.decodeTransaction(encodedWith("version", JSON.number(2, 0))) }))
+Assertions.require(F.fails(() => { Domain.decodeTransaction(encodedWith("schema", JSON.string("other"))) }))
+Assertions.require(F.fails(() => { Domain.decodeTransaction(encodedWith("nextCommentId", JSON.number(15, 1))) }))
+Assertions.require(F.fails(() => { Domain.decodeTransaction(encodedWith("nextCommentId", JSON.string("3"))) }))
+Assertions.require(F.fails(() => { Domain.decodeTransaction(encodedWith("nextCommentId", JSON.number(0, 0))) }))
+Assertions.require(F.fails(() => { Domain.decodeTransaction(encodedWith("accounts", JSON.object())) }))
+Assertions.require(F.fails(() => { Domain.decodeTransaction(F.bytesOf("{")) }))
+Assertions.require(F.fails(() => { Domain.decodeTransaction(F.bytesOf("[]")) }))
+badUtf8: Codec.emptyBytes()
+badUtf8.add(255)
+Assertions.require(F.fails(() => { Domain.decodeTransaction(badUtf8) }))
+extra: JSON.parse(Encoding.UTF8.decode(payload)).value
+Assertions.require(F.fails(() => {
+    Domain.decodeTransaction(Encoding.UTF8.encode(JSON.encode(JSON.object(
+        "schema", extra["schema"], "version", extra["version"], "operation", extra["operation"],
+        "nextIdentityId", extra["nextIdentityId"], "nextCommentId", extra["nextCommentId"],
+        "accounts", extra["accounts"], "articles", extra["articles"], "comments", extra["comments"],
+        "follows", extra["follows"], "favorites", extra["favorites"], "unknown", JSON.nullValue()))))
+}))
+true

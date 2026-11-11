@@ -1,0 +1,206 @@
+//! Deterministic, bounded replay of a complete journal image.
+//!
+//! replay(bytes, limits) never signals for bad journal CONTENT: it returns
+//!   { ok: true,  domain, nextSequence, endOffset, frames, applied,
+//!     duplicates, tail, tailReason }
+//!   { ok: false, reason, offset, frames }
+//! and the caller decides whether to start. A failed replay never yields a
+//! domain, so no partially recovered state can be published.
+//!
+//! Rules (format version 1):
+//!  1. Start from DomainCodec.emptyDomain().
+//!  2. Frames must carry sequences 1, 2, 3, ... with no gap or repetition.
+//!  3. Each frame's payload is strictly decoded (DomainCodec), the complete
+//!     candidate domain is validated (MemoryStore.validateDomain) and the
+//!     transition from the previous domain is checked (`transition` below)
+//!     BEFORE it replaces the replay state.
+//!  4. Idempotence rule for transaction IDs: a frame whose transaction ID
+//!     equals the IMMEDIATELY PRECEDING applied frame's ID and whose payload
+//!     is byte-for-byte identical is an exact retransmission: it consumes its
+//!     sequence number but is not applied again. Any other reuse of a
+//!     transaction ID (different payload, or an older ID) is rejected.
+//!  5. An invalid interior frame is never skipped: replay fails.
+//!  6. Only the FINAL region of the file may be `incomplete` (a strict prefix of
+//!     a frame, or an all-zero remainder). Such a frame was never acknowledged,
+//!     because acknowledgement requires the whole frame plus a successful
+//!     sync. Earlier frames are kept; the caller must not append after the
+//!     incomplete region without an explicitly authorized repair.
+//!  7. A complete, checksum-valid final frame is APPLIED. It may belong to a
+//!     transaction whose sync never returned (its client may have seen an
+//!     error). Recovery cannot distinguish that from an acknowledged commit,
+//!     so it never discards it: an uncertain commit resolves to committed.
+//!     A valid checksum is not proof that a sync was acknowledged.
+//!  8. Total size, frame count and frame size limits are enforced.
+
+Codec: import("./JournalCodec.protos")
+Domain: import("./DomainCodec.protos")
+Store: import("../MemoryStore.protos")
+
+failed: (reason, offset, frames) => {
+    {
+        ok: false
+        reason: reason
+        offset: offset
+        frames: frames
+    }
+}
+
+/// Monotonic identity rules between two consecutive committed domains.
+/// Accounts are never deleted in RealWorld, subjects never change, credential
+/// generations never decrease (revocation is preserved), and counters never
+/// move backwards, so no restored ID can ever be reassigned.
+transition: (previous, next) => {
+    valid: true
+    if(next.nextIdentityId < previous.nextIdentityId) { valid = false }
+    if(next.nextCommentId < previous.nextCommentId) { valid = false }
+    if(valid) {
+        nextAccounts: Map()
+        for(account in next.accounts) { nextAccounts[account.id] = account }
+        previousIds: Map()
+        for(account in previous.accounts) {
+            previousIds[account.id] = true
+            if(!nextAccounts.containsKey(account.id)) {
+                valid = false
+            } else {
+                successor: nextAccounts[account.id]
+                if(successor.subject != account.subject) { valid = false }
+                if(successor.generation < account.generation) { valid = false }
+            }
+        }
+        for(account in next.accounts) {
+            if(!previousIds.containsKey(account.id) &&
+               (account.id < previous.nextIdentityId)) {
+                valid = false
+            }
+        }
+        previousComments: Map()
+        for(comment in previous.comments) { previousComments[comment.id] = true }
+        for(comment in next.comments) {
+            if(!previousComments.containsKey(comment.id) &&
+               (comment.id < previous.nextCommentId)) {
+                valid = false
+            }
+        }
+    }
+    valid
+}
+
+replay: (bytes, limits) => {
+    result: null
+    if(bytes.size() > limits.maxJournalBytes) {
+        result = failed("journal_quota", 0, 0)
+    }
+    domain: Domain.emptyDomain()
+    expected: 1
+    offset: 0
+    frames: 0
+    applied: 0
+    duplicates: 0
+    lastTransaction: null
+    lastPayload: null
+    // Every applied transaction ID, keyed by its Latin-1 text (lookup only;
+    // this Map is never enumerated, so its order cannot affect replay).
+    seenTransactions: Map()
+    tail: "clean"
+    tailReason: null
+    running: result === null
+    while(running) {
+        decoded: Codec.decodeAt(bytes, offset, limits)
+        if(decoded.status == "eof") {
+            running = false
+        } else {
+            if(decoded.status == "incomplete") {
+                // A torn tail with a complete header must carry the next
+                // expected sequence; otherwise it is corruption, not a tear.
+                if((decoded.frame !== null) && (decoded.frame.sequence != expected)) {
+                    result = failed("sequence_gap", offset, frames)
+                } else {
+                    tail = "incomplete"
+                    tailReason = decoded.reason
+                }
+                running = false
+            } else {
+                if(decoded.status == "corrupt") {
+                    result = failed("corrupt_" + decoded.reason, offset, frames)
+                    running = false
+                } else {
+                    frame: decoded.frame
+                    frames = frames + 1
+                    if(frames > limits.maxFrames) {
+                        result = failed("frame_limit", offset, frames)
+                    } else {
+                        if(frame.sequence != expected) {
+                            result = failed("sequence_gap", offset, frames)
+                        } else {
+                            if((lastTransaction !== null) &&
+                               Codec.sameBytes(lastTransaction, frame.transaction)) {
+                                if(Codec.sameBytes(lastPayload, frame.payload)) {
+                                    duplicates = duplicates + 1
+                                } else {
+                                    result = failed("transaction_conflict", offset, frames)
+                                }
+                            } else {
+                                if(seenTransactions.containsKey(Encoding.Latin1.decode(frame.transaction))) {
+                                    result = failed("transaction_conflict", offset, frames)
+                                }
+                            }
+                            if((result === null) && !((lastTransaction !== null) &&
+                               Codec.sameBytes(lastTransaction, frame.transaction))) {
+                                candidate: null
+                                Error.handle(
+                                    () => { candidate = Domain.decodeTransaction(frame.payload).domain },
+                                    (failure) => { failure }
+                                )
+                                if(candidate === null) {
+                                    result = failed("domain_schema", offset, frames)
+                                } else {
+                                    validated: false
+                                    Error.handle(
+                                        () => { validated = Store.validateDomain(candidate) },
+                                        (failure) => { failure }
+                                    )
+                                    if(!validated) {
+                                        result = failed("domain_invariant", offset, frames)
+                                    } else {
+                                        if(!transition(domain, candidate)) {
+                                            result = failed("domain_transition", offset, frames)
+                                        } else {
+                                            // Only an exact retransmission of
+                                            // the previous frame is idempotent;
+                                            // older IDs must never reappear.
+                                            domain = candidate
+                                            seenTransactions[Encoding.Latin1.decode(frame.transaction)] = true
+                                            lastTransaction = frame.transaction
+                                            lastPayload = frame.payload
+                                            applied = applied + 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if(result === null) {
+                        expected = expected + 1
+                        offset = decoded.next
+                    } else {
+                        running = false
+                    }
+                }
+            }
+        }
+    }
+    if(result === null) {
+        result = {
+            ok: true
+            domain: domain
+            nextSequence: expected
+            endOffset: offset
+            frames: frames
+            applied: applied
+            duplicates: duplicates
+            tail: tail
+            tailReason: tailReason
+        }
+    }
+    result
+}

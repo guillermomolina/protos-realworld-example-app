@@ -33,8 +33,37 @@ rejected: (field, message) => {
     }
 }
 
-create: (identities, articleExists) => {
-    edges: []
+edgeCopy: (edge) => {
+    {
+        actorId: edge.actorId
+        slug: edge.slug
+    }
+}
+
+/// Validate restored edges: existing account and article, unique pairs.
+/// Favorite counts are cross-checked against ContentStore by MemoryStore.
+validEdges: (identities, articleExists, initialEdges) => {
+    seen: []
+    for(edge in initialEdges) {
+        if(identities.findId(edge.actorId) === null) { Error().signal() }
+        if(!articleExists(edge.slug)) { Error().signal() }
+        for(other in seen) {
+            if((other.actorId == edge.actorId) && (other.slug == edge.slug)) { Error().signal() }
+        }
+        seen = Arrays.append(seen, edge)
+    }
+    true
+}
+
+restore: (identities, articleExists, initialEdges) => {
+    validEdges(identities, articleExists, initialEdges)
+    build(identities, articleExists, initialEdges)
+}
+
+create: (identities, articleExists) => { build(identities, articleExists, []) }
+
+build: (identities, articleExists, initialEdges) => {
+    edges: Arrays.map(initialEdges, edgeCopy)
 
     contains: (actorId, slug) => {
         found: false
@@ -47,6 +76,9 @@ create: (identities, articleExists) => {
     }
 
     store: {
+        /// Durable export: fresh edges in insertion order.
+        exportState: () => { Arrays.map(edges, edgeCopy) }
+
         isFavorited: (actorId, slug) => {
             contains(actorId, slug)
         }

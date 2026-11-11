@@ -1,0 +1,223 @@
+//! Transaction coordinator tests over injected in-memory Files.
+//! Suspension uses genuine Core Futures and cancellation-based gates, not
+//! invented scheduling. Only protocol behavior is asserted here.
+
+Assertions: import("std:test/assertions")
+Codec: import("../app/persistence/JournalCodec.protos")
+Journal: import("../app/persistence/Journal.protos")
+DurableStore: import("../app/persistence/DurableStore.protos")
+Recovery: import("../app/persistence/Recovery.protos")
+Store: import("../app/MemoryStore.protos")
+F: import("./persistence-fixtures.protos")
+
+T: "2026-11-11T00:00:00.000Z"
+
+openDurable: (image, faults, maxPending, lim) => {
+    mem: F.memoryFile(image, faults)
+    lock: F.fakeLock()
+    journal: Journal.attach(mem.file, lock, lim)
+    recovered: journal.recover()
+    durable: DurableStore.create(journal, recovered, F.nonce(42), { maxPending: maxPending })
+    {
+        mem: mem
+        lock: lock
+        journal: journal
+        durable: durable
+        store: durable.store
+    }
+}
+fresh: (faults) => { openDurable(F.journalOf([F.twoAccounts()]), faults, 4, F.limits()) }
+recoveredFrom: (bytes) => { Store.restore(Recovery.replay(bytes, F.limits()).domain) }
+
+// ---- successful append + sync, then publication -------------------------------
+ctx: fresh(F.defaultFaults())
+Assertions.require(ctx.store.isDurable())
+before: ctx.mem.syncs()
+followed: ctx.store.follow(1, 2)
+Assertions.require(followed.ok && followed.changed)
+Assertions.require(ctx.store.isFollowingIdentity(1, 2))
+Assertions.require(ctx.mem.syncs() == before + 1)
+Assertions.require(ctx.durable.lastReceipt().sequence == 2)
+Assertions.require(Codec.sameBytes(ctx.mem.synced(), ctx.mem.written()))
+Assertions.require(recoveredFrom(ctx.mem.synced()).isFollowingIdentity(1, 2))
+
+// Rejections and idempotent repeats are not journaled.
+sequenceBefore: ctx.journal.nextSequence()
+Assertions.require(!ctx.store.follow(1, 1).ok)
+Assertions.require(!ctx.store.follow(1, 99).ok)
+Assertions.require(!ctx.store.follow(1, 2).changed)
+Assertions.require(!ctx.store.unfavorite(1, "missing").ok)
+Assertions.require(ctx.journal.nextSequence() == sequenceBefore)
+
+// No direct mutation path around the coordinator.
+Assertions.require(F.fails(() => { ctx.store.followIdentityFixture(2, 1) }))
+Assertions.require(F.fails(() => { ctx.store.addIdentityFixture("eve", "eve@example.test", null, null) }))
+Assertions.require(F.fails(() => { ctx.store.credentialTable().replaceVerifier(1, F.VERIFIER) }))
+Assertions.require(!ctx.store.isFollowingIdentity(2, 1))
+
+// Prepare failure leaves committed state and the journal untouched.
+Assertions.require(F.fails(() => {
+    ctx.store.transact("prepare", (candidate) => {
+        candidate.followIdentityFixture(2, 1)
+        Error().signal()
+    })
+}))
+Assertions.require((!ctx.store.isFollowingIdentity(2, 1)) && (!ctx.durable.isFaulted()))
+
+// No speculative visibility: the candidate is independent of committed state.
+ctx.store.transact("observe", (candidate) => {
+    candidate.followIdentityFixture(2, 1)
+    Assertions.require(candidate.isFollowingIdentity(2, 1))
+    Assertions.require(!ctx.store.isFollowingIdentity(2, 1))
+    {
+        result: true
+        changed: false
+    }
+})
+Assertions.require(!ctx.store.isFollowingIdentity(2, 1))
+
+// Article/comment/favorite cascade is one transaction.
+created: ctx.store.createArticleWithTitle(1, "Hello", "d", "b", ["t"], T)
+Assertions.require(created.ok && (created.value.slug == "hello"))
+Assertions.require(ctx.store.createComment(2, "hello", "c", T).ok)
+Assertions.require(ctx.store.favorite(2, "hello").changed)
+Assertions.require(ctx.store.find("hello").favoritesCount == 1)
+deleteSequence: ctx.journal.nextSequence()
+Assertions.require(!ctx.store.deleteArticle(2, "hello").ok)  // not owned
+Assertions.require(ctx.store.deleteArticle(1, "hello").ok)
+Assertions.require(ctx.journal.nextSequence() == deleteSequence + 1)
+afterDelete: recoveredFrom(ctx.mem.synced())
+Assertions.require(afterDelete.find("hello") === null)
+Assertions.require(afterDelete.favoriteSlugsForIdentity(2).size() == 0)
+Assertions.require(afterDelete.exportDomain().comments.size() == 0)
+Assertions.require(afterDelete.exportDomain().nextCommentId == 2)
+
+// ---- failed append before any octet: no poisoning ---------------------------
+faults: F.defaultFaults()
+ctx = fresh(faults)
+faults.failSeek = true
+Assertions.require(F.fails(() => { ctx.store.follow(1, 2) }))
+Assertions.require(!ctx.store.isFollowingIdentity(1, 2))
+Assertions.require((!ctx.durable.isFaulted()) && ctx.journal.isAvailable())
+faults.failSeek = false
+Assertions.require(ctx.store.follow(1, 2).ok)
+
+// ---- failed write that committed a prefix: uncertain, poisoned, not published
+faults = F.defaultFaults()
+ctx = fresh(faults)
+faults.failWriteAt = ctx.mem.writes()
+faults.prefixOnFailure = 10
+receiptBefore: ctx.durable.lastReceipt()
+Assertions.require(F.fails(() => { ctx.store.follow(1, 2) }))
+Assertions.require(ctx.durable.isFaulted() && (!ctx.journal.isAvailable()))
+Assertions.require(ctx.journal.state() == "faulted")
+Assertions.require(ctx.durable.lastReceipt() === receiptBefore)  // no receipt
+Assertions.require(!ctx.store.isFollowingIdentity(1, 2))
+faults.failWriteAt = -1
+Assertions.require(F.fails(() => { ctx.store.follow(2, 1) }))  // poisoned
+Assertions.require(ctx.store.find("x") === null)               // reads still served
+torn: Recovery.replay(ctx.mem.written(), F.limits())
+Assertions.require(torn.ok && (torn.tail == "incomplete"))
+Assertions.require(!Store.restore(torn.domain).isFollowingIdentity(1, 2))
+// Restart without authorization refuses; authorized repair keeps frame 1.
+Assertions.require(F.fails(() => {
+    Journal.attach(F.memoryFile(ctx.mem.written(), F.defaultFaults()).file,
+        F.fakeLock(), F.limits()).recover()
+}))
+repaired: openDurable(ctx.mem.written(), F.defaultFaults(), 4, F.repairLimits())
+Assertions.require(repaired.store.identityById(2) !== null)
+Assertions.require(repaired.store.follow(1, 2).ok)
+Assertions.require(Recovery.replay(repaired.mem.synced(), F.limits()).tail == "clean")
+
+// ---- failed sync: complete frame written, never acknowledged ---------------
+faults = F.defaultFaults()
+ctx = fresh(faults)
+faults.failSync = true
+Assertions.require(F.fails(() => { ctx.store.follow(1, 2) }))
+Assertions.require(ctx.durable.isFaulted() && (!ctx.store.isFollowingIdentity(1, 2)))
+// Uncertainty is resolved by recovery: if the octets survived, the transaction
+// is committed; if only the last synced image survived, it is absent.
+Assertions.require(recoveredFrom(ctx.mem.written()).isFollowingIdentity(1, 2))
+Assertions.require(!recoveredFrom(ctx.mem.synced()).isFollowingIdentity(1, 2))
+
+// ---- conflicting mutations during suspension --------------------------------
+faults = F.defaultFaults()
+ctx = fresh(faults)
+reached: DurableStore.makeGate()
+proceed: DurableStore.makeGate()
+faults.onSync = () => {
+    faults.onSync = null
+    reached.open()
+    proceed.wait()
+}
+first: (() => { ctx.store.createArticleWithTitle(1, "Same", "d", "b", [], T) }).future()
+reached.wait()
+// The first transaction holds the gate inside sync(); nothing is published yet.
+Assertions.require(ctx.durable.busy())
+Assertions.require(ctx.store.find("same") === null)
+second: (() => { ctx.store.createArticleWithTitle(2, "Same", "d", "b", [], T) }).future()
+proceed.open()
+one: first.value()
+two: second.value()
+Assertions.require(one.ok && two.ok)
+Assertions.require(one.value.slug != two.value.slug)  // validated against fresh state
+Assertions.require((ctx.store.find("same") !== null) && (ctx.store.find("same-2") !== null))
+Assertions.require((!ctx.durable.busy()) && (ctx.durable.pending() == 0))
+
+// ---- bounded queue fails closed -------------------------------------------
+faults = F.defaultFaults()
+ctx = openDurable(F.journalOf([F.twoAccounts()]), faults, 0, F.limits())
+reached = DurableStore.makeGate()
+proceed = DurableStore.makeGate()
+faults.onSync = () => {
+    faults.onSync = null
+    reached.open()
+    proceed.wait()
+}
+holder: (() => { ctx.store.follow(1, 2) }).future()
+reached.wait()
+Assertions.require(F.fails(() => { ctx.store.follow(2, 1) }))  // maxPending = 0
+proceed.open()
+Assertions.require(holder.value().ok)
+Assertions.require(ctx.store.follow(2, 1).ok)                  // gate released
+
+// ---- a fault releases queued writers instead of leaving them waiting -------
+faults = F.defaultFaults()
+ctx = fresh(faults)
+reached = DurableStore.makeGate()
+proceed = DurableStore.makeGate()
+faults.onSync = () => {
+    faults.onSync = null
+    reached.open()
+    proceed.wait()
+    faults.failSync = true
+}
+holder = (() => { ctx.store.follow(1, 2) }).future()
+reached.wait()
+queued: (() => { ctx.store.follow(2, 1) }).future()
+proceed.open()
+Assertions.require(F.fails(() => { holder.value() }))
+Assertions.require(F.fails(() => { queued.value() }))   // refused, not hung
+Assertions.require(ctx.durable.isFaulted() && (!ctx.durable.busy()))
+
+// ---- close: refuse new work, release the lock exactly once ------------------
+ctx = fresh(F.defaultFaults())
+Assertions.require(ctx.store.follow(1, 2).ok)
+ctx.durable.close()
+Assertions.require(ctx.lock.releases() == 1)
+Assertions.require(ctx.mem.isClosed() && (ctx.journal.state() == "closed"))
+Assertions.require(F.fails(() => { ctx.store.follow(2, 1) }))
+ctx.durable.close()
+Assertions.require(ctx.lock.releases() == 1)
+
+// ---- recovery of the complete domain, no double application ------------------
+rich: openDurable(F.journalOf([F.twoAccounts(), F.richDomain()]), F.defaultFaults(), 4, F.limits())
+Assertions.require(rich.store.isFollowingIdentity(2, 1))
+Assertions.require(rich.store.find("hello").favoritesCount == 1)
+Assertions.require(rich.store.isFavoritedByIdentity(2, "hello"))
+Assertions.require(rich.store.createComment(1, "hello", "next", T).value.id == 2)
+Assertions.require(rich.store.unfavorite(2, "hello").changed)
+Assertions.require(rich.store.find("hello").favoritesCount == 0)
+replayedTwice: Recovery.replay(F.concat([rich.mem.synced()]), F.limits())
+Assertions.require(Store.restore(replayedTwice.domain).find("hello").favoritesCount == 0)
+true

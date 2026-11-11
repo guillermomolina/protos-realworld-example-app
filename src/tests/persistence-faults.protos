@@ -1,0 +1,227 @@
+//! Deterministic fault injection at the File, lock and journal boundaries.
+//!
+//! Every case states its exact expected outcome. These fixtures exercise the
+//! journal protocol with injected Files; they DO NOT prove power-loss or device
+//! durability. Real process restarts and SIGKILL live in restart-integration.py.
+
+Assertions: import("std:test/assertions")
+Arrays: import("std:collections/array")
+Codec: import("../app/persistence/JournalCodec.protos")
+Domain: import("../app/persistence/DomainCodec.protos")
+Journal: import("../app/persistence/Journal.protos")
+Recovery: import("../app/persistence/Recovery.protos")
+F: import("./persistence-fixtures.protos")
+
+reasons: []
+report: (label) => {
+    reasons = Arrays.append(reasons, label)
+    label
+}
+reported: (label) => { Arrays.contains(reasons, label) }
+payloadOf: (domain) => { Domain.encodeTransaction("fault", domain) }
+txFor: (sequence) => { Codec.transactionId(F.nonce(5), sequence) }
+
+/// A ready journal over an injected File, after one committed transaction.
+ready: (faults, lim) => {
+    mem: F.memoryFile(Codec.emptyBytes(), faults)
+    lock: F.fakeLock()
+    journal: Journal.attach(mem.file, lock, lim, report)
+    journal.recover()
+    journal.appendCommit(txFor(1), payloadOf(F.twoAccounts()))
+    {
+        mem: mem
+        lock: lock
+        journal: journal
+    }
+}
+
+/// Minimal confined Filesystem double: names map to memory Files, and a
+/// `present` flag per name models createNew/delete. Not a real filesystem.
+fakeFilesystem: (names) => {
+    files: Map()
+    present: Map()
+    for(name in names) {
+        files[name] = F.memoryFile(Codec.emptyBytes(), F.defaultFaults())
+        present[name] = true
+    }
+    revokedFlag: false
+    isPresent: (path) => { present.containsKey(path) && present[path] }
+    {
+        open: (path, read, write, createNew) => {
+            F.later(() => {
+                if(revokedFlag) { Error().signal() }
+                if(createNew == true) {
+                    if(isPresent(path)) { Error().signal() }
+                    files[path] = F.memoryFile(Codec.emptyBytes(), F.defaultFaults())
+                    present[path] = true
+                } else {
+                    if(!isPresent(path)) { Error().signal() }
+                    // Reopening a path creates a fresh File handle while
+                    // retaining the bytes written by the previous handle.
+                    if(files[path].isClosed()) {
+                        files[path] = F.memoryFile(
+                            files[path].written(),
+                            F.defaultFaults()
+                        )
+                    }
+                }
+                files[path].file
+            })
+        }
+        remove: (path) => {
+            F.later(() => {
+                if(revokedFlag || !isPresent(path)) { Error().signal() }
+                present[path] = false
+                true
+            })
+        }
+        exists: isPresent
+        revoke: () => { revokedFlag = true }
+    }
+}
+
+// 1. Successful chunked write: complete frame synced, journal stays ready.
+faults: F.defaultFaults()
+r: ready(faults, F.limits())
+Assertions.require(r.journal.isAvailable())
+Assertions.require(Recovery.replay(r.mem.synced(), F.limits()).applied == 1)
+
+// 2. Write failure on the first write call: no octet may have been accepted,
+//    but the provider cannot prove it, so the outcome is uncertain: faulted.
+faults = F.defaultFaults()
+r = ready(faults, F.limits())
+faults.failWriteAt = r.mem.writes()
+Assertions.require(F.fails(() => { r.journal.appendCommit(txFor(2), payloadOf(F.richDomain())) }))
+Assertions.require((r.journal.state() == "faulted") && (r.journal.failureReason() == "uncertain_commit"))
+Assertions.require(Recovery.replay(r.mem.written(), F.limits()).tail == "clean")
+
+// 3. Write failure after a committed prefix: faulted; restart sees a torn tail.
+faults = F.defaultFaults()
+r = ready(faults, F.limits())
+faults.failWriteAt = r.mem.writes()
+faults.prefixOnFailure = 48
+Assertions.require(F.fails(() => { r.journal.appendCommit(txFor(2), payloadOf(F.richDomain())) }))
+Assertions.require(r.journal.state() == "faulted")
+Assertions.require(Recovery.replay(r.mem.written(), F.limits()).tail == "incomplete")
+Assertions.require(F.fails(() => { r.journal.appendCommit(txFor(2), payloadOf(F.richDomain())) }))
+
+// 4. Failure before any write (seek): journal remains ready, nothing written.
+faults = F.defaultFaults()
+r = ready(faults, F.limits())
+size: r.mem.written().size()
+faults.failSeek = true
+Assertions.require(F.fails(() => { r.journal.appendCommit(txFor(2), payloadOf(F.richDomain())) }))
+Assertions.require(r.journal.isAvailable() && (r.journal.failureReason() == "seek_failed"))
+Assertions.require(r.mem.written().size() == size)
+faults.failSeek = false
+Assertions.require(r.journal.appendCommit(txFor(2), payloadOf(F.richDomain())).sequence == 2)
+
+// 5. Failure during sync: frame fully written, unacknowledged, faulted.
+faults = F.defaultFaults()
+r = ready(faults, F.limits())
+faults.failSync = true
+Assertions.require(F.fails(() => { r.journal.appendCommit(txFor(2), payloadOf(F.richDomain())) }))
+Assertions.require(r.journal.state() == "faulted")
+Assertions.require(Recovery.replay(r.mem.written(), F.limits()).applied == 2)
+Assertions.require(Recovery.replay(r.mem.synced(), F.limits()).applied == 1)
+
+// 6. Close failure: lock retained for operator inspection.
+faults = F.defaultFaults()
+r = ready(faults, F.limits())
+faults.failClose = true
+Assertions.require(F.fails(() => { r.journal.close() }))
+Assertions.require((r.lock.releases() == 0) && (r.journal.state() == "faulted"))
+
+// 7. Revoked resource during recovery: startup fails closed.
+faults = F.defaultFaults()
+faults.failRead = true
+revoked: Journal.attach(F.memoryFile(F.journalOf([F.twoAccounts()]), faults).file,
+    F.fakeLock(), F.limits(), report)
+Assertions.require(F.fails(() => { revoked.recover() }))
+Assertions.require((revoked.state() == "faulted") && reported("journal_read_failed"))
+
+// 8. Invalid commit target/input: rejected before I/O; journal stays ready.
+r = ready(F.defaultFaults(), F.limits())
+writes: r.mem.writes()
+zero: Codec.emptyBytes()
+for(index, 0, 16) { zero.add(0) }
+Assertions.require(F.fails(() => { r.journal.appendCommit(zero, payloadOf(F.twoAccounts())) }))
+Assertions.require(r.journal.isAvailable() && (r.mem.writes() == writes))
+// Commits before recovery are refused.
+unrecovered: Journal.attach(F.memoryFile(Codec.emptyBytes(), F.defaultFaults()).file,
+    F.fakeLock(), F.limits(), report)
+Assertions.require(F.fails(() => { unrecovered.appendCommit(txFor(1), payloadOf(F.twoAccounts())) }))
+
+// 9. Missing preprovisioned journal: startup fails; our own lock is removed.
+fs: fakeFilesystem([])
+Assertions.require(F.fails(() => { Journal.open(fs, "journal", "lock", F.limits(), report) }))
+Assertions.require(reported("journal_unavailable") && (!fs.exists("lock")) && (!fs.exists("journal")))
+
+// 10/11. Existing lock (live or stale): rejected, never stolen or deleted.
+fs = fakeFilesystem(["journal", "lock"])
+reasons = []
+Assertions.require(F.fails(() => { Journal.open(fs, "journal", "lock", F.limits(), report) }))
+Assertions.require(reported("lock_unavailable") && fs.exists("lock"))
+// Manual operator removal (modelled by remove) then permits a start.
+fs.remove("lock").value()
+manual: Journal.open(fs, "journal", "lock", F.limits(), report)
+manual.recover()
+Assertions.require(manual.isAvailable() && fs.exists("lock"))
+manual.close()
+Assertions.require(!fs.exists("lock"))
+
+// 12. Journal quota: refused before I/O, journal stays ready.
+quota: F.limits()
+quota.maxJournalBytes = 4096
+r = ready(F.defaultFaults(), quota)
+writes = r.mem.writes()
+large: F.twoAccounts()
+bio: ""
+for(index, 0, 5000) { bio = bio + "x" }
+alice: F.account(1, "alice")
+alice.bio = bio
+large.accounts = [alice, F.account(2, "bob")]
+Assertions.require(F.fails(() => { r.journal.appendCommit(txFor(2), payloadOf(large)) }))
+Assertions.require(r.journal.isAvailable() && (r.journal.failureReason() == "journal_quota"))
+Assertions.require(r.mem.writes() == writes)
+
+// 13. Non-Syncable receiver: startup fails closed before any commit.
+nosync: Journal.attach(F.unsyncableFile(Codec.emptyBytes()), F.fakeLock(), F.limits(), report)
+Assertions.require(F.fails(() => { nosync.recover() }))
+Assertions.require(reported("sync_unsupported") && (!nosync.isAvailable()))
+
+// 14. Incomplete tail without authorization: refused, file untouched.
+image: F.journalOf([F.twoAccounts(), F.richDomain()])
+tornImage: Codec.slice(image, 0, image.size() - 5)
+tornFile: F.memoryFile(tornImage, F.defaultFaults())
+Assertions.require(F.fails(() => {
+    Journal.attach(tornFile.file, F.fakeLock(), F.limits(), report).recover()
+}))
+Assertions.require(reported("incomplete_tail_requires_repair"))
+Assertions.require(Codec.sameBytes(tornFile.written(), tornImage))
+
+// 15. Middle corruption: refused, never skipped.
+middle: Codec.emptyBytes()
+for(index, 0, image.size()) {
+    octet: image[index]
+    if(index == 40) { octet = (octet + 7) % 256 }
+    middle.add(octet)
+}
+Assertions.require(F.fails(() => {
+    Journal.attach(F.memoryFile(middle, F.defaultFaults()).file, F.fakeLock(), F.limits(), report).recover()
+}))
+Assertions.require(reported("corrupt_checksum"))
+
+// 16. Second writer: the cooperative lock rejects it until the first closes.
+fs = fakeFilesystem(["journal"])
+reasons = []
+writer: Journal.open(fs, "journal", "lock", F.limits(), report)
+writer.recover()
+Assertions.require(F.fails(() => { Journal.open(fs, "journal", "lock", F.limits(), report) }))
+Assertions.require(reported("lock_unavailable") && writer.isAvailable())
+writer.close()
+second: Journal.open(fs, "journal", "lock", F.limits(), report)
+second.recover()
+Assertions.require(second.isAvailable())
+second.close()
+true

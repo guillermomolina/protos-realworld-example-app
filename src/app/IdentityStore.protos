@@ -12,6 +12,9 @@
 //! that id as their owner/relationship key, so a rename preserves ownership.
 //! Lookups return new objects: editing a returned profile cannot edit retained
 //! state. Rejected insertions do not advance nextId or occupy either name.
+//!
+//! restore/exportState support durable recovery: restoration validates the
+//! complete record set and nextId, then constructs the store directly.
 
 Arrays: import("std:collections/array")
 
@@ -61,10 +64,45 @@ nullable: (value) => {
     answer
 }
 
+/// Durable restoration: validate a complete record set, then construct the
+/// store in one step. Never replays registration logic, never reassigns an ID.
+/// Signals an Error for duplicate IDs/usernames/emails, blank names, "" in a
+/// nullable field (it would have been normalized to null) or a nextId that
+/// does not exceed every retained ID (which would permit accidental reuse).
+validRecords: (initialRecords, initialNextId) => {
+    if(initialNextId < 1) { Error().signal() }
+    seenIds: []
+    seenUsernames: []
+    seenEmails: []
+    for(record in initialRecords) {
+        if((record.id < 1) || (record.id >= initialNextId)) { Error().signal() }
+        if((record.username === null) || (record.username == "")) { Error().signal() }
+        if((record.email === null) || (record.email == "")) { Error().signal() }
+        if(record.bio == "") { Error().signal() }
+        if(record.image == "") { Error().signal() }
+        if(Arrays.contains(seenIds, record.id)) { Error().signal() }
+        if(Arrays.contains(seenUsernames, record.username)) { Error().signal() }
+        if(Arrays.contains(seenEmails, record.email)) { Error().signal() }
+        seenIds = Arrays.append(seenIds, record.id)
+        seenUsernames = Arrays.append(seenUsernames, record.username)
+        seenEmails = Arrays.append(seenEmails, record.email)
+    }
+    true
+}
+
+restore: (initialRecords, initialNextId) => {
+    validRecords(initialRecords, initialNextId)
+    build(initialRecords, initialNextId)
+}
+
 /// Each invocation creates a completely independent in-memory identity store.
-create: () => {
-    records: []
-    nextId: 1
+create: () => { build([], 1) }
+
+/// Private constructor. Inputs are copied, so later edits by the caller cannot
+/// reach retained records. Callers must have validated the inputs.
+build: (initialRecords, initialNextId) => {
+    records: Arrays.map(initialRecords, snapshot)
+    nextId: initialNextId
 
     byId: (id) => {
         found: null
@@ -107,6 +145,15 @@ create: () => {
     // These lookups are intended for the RootActor application store only.
     // A public HTTP profile must use profileFor, not an account snapshot.
     store: {
+        /// Durable export for the RootActor transaction coordinator only.
+        /// Records are fresh copies in stable insertion (ID) order.
+        exportState: () => {
+            {
+                records: Arrays.map(records, snapshot)
+                nextId: nextId
+            }
+        }
+
         findId: (id) => {
             copyOrNull(byId(id))
         }

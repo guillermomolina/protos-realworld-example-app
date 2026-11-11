@@ -1,0 +1,13 @@
+print("I153_PROBE=START")
+
+Codec: import("./app/persistence/JournalCodec.protos")
+print("I153_PROBE=CODEC_OK")
+
+Domain: import("./app/persistence/DomainCodec.protos")
+print("I153_PROBE=DOMAIN_OK")
+
+Fixtures: import("./tests/persistence-fixtures.protos")
+print("I153_PROBE=FIXTURES_OK")
+
+print(Fixtures.limits().maxFrames)
+print("I153_PROBE=PASS")
