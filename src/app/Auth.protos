@@ -4,7 +4,9 @@
 //! Auth answers "which account is making this request?". Owner authorization
 //! answers "may that account change this resource?" and remains in Api/stores.
 //! AuthStore keeps credentials; this module keeps the signing key and connects
-//! verified JWT claims to those retained accounts. It never trusts decoded JSON
+//! verified JWT claims to those retained accounts. The production server passes
+//! a persistent credential repository as the optional fifth argument of create;
+//! unit tests omit it and use AuthStore's in-memory records. It never trusts decoded JSON
 //! claims without the Standard Library's signature and policy verification.
 JWT: import("std:auth/jwt")
 JSON: import("std:json/json")
@@ -43,7 +45,9 @@ seconds: (instant) => {
 /// Dependencies are explicit so each instance belongs to one application store.
 /// Production supplies real RootActor authority; tests can control only now's
 /// Instant value while retaining genuine password/JWT/entropy providers.
-create: (store, entropy, signingKey, now) => {
+/// ...repositories optionally carries the persistent credential repository,
+/// which must operate on the same SQLite database as store.
+create: (store, entropy, signingKey, now, ...repositories) => {
     // The standard codec admits genuine Bytes and creates an independent copy.
     // A non-Bytes input is rejected before a service can retain any key.
     retainedKey: null
@@ -53,7 +57,7 @@ create: (store, entropy, signingKey, now) => {
     )
     if(retainedKey === null) { Error().signal() }
     if((retainedKey.size() < 32) || (retainedKey.size() > 4096)) { Error().signal() }
-    credentials: Credentials.create(store, entropy)
+    credentials: Credentials.create(store, entropy, ...repositories)
     jwtPolicy: policy()
     // Private issuance also supports a prepared subject before account commit.
     issueForSubject: (subject, generation) => {
@@ -78,14 +82,15 @@ create: (store, entropy, signingKey, now) => {
         issueForSubject(credentials.subjectFor(identity.id),
             credentials.generationFor(identity.id))
     }
-    accountResponse: (result, status, registration) => {
-        // Registration has already signed before committing either record.
-        // Signing again here could report failure after creating an account.
-        // Login and account updates issue their response token in the usual way.
+    accountResponse: (result, status, prepared) => {
+        // Registration and account updates sign before committing anything.
+        // Signing again here could report failure after a confirmed commit.
+        // Issuing a token never itself admits or changes an account. Login
+        // changes nothing, so it issues its response token in the usual way.
         response: null
         if(result.ok) {
             token: null
-            if(registration) { token = result.token } else { token = issue(result.value) }
+            if(prepared) { token = result.token } else { token = issue(result.value) }
             response = Responses.json(status, Users.single(result.value, token))
         } else {
             if(result.field == "credentials") { response = Responses.invalidCredentials() } else {
@@ -167,8 +172,10 @@ create: (store, entropy, signingKey, now) => {
             Users.single(store.identityById(principal.id), principal.token)
         }
         update: (principal, fields) => {
+            // The token is prepared for the generation the commit establishes
+            // (incremented once when the password changes).
             accountResponse(credentials.updateAccount(principal.id,
-                principal.generation, fields), 200, false)
+                principal.generation, fields, issueForSubject), 200, true)
         }
         timestamp: () => { ISO8601.formatInstant(now()) }
     }

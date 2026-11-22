@@ -1,64 +1,78 @@
 # TODO — RealWorld backend in Protos
 
-## Remaining application work
+## Implementation prepared (not yet validated)
 
-- [ ] Durable persistence: save accounts, password verifiers, JWT subjects and
-  generations, articles, comments, follows and favorites. Restore the same
-  identities and relationships after restarting the process.
-- [ ] Add restart/recovery tests when persistence is implemented.
+SQLite persistence is implemented in code, with SQLite as the only source of
+truth. None of the checks below has been run yet. This section describes the
+code that exists; it does not record a validation.
 
-The current backend stores everything in memory. Restarting loses all accounts
-and domain data. Persistence is the main remaining application feature; the
-implemented HTTP routes and authentication have passed the checks listed below.
+- `SqliteDatabase`: explicit open/create, WAL, `synchronous=FULL`, foreign
+  keys, busy timeout, schema version 1, structural/integrity checks,
+  transactions and handling of an uncertain COMMIT.
+- `SqliteStore` and `SqliteCredentials`: the production repositories.
+  Identity and credentials share one transaction.
+- `AuthStore`/`Auth`: the persistent credential repository is selected at
+  construction. Update tokens are prepared before the commit.
+- `main.protos`: the startup order and fail-closed checks, close on shutdown,
+  and stopping service when the connection becomes unusable.
+- Tests prepared: `make test-sqlite`, `make test-sqlite-restart`,
+  `make test-sqlite-failures`.
 
-## Optional work for deployment
+## Validation pending
+
+- [ ] `make test` still passes with the in-memory fixtures after the shared
+  `AuthStore`/`Auth`/`IdentityStore`/`ContentStore` changes.
+- [ ] `make test-sqlite`: repositories, transactions, rollback and persistent
+  authentication against real SQLite.
+- [ ] Restart validation, `make test-sqlite-restart`: data, IDs, credentials
+  and token revocation across independent processes and a server restart.
+- [ ] Recovery after errors and crashes, `make test-sqlite-restart` and
+  `make test-sqlite-failures`: SIGKILL during an open transaction and after a
+  confirmed commit, lock contention, unknown or incompatible schema, foreign
+  content, missing authorization or provider, a corrupt file.
+- [ ] `make test-http` and `make test-http-lifecycle` against the persistent
+  server.
+- [ ] Native Image execution (Protos `0.4.192-SNAPSHOT` or newer with I170)
+  using the integrated FFM provider, without a provider JAR or JVM.
+- [ ] SQLite authorization through `--allow-library sqlite3=…` (both CLI
+  spellings) under Native.
+- [ ] Persistent reopen and WAL behavior under Native.
+- [ ] SIGKILL and recovery under Native.
+- [ ] HTTP restart and JWT revocation under Native.
+- [ ] Absent `sqlite3` authorization rejected under Native.
+- [ ] JVM compatibility with the external provider
+  (`PROTOS_ARGS="--foreign-provider-path …"`).
+- [ ] Missing external provider detected in JVM mode (the `no-ffm-provider`
+  scenario; not applicable to integrated-provider runners).
+- [ ] Official Hurl conformance, `make test-hurl` (unmodified suite), still to
+  be verified. Report `make test-hurl-adjusted` separately, as a compatibility
+  variant only.
+
+## Optional work for production deployment
 
 These tasks are needed for a production deployment, not to run the learning
 example locally:
 
 - [ ] Configure HTTPS and deployment supervision.
 - [ ] Add request/rate limits appropriate to the deployment. The existing HTTP
-  request-body size limit is already implemented and tested.
+  request-body size limit is already implemented.
 - [ ] Define secure storage and rotation of the production JWT signing key.
-  `make serve` generates a temporary development key only when none is configured.
+- [ ] Define database backup/restore procedures, including the WAL companion
+  files.
 - [ ] Connect process shutdown signals to graceful drain. The manual `quit`
-  command and the drain/abort lifecycle already work.
+  command and the drain/abort lifecycle already exist.
+- [ ] Consider SQL-side filtering and pagination if article volume grows. The
+  current repository materializes rows and applies the shared Protos query
+  algorithm.
 
 Using `std:http/host` is a possible future refactor, not a missing feature or a
 requirement for completing this example.
 
-## Implemented and validated
-
-- All 19 Slice 12 routes: registration/login, account retrieval/update, profiles,
-  follows, feed, article CRUD, comments, favorites and tags.
-- Standard Library Argon2id and JWT authentication, stable subjects and ownership,
-  token revocation after password changes, atomic registration and account updates.
-- Input validation, unique slugs, chronological ordering, filters, pagination and
-  viewer-aware JSON presentation.
-- RootActor-owned state and security authority, two HTTP Workers, bounded request
-  snapshots and safe logs.
-
-Results reported by the maintainer on **2026-11-09**, with the Protos
-`0.3.459-SNAPSHOT` development baseline:
-
-| Command | Result |
-| --- | --- |
-| `make test` | All 12 groups PASS, including secure authentication HTTP |
-| `make test-http` | `REALWORLD_NATIVE_HTTP=PASS` |
-| `make test-http-lifecycle` | All five checks PASS: concurrent Workers, request envelope, body limit, drain and abort |
-| `make test-hurl` | All 13 files and 157 requests succeeded; zero failed files |
-
 ## Hurl compatibility note
 
-`make test-hurl` applies the tracked token-refresh patch to a temporary copy of
-external tests. After a password change, the next request uses the token returned
-by that change. The original test reused the revoked token and therefore received
-HTTP 401. This adjustment preserves the application's token-revocation requirement
-and does not modify the external checkout.
-
-All 157 requests pass with this documented adjustment. This is an adapted-suite
-result, not a claim that the unmodified official suite passes. Its exact external
-revision was not recorded in the reported run. Proposing the test correction
-upstream is optional and does not block application development.
-
-No Standard Library blocker has been identified by the reported validations.
+`make test-hurl-adjusted` applies the tracked token-refresh patch to a temporary
+copy of the external tests. After a password change, the next request uses the
+token returned by that change, because the application revokes the previous
+token. This keeps the token-revocation requirement intact and does not modify
+the external checkout. A result from this variant is not an official-suite
+result.

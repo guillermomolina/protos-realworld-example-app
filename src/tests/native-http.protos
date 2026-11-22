@@ -1,10 +1,14 @@
 //! Native TCP integration checks against an already-running RealWorld server.
 //!
-//! Start the application with `make serve` in another terminal.
+//! Start the application with `make serve` in another terminal, on a fresh
+//! disposable database created for this run only, for example:
+//!   REALWORLD_DB_CREATE=1 REALWORLD_DB_PATH="$(mktemp -d)/http.db" make serve
 //! Run these assertions with `make test-http`.
 //!
 //! Unlike the direct suite, each exchange opens a real connection to port 3000.
-//! Restart the server before rerunning: fixed test account names remain in memory.
+//! The first checks expect an empty database, and the fixed test account names
+//! are persisted: use a new disposable database for every run, never a
+//! database that holds real data.
 //! Follow the authenticated scenario near registration at the end of this file
 //! to see tokens captured from JSON and passed back in Authorization headers.
 
@@ -175,7 +179,7 @@ exchange("DELETE", path + "/comments/" + commentId, null, token, 204)
 Assertions.require(exchange("GET", path + "/comments", null, null, 200)["comments"].value.size() == 0)
 exchange("DELETE", path, null, token, 204)
 exchange("GET", path, null, null, 404)
-// The in-memory account remains until restart; run against a fresh server.
+// The account is persisted; the next run needs a new disposable database.
 
 print("REALWORLD_NATIVE_HTTP=PASS")
 true

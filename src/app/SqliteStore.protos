@@ -1,0 +1,503 @@
+//! SQLite-backed RealWorld domain repository, used by the production server.
+//!
+//! Offers the same operations, arguments and result shapes that Api, Auth,
+//! Articles and Comments consume from MemoryStore. SQLite is the only source
+//! of truth: nothing here keeps an authoritative copy of rows between calls.
+//! Every read builds fresh ordinary Protos objects from copied SQLite rows.
+//!
+//! The domain rules remain Protos code: blank-field and ownership checks,
+//! "not found"/"not owned"/"has already been taken" results, idempotent follow
+//! and favorite edges, and ArticleQuery's Instant-based ordering and paging.
+//! SQLite constraints are the final integrity guarantee underneath them.
+//!
+//! Mutations run inside SqliteDatabase.transaction. When a caller (the
+//! credential repository) has already opened a transaction, they join it, so
+//! identity and credential rows commit or roll back together. Expected
+//! collisions are detected before writing and answered as domain results;
+//! unexpected SQLite failures propagate as operational errors (HTTP 503).
+Arrays: import("std:collections/array")
+Identities: import("./IdentityStore.protos")
+Content: import("./ContentStore.protos")
+Follows: import("./FollowStore.protos")
+Favorites: import("./FavoriteStore.protos")
+ArticleQuery: import("./ArticleQuery.protos")
+
+/// Shared projection for article rows. favoritesCount is derived from the
+/// favorites relation on every read, so there is no counter to diverge.
+articleColumns: "SELECT a.slug, a.title, a.description, a.body, a.created_at, a.updated_at, u.username, u.bio, u.image, (SELECT count(*) FROM favorites f WHERE f.article_slug = a.slug), a.author_id FROM articles a JOIN users u ON u.id = a.author_id"
+
+commentColumns: "SELECT c.id, c.body, c.created_at, c.updated_at, u.username, u.bio, u.image FROM comments c JOIN users u ON u.id = c.author_id"
+
+identityColumns: "SELECT id, username, email, bio, image FROM users"
+
+create: (database) => {
+    // Join the caller's transaction when one is active, otherwise open one.
+    write: (operation) => {
+        result: null
+        if(database.inTransaction()) { result = operation() } else {
+            result = database.transaction(operation)
+        }
+        result
+    }
+
+    identityFrom: (row) => {
+        {
+            id: row[0]
+            username: row[1]
+            email: row[2]
+            bio: row[3]
+            image: row[4]
+        }
+    }
+
+    firstIdentity: (rows) => {
+        found: null
+        if(rows.size() > 0) { found = identityFrom(rows[0]) }
+        found
+    }
+
+    byId: (id) => { firstIdentity(database.rows(identityColumns + " WHERE id = ?1", [id])) }
+    byUsername: (username) => {
+        firstIdentity(database.rows(identityColumns + " WHERE username = ?1", [username]))
+    }
+    byEmail: (email) => {
+        firstIdentity(database.rows(identityColumns + " WHERE email = ?1", [email]))
+    }
+
+    articleFrom: (row, tags) => {
+        {
+            slug: row[0]
+            title: row[1]
+            description: row[2]
+            body: row[3]
+            tagList: tags
+            createdAt: row[4]
+            updatedAt: row[5]
+            favoritesCount: row[9]
+            author: {
+                username: row[6]
+                bio: row[7]
+                image: row[8]
+            }
+        }
+    }
+
+    tagsFor: (slug) => {
+        names: []
+        for(row in database.rows("SELECT name FROM article_tags WHERE article_slug = ?1 ORDER BY position", [slug])) {
+            names = Arrays.append(names, row[0])
+        }
+        names
+    }
+
+    // Insertion order (rowid) matches MemoryStore's append order, so equal
+    // createdAt values keep the same relative order after ArticleQuery sorts.
+    articlesWhere: (condition, parameters) => {
+        tagMap: Map()
+        for(row in database.rows("SELECT article_slug, name FROM article_tags ORDER BY article_slug, position", [])) {
+            existing: []
+            if(tagMap.containsKey(row[0])) { existing = tagMap[row[0]] }
+            tagMap[row[0]] = Arrays.append(existing, row[1])
+        }
+        result: []
+        for(row in database.rows(articleColumns + condition + " ORDER BY a.rowid", parameters)) {
+            tags: []
+            if(tagMap.containsKey(row[0])) { tags = tagMap[row[0]] }
+            result = Arrays.append(result, articleFrom(row, tags))
+        }
+        result
+    }
+
+    articleRow: (slug) => {
+        rows: database.rows(articleColumns + " WHERE a.slug = ?1", [slug])
+        found: null
+        if(rows.size() > 0) { found = rows[0] }
+        found
+    }
+
+    findArticle: (slug) => {
+        row: articleRow(slug)
+        found: null
+        if(row !== null) { found = articleFrom(row, tagsFor(slug)) }
+        found
+    }
+
+    commentFrom: (row) => {
+        {
+            id: row[0]
+            body: row[1]
+            createdAt: row[2]
+            updatedAt: row[3]
+            author: {
+                username: row[4]
+                bio: row[5]
+                image: row[6]
+            }
+        }
+    }
+
+    commentOwner: (slug, id) => {
+        rows: database.rows("SELECT author_id FROM comments WHERE article_slug = ?1 AND id = ?2", [slug, id])
+        owner: null
+        if(rows.size() > 0) { owner = rows[0][0] }
+        owner
+    }
+
+    articleOwner: (slug) => {
+        rows: database.rows("SELECT author_id FROM articles WHERE slug = ?1", [slug])
+        owner: null
+        if(rows.size() > 0) { owner = rows[0][0] }
+        owner
+    }
+
+    following: (followerId, followedId) => {
+        database.rows("SELECT 1 FROM follows WHERE follower_id = ?1 AND followed_id = ?2",
+            [followerId, followedId]).size() > 0
+    }
+
+    favorited: (actorId, slug) => {
+        database.rows("SELECT 1 FROM favorites WHERE user_id = ?1 AND article_slug = ?2",
+            [actorId, slug]).size() > 0
+    }
+
+    insertTags: (slug, tags) => {
+        position: 0
+        for(tag in tags) {
+            database.execute("INSERT INTO article_tags (article_slug, position, name) VALUES (?1, ?2, ?3)",
+                [slug, position, tag])
+            position = position + 1
+        }
+        true
+    }
+
+    // A statement that must change exactly one row and did not is an
+    // operational inconsistency, never a user-facing domain result.
+    exactlyOne: (changes) => {
+        if(changes != 1) { Error().signal() }
+        true
+    }
+
+    idsFrom: (rows) => {
+        ids: []
+        for(row in rows) { ids = Arrays.append(ids, row[0]) }
+        ids
+    }
+
+    store: {
+        // Identity metadata. Results are fresh snapshots without credentials.
+        identityById: (id) => { byId(id) }
+        identityByUsername: (username) => { byUsername(username) }
+        identityByEmail: (email) => { byEmail(email) }
+
+        findProfile: (username) => {
+            record: byUsername(username)
+            result: null
+            if(record !== null) { result = Identities.publicProfile(record) }
+            result
+        }
+
+        /// Insert an identity. Joins the credential repository's transaction
+        /// when called from registration. Collisions are domain rejections.
+        admitIdentity: (username, email) => {
+            write(() => {
+                outcome: Identities.requiredNames(username, email)
+                if(outcome === null) {
+                    if(byUsername(username) !== null) {
+                        outcome = Identities.rejected("username", "has already been taken")
+                    } else {
+                        if(byEmail(email) !== null) {
+                            outcome = Identities.rejected("email", "has already been taken")
+                        } else {
+                            exactlyOne(database.execute("INSERT INTO users (username, email, bio, image) VALUES (?1, ?2, NULL, NULL)",
+                                [username, email]))
+                            outcome = Identities.accepted(byId(database.lastInsertId()))
+                        }
+                    }
+                }
+                outcome
+            })
+        }
+
+        /// Replace account metadata; the numeric ID never changes, so every
+        /// relation, article and comment keeps its owner across renames.
+        replaceIdentity: (id, username, email, bio, image) => {
+            write(() => {
+                outcome: Identities.rejected("user", "not found")
+                if(byId(id) !== null) {
+                    outcome = Identities.requiredNames(username, email)
+                    if(outcome === null) {
+                        usernameOwner: byUsername(username)
+                        emailOwner: byEmail(email)
+                        if((usernameOwner !== null) && (usernameOwner.id != id)) {
+                            outcome = Identities.rejected("username", "has already been taken")
+                        } else {
+                            if((emailOwner !== null) && (emailOwner.id != id)) {
+                                outcome = Identities.rejected("email", "has already been taken")
+                            } else {
+                                exactlyOne(database.execute("UPDATE users SET username = ?2, email = ?3, bio = ?4, image = ?5 WHERE id = ?1",
+                                    [id, username, email, Identities.nullable(bio), Identities.nullable(image)]))
+                                outcome = Identities.accepted(byId(id))
+                            }
+                        }
+                    }
+                }
+                outcome
+            })
+        }
+
+        // Follow graph keyed by stable IDs; repeats are idempotent successes.
+        follow: (followerId, followedId) => {
+            write(() => {
+                result: null
+                if(byId(followerId) === null) { result = Follows.rejected("follower", "not found") } else {
+                    if(byId(followedId) === null) { result = Follows.rejected("profile", "not found") } else {
+                        if(followerId == followedId) {
+                            result = Follows.rejected("profile", "cannot follow yourself")
+                        } else {
+                            if(following(followerId, followedId)) { result = Follows.accepted(false) } else {
+                                exactlyOne(database.execute("INSERT INTO follows (follower_id, followed_id) VALUES (?1, ?2)",
+                                    [followerId, followedId]))
+                                result = Follows.accepted(true)
+                            }
+                        }
+                    }
+                }
+                result
+            })
+        }
+
+        unfollow: (followerId, followedId) => {
+            write(() => {
+                result: null
+                if(byId(followerId) === null) { result = Follows.rejected("follower", "not found") } else {
+                    if(byId(followedId) === null) { result = Follows.rejected("profile", "not found") } else {
+                        if(following(followerId, followedId)) {
+                            exactlyOne(database.execute("DELETE FROM follows WHERE follower_id = ?1 AND followed_id = ?2",
+                                [followerId, followedId]))
+                            result = Follows.accepted(true)
+                        } else { result = Follows.accepted(false) }
+                    }
+                }
+                result
+            })
+        }
+
+        isFollowingIdentity: (followerId, followedId) => { following(followerId, followedId) }
+
+        followingIdentityIdsFor: (followerId) => {
+            idsFrom(database.rows("SELECT followed_id FROM follows WHERE follower_id = ?1 ORDER BY rowid", [followerId]))
+        }
+
+        followerIdentityIdsFor: (followedId) => {
+            idsFrom(database.rows("SELECT follower_id FROM follows WHERE followed_id = ?1 ORDER BY rowid", [followedId]))
+        }
+
+        articleOwnerId: (slug) => { articleOwner(slug) }
+        commentOwnerId: (slug, id) => { commentOwner(slug, id) }
+
+        /// Same checks and order as MemoryStore + ContentStore. The caller
+        /// supplies a collision-free slug and the ISO8601 creation time.
+        createArticle: (authorId, slug, title, description, body, tags, time) => {
+            write(() => {
+                outcome: null
+                if(articleRow(slug) !== null) {
+                    outcome = Content.rejected("slug", "has already been taken")
+                } else {
+                    if(byId(authorId) === null) { outcome = Content.rejected("user", "not found") } else {
+                        if(slug == "") { outcome = Content.rejected("slug", "can't be blank") } else {
+                            outcome = Content.validFields(title, description, body)
+                            if(outcome === null) {
+                                exactlyOne(database.execute("INSERT INTO articles (slug, author_id, title, description, body, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                                    [slug, authorId, title, description, body, time]))
+                                insertTags(slug, tags)
+                                outcome = Content.accepted(findArticle(slug))
+                            }
+                        }
+                    }
+                }
+                outcome
+            })
+        }
+
+        /// null arguments mean "not supplied"; [] clears every tag. The slug
+        /// and createdAt never change; updatedAt changes only on success.
+        updateArticle: (actorId, slug, title, description, body, tags, time) => {
+            write(() => {
+                rows: database.rows("SELECT author_id, title, description, body FROM articles WHERE slug = ?1", [slug])
+                outcome: Content.rejected("article", "not found")
+                if(rows.size() > 0) {
+                    record: rows[0]
+                    if(record[0] != actorId) { outcome = Content.rejected("article", "not owned") } else {
+                        nextTitle: record[1]
+                        nextDescription: record[2]
+                        nextBody: record[3]
+                        if(title !== null) { nextTitle = title }
+                        if(description !== null) { nextDescription = description }
+                        if(body !== null) { nextBody = body }
+                        outcome = Content.validFields(nextTitle, nextDescription, nextBody)
+                        if(outcome === null) {
+                            exactlyOne(database.execute("UPDATE articles SET title = ?2, description = ?3, body = ?4, updated_at = ?5 WHERE slug = ?1",
+                                [slug, nextTitle, nextDescription, nextBody, time]))
+                            if(tags !== null) {
+                                database.execute("DELETE FROM article_tags WHERE article_slug = ?1", [slug])
+                                insertTags(slug, tags)
+                            }
+                            outcome = Content.accepted(findArticle(slug))
+                        }
+                    }
+                }
+                outcome
+            })
+        }
+
+        /// Deletes the article with its tags, comments and favorite edges in
+        /// one transaction. The ON DELETE CASCADE clauses are the safety net.
+        deleteArticle: (actorId, slug) => {
+            write(() => {
+                owner: articleOwner(slug)
+                outcome: Content.rejected("article", "not found")
+                if(owner !== null) {
+                    if(owner != actorId) { outcome = Content.rejected("article", "not owned") } else {
+                        database.execute("DELETE FROM favorites WHERE article_slug = ?1", [slug])
+                        database.execute("DELETE FROM comments WHERE article_slug = ?1", [slug])
+                        database.execute("DELETE FROM article_tags WHERE article_slug = ?1", [slug])
+                        exactlyOne(database.execute("DELETE FROM articles WHERE slug = ?1", [slug]))
+                        outcome = Content.accepted(true)
+                    }
+                }
+                outcome
+            })
+        }
+
+        /// AUTOINCREMENT keeps comment IDs persistent and never reused.
+        createComment: (actorId, slug, body, time) => {
+            write(() => {
+                outcome: Content.rejected("article", "not found")
+                if(articleRow(slug) !== null) {
+                    if(byId(actorId) === null) { outcome = Content.rejected("user", "not found") } else {
+                        if(body == "") { outcome = Content.rejected("body", "can't be blank") } else {
+                            exactlyOne(database.execute("INSERT INTO comments (article_slug, author_id, body, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+                                [slug, actorId, body, time]))
+                            id: database.lastInsertId()
+                            outcome = Content.accepted(commentFrom(
+                                database.rows(commentColumns + " WHERE c.id = ?1", [id])[0]))
+                        }
+                    }
+                }
+                outcome
+            })
+        }
+
+        deleteComment: (actorId, slug, id) => {
+            write(() => {
+                outcome: Content.rejected("article", "not found")
+                if(articleRow(slug) !== null) {
+                    owner: commentOwner(slug, id)
+                    outcome = Content.rejected("comment", "not found")
+                    if(owner !== null) {
+                        if(owner != actorId) { outcome = Content.rejected("comment", "not owned") } else {
+                            exactlyOne(database.execute("DELETE FROM comments WHERE article_slug = ?1 AND id = ?2", [slug, id]))
+                            outcome = Content.accepted(true)
+                        }
+                    }
+                }
+                outcome
+            })
+        }
+
+        commentsFor: (slug) => {
+            result: []
+            for(row in database.rows(commentColumns + " WHERE c.article_slug = ?1 ORDER BY c.id", [slug])) {
+                result = Arrays.append(result, commentFrom(row))
+            }
+            result
+        }
+
+        // Favorite edges keyed by stable IDs; repeats never change the count.
+        favorite: (actorId, slug) => {
+            write(() => {
+                outcome: null
+                if(byId(actorId) === null) { outcome = Favorites.rejected("user", "not found") } else {
+                    if(articleRow(slug) === null) { outcome = Favorites.rejected("article", "not found") } else {
+                        if(favorited(actorId, slug)) { outcome = Favorites.accepted(false) } else {
+                            exactlyOne(database.execute("INSERT INTO favorites (user_id, article_slug) VALUES (?1, ?2)", [actorId, slug]))
+                            outcome = Favorites.accepted(true)
+                        }
+                    }
+                }
+                outcome
+            })
+        }
+
+        unfavorite: (actorId, slug) => {
+            write(() => {
+                outcome: null
+                if(byId(actorId) === null) { outcome = Favorites.rejected("user", "not found") } else {
+                    if(articleRow(slug) === null) { outcome = Favorites.rejected("article", "not found") } else {
+                        if(favorited(actorId, slug)) {
+                            exactlyOne(database.execute("DELETE FROM favorites WHERE user_id = ?1 AND article_slug = ?2", [actorId, slug]))
+                            outcome = Favorites.accepted(true)
+                        } else { outcome = Favorites.accepted(false) }
+                    }
+                }
+                outcome
+            })
+        }
+
+        isFavoritedByIdentity: (actorId, slug) => { favorited(actorId, slug) }
+
+        favoriteSlugsForIdentity: (actorId) => {
+            idsFrom(database.rows("SELECT article_slug FROM favorites WHERE user_id = ?1 ORDER BY rowid", [actorId]))
+        }
+
+        /// Public ?favorited=username resolves the current identity by name.
+        favoriteSlugsFor: (username) => {
+            slugs: []
+            actor: byUsername(username)
+            if(actor !== null) { slugs = store.favoriteSlugsForIdentity(actor.id) }
+            slugs
+        }
+
+        /// Followed authors' articles, filtered/sorted/paged by ArticleQuery.
+        feedForIdentity: (viewerId, options) => {
+            result: {
+                ok: false
+                page: []
+                total: 0
+                field: "user"
+                message: "not found"
+            }
+            if(byId(viewerId) !== null) {
+                selected: ArticleQuery.select(articlesWhere(
+                    " WHERE a.author_id IN (SELECT followed_id FROM follows WHERE follower_id = ?1)",
+                    [viewerId]), options, [])
+                result = {
+                    ok: true
+                    page: selected.page
+                    total: selected.total
+                    field: null
+                    message: null
+                }
+            }
+            result
+        }
+
+        /// A fresh Array of fresh article objects on every call.
+        all: () => { articlesWhere("", []) }
+
+        find: (slug) => { findArticle(slug) }
+
+        /// Distinct tags in first-seen order across articles, as MemoryStore.
+        tags: () => {
+            names: []
+            for(item in store.all()) {
+                for(tag in item.tagList) {
+                    if(!Arrays.contains(names, tag)) { names = Arrays.append(names, tag) }
+                }
+            }
+            names
+        }
+    }
+
+    store
+}

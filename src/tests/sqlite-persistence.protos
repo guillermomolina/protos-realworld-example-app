@@ -1,0 +1,295 @@
+//! Persistent repository tests against the real std:sqlite library.
+//!
+//! Run through src/sqlite-test-main.protos (make test-sqlite), which requires
+//! the optional FFM provider and --allow-library sqlite3=libsqlite3.so.0. The
+//! caller supplies a fresh temporary directory; each test uses its own file.
+//! There is no SQLite simulator: every assertion reads back real database rows.
+Assertions: import("std:test/assertions")
+SQLite: import("std:sqlite")
+ArticleQuery: import("../app/ArticleQuery.protos")
+SqliteDatabase: import("../app/SqliteDatabase.protos")
+SqliteStore: import("../app/SqliteStore.protos")
+SqliteCredentials: import("../app/SqliteCredentials.protos")
+Identities: import("../app/IdentityStore.protos")
+
+/// Open, configure and initialize; fail the test on any rejection label.
+ready: (path, allowCreate) => {
+    database: SqliteDatabase.open(path, allowCreate)
+    Assertions.require(database.configure() === null)
+    Assertions.require(database.initialize() === null)
+    Assertions.require(database.usable())
+    database
+}
+
+signals: (operation) => {
+    signaled: false
+    Error.handle(
+        () => { operation() },
+        (failure) => {
+            signaled = true
+            failure
+        }
+    )
+    signaled
+}
+
+run: (directory) => {
+    path: directory + "/persistence.db"
+    t1: "2026-11-22T10:00:00Z"
+    t2: "2026-11-22T10:00:01.5Z"
+    t3: "2026-11-22T10:00:01.25Z"
+
+    // Invalid names never reach SQLite and never fall back to memory.
+    for(name in ["", ":memory:", "file:x.db", 42, null]) {
+        Assertions.require(!SqliteDatabase.acceptablePath(name))
+        Assertions.require(signals(() => { SqliteDatabase.open(name, true) }))
+    }
+    // Without creation authority an absent file is not created.
+    Assertions.require(signals(() => { SqliteDatabase.open(directory + "/absent.db", false) }))
+
+    // Initial schema creation, connection policy and empty contents.
+    database: ready(path, true)
+    Assertions.require(database.rows("PRAGMA user_version", [])[0][0] == 1)
+    Assertions.require(database.rows("PRAGMA journal_mode", [])[0][0] == "wal")
+    Assertions.require(database.rows("PRAGMA synchronous", [])[0][0] == 2)
+    Assertions.require(database.rows("PRAGMA foreign_keys", [])[0][0] == 1)
+    store: SqliteStore.create(database)
+    credentials: SqliteCredentials.create(database)
+    Assertions.require(store.all().size() == 0)
+    Assertions.require(store.tags().size() == 0)
+
+    // Parameterized TEXT and NULL remain distinct, including hostile text.
+    typed: database.rows("SELECT ?1, typeof(?1), ?2, typeof(?2), ?3", ["x'); DROP TABLE users; --", null, ""])[0]
+    Assertions.require(typed[0] == "x'); DROP TABLE users; --")
+    Assertions.require(typed[1] == "text")
+    Assertions.require(typed[2] === null)
+    Assertions.require(typed[3] == "null")
+    Assertions.require(typed[4] == "")
+    Assertions.require(database.statementsInCustody() == 0)
+
+    // Stable IDs and exact, case-sensitive uniqueness.
+    alice: store.admitIdentity("alice", "alice@example.test")
+    Assertions.require(alice.ok && (alice.value.id == 1))
+    bob: store.admitIdentity("bob", "bob@example.test")
+    Assertions.require(bob.ok && (bob.value.id == 2))
+    Assertions.require(store.admitIdentity("alice", "other@example.test").field == "username")
+    Assertions.require(store.admitIdentity("other", "alice@example.test").field == "email")
+    Assertions.require(store.admitIdentity("", "blank@example.test").message == "can't be blank")
+    Assertions.require(store.admitIdentity("Alice", "Alice@example.test").ok)
+    Assertions.require(store.identityByUsername("Alice").id == 3)
+    Assertions.require(store.identityByUsername("ALICE") === null)
+    Assertions.require(store.identityById(1).bio === null)
+    profile: store.findProfile("alice")
+    Assertions.require(!profile.hasSlot("id") && !profile.hasSlot("email"))
+
+    // Credential rows persist subject, verifier and generation.
+    database.transaction(() => {
+        credentials.insert(1, "subject-alice", "verifier-alice", 1)
+        credentials.insert(2, "subject-bob", "verifier-bob", 1)
+        { ok: true }
+    })
+    // Inserts outside a transaction are refused before writing.
+    Assertions.require(signals(() => { credentials.insert(3, "subject-x", "verifier-x", 1) }))
+    Assertions.require(credentials.byId(3) === null)
+    Assertions.require(credentials.bySubject("subject-alice").id == 1)
+
+    // Articles, ordered tags (duplicates kept), comments and relations.
+    created: store.createArticle(1, "first", "First", "D", "B", ["b", "a", "b"], t1)
+    Assertions.require(created.ok)
+    Assertions.require(created.value.tagList.size() == 3)
+    Assertions.require(created.value.tagList[0] == "b")
+    Assertions.require(created.value.favoritesCount == 0)
+    Assertions.require(store.createArticle(1, "first", "Again", "D", "B", [], t1).field == "slug")
+    Assertions.require(store.createArticle(99, "ghost", "T", "D", "B", [], t1).field == "user")
+    Assertions.require(store.createArticle(1, "blank", "", "D", "B", [], t1).field == "title")
+    Assertions.require(store.createArticle(2, "second", "Second", "D", "B", ["c"], t2).ok)
+    Assertions.require(store.createArticle(2, "third", "Third", "D", "B", [], t3).ok)
+    comment1: store.createComment(2, "first", "Nice", t2)
+    Assertions.require(comment1.ok && (comment1.value.id == 1))
+    Assertions.require(comment1.value.author.username == "bob")
+    Assertions.require(store.createComment(1, "first", "", t2).field == "body")
+    Assertions.require(store.createComment(1, "missing", "x", t2).field == "article")
+
+    Assertions.require(store.follow(2, 1).changed)
+    Assertions.require(store.follow(2, 1).ok && !store.follow(2, 1).changed)
+    Assertions.require(store.follow(1, 1).message == "cannot follow yourself")
+    Assertions.require(store.follow(2, 99).field == "profile")
+    Assertions.require(store.follow(1, 2).changed)
+    Assertions.require(store.unfollow(1, 2).changed)
+    Assertions.require(store.unfollow(1, 2).ok && !store.unfollow(1, 2).changed)
+    Assertions.require(store.isFollowingIdentity(2, 1))
+    Assertions.require(!store.isFollowingIdentity(1, 2))
+    Assertions.require(store.followerIdentityIdsFor(1)[0] == 2)
+
+    // Idempotent favorites and derived counts.
+    Assertions.require(store.favorite(2, "first").changed)
+    Assertions.require(!store.favorite(2, "first").changed)
+    Assertions.require(store.favorite(1, "first").changed)
+    Assertions.require(store.find("first").favoritesCount == 2)
+    Assertions.require(store.unfavorite(1, "first").changed)
+    Assertions.require(!store.unfavorite(1, "first").changed)
+    Assertions.require(store.find("first").favoritesCount == 1)
+    Assertions.require(store.favorite(2, "missing").field == "article")
+    Assertions.require(store.favoriteSlugsFor("bob")[0] == "first")
+    Assertions.require(store.isFavoritedByIdentity(2, "first"))
+
+    // Instant ordering across fractional precisions; total before paging.
+    listed: ArticleQuery.select(store.all(), ArticleQuery.read("limit=2"), [])
+    Assertions.require(listed.total == 3)
+    Assertions.require(listed.page[0].slug == "second")
+    Assertions.require(listed.page[1].slug == "third")
+    feed: store.feedForIdentity(2, ArticleQuery.read(null))
+    Assertions.require(feed.ok && (feed.total == 1) && (feed.page[0].slug == "first"))
+    Assertions.require(!store.feedForIdentity(99, ArticleQuery.read(null)).ok)
+    Assertions.require(store.tags().size() == 3)
+
+    // Update keeps slug/createdAt, null means unchanged, [] clears tags.
+    Assertions.require(store.updateArticle(2, "first", "X", null, null, null, t3).message == "not owned")
+    Assertions.require(store.updateArticle(1, "missing", "X", null, null, null, t3).message == "not found")
+    Assertions.require(store.updateArticle(1, "first", "", null, null, null, t3).field == "title")
+    Assertions.require(store.find("first").updatedAt == t1)
+    updated: store.updateArticle(1, "first", "Renamed", null, null, [], t3)
+    Assertions.require(updated.ok)
+    Assertions.require(updated.value.slug == "first")
+    Assertions.require(updated.value.title == "Renamed")
+    Assertions.require(updated.value.description == "D")
+    Assertions.require(updated.value.createdAt == t1)
+    Assertions.require(updated.value.updatedAt == t3)
+    Assertions.require(updated.value.tagList.size() == 0)
+
+    // Renaming keeps the ID and every relation.
+    Assertions.require(store.replaceIdentity(1, "bob", "a@example.test", null, null).field == "username")
+    renamed: store.replaceIdentity(1, "alice-new", "alice-new@example.test", "bio", "")
+    Assertions.require(renamed.ok && (renamed.value.id == 1))
+    Assertions.require(renamed.value.image === null)
+    Assertions.require(store.find("first").author.username == "alice-new")
+    Assertions.require(store.isFollowingIdentity(2, 1))
+    Assertions.require(store.articleOwnerId("first") == 1)
+    Assertions.require(store.identityByUsername("alice") === null)
+
+    // Comment IDs are not reused after deletion.
+    comment2: store.createComment(1, "first", "Second", t3)
+    Assertions.require(comment2.value.id == 2)
+    Assertions.require(store.deleteComment(1, "first", 1).message == "not owned")
+    Assertions.require(store.deleteComment(2, "first", 1).ok)
+    Assertions.require(store.deleteComment(2, "first", 1).message == "not found")
+    comment3: store.createComment(2, "first", "Third", t3)
+    Assertions.require(comment3.value.id == 3)
+    Assertions.require(store.commentOwnerId("first", 3) == 2)
+
+    // A rejected domain result rolls back every write of its transaction.
+    rejectedOutcome: database.transaction(() => {
+        store.admitIdentity("rolled-back", "rolled-back@example.test")
+        store.follow(1, 2)
+        Identities.rejected("test", "rolled back")
+    })
+    Assertions.require(!rejectedOutcome.ok)
+    Assertions.require(store.identityByUsername("rolled-back") === null)
+    Assertions.require(!store.isFollowingIdentity(1, 2))
+    // A signaled Error rolls back and propagates; the connection stays usable.
+    Assertions.require(signals(() => {
+        database.transaction(() => {
+            store.admitIdentity("interrupted", "interrupted@example.test")
+            Error().signal()
+        })
+    }))
+    Assertions.require(store.identityByUsername("interrupted") === null)
+    Assertions.require(database.usable())
+    // Nested transactions are refused rather than emulated.
+    Assertions.require(signals(() => {
+        database.transaction(() => { database.transaction(() => { { ok: true } }) })
+    }))
+    // SQLite constraints remain the final guarantee under the domain checks.
+    Assertions.require(signals(() => {
+        database.execute("INSERT INTO follows (follower_id, followed_id) VALUES (?1, ?1)", [2])
+    }))
+    Assertions.require(signals(() => {
+        database.execute("INSERT INTO favorites (user_id, article_slug) VALUES (?1, ?2)", [2, "missing"])
+    }))
+    // The primary step failure stays observable, never a later finalize error.
+    favoritesBefore: database.rows("SELECT count(*) FROM favorites", [])[0][0]
+    foreignKeyFailure: null
+    Error.handle(
+        () => { database.execute("INSERT INTO favorites (user_id, article_slug) VALUES (?1, ?2)", [2, "missing"]) },
+        (failure) => {
+            foreignKeyFailure = failure
+            failure
+        }
+    )
+    Assertions.require(foreignKeyFailure !== null)
+    Assertions.require(foreignKeyFailure.parent() === SQLite.SQLiteError)
+    Assertions.require(foreignKeyFailure.operation == "step")
+    // SQLITE_CONSTRAINT (19); the primary result code without extended bits.
+    Assertions.require((foreignKeyFailure.code % 256) == 19)
+    Assertions.require(database.usable())
+    Assertions.require(database.statementsInCustody() == 0)
+    Assertions.require(database.rows("SELECT count(*) FROM favorites", [])[0][0] == favoritesBefore)
+    Assertions.require(database.rows("SELECT count(*) FROM favorites WHERE article_slug = ?1", ["missing"])[0][0] == 0)
+    // articles.slug is NOT NULL: SQLite itself refuses a NULL key.
+    articlesBefore: database.rows("SELECT count(*) FROM articles", [])[0][0]
+    Assertions.require(signals(() => {
+        database.execute("INSERT INTO articles (slug, author_id, title, description, body, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            [null, 1, "Null slug", "D", "B", t1])
+    }))
+    Assertions.require(database.rows("SELECT count(*) FROM articles WHERE slug IS NULL", [])[0][0] == 0)
+    Assertions.require(database.rows("SELECT count(*) FROM articles", [])[0][0] == articlesBefore)
+    Assertions.require(database.usable())
+    Assertions.require(database.statementsInCustody() == 0)
+    Assertions.require(database.close())
+
+    // Every operation after close is refused; close is repeatable.
+    Assertions.require(!database.usable())
+    Assertions.require(signals(() => { database.rows("SELECT 1", []) }))
+    Assertions.require(signals(() => { store.identityById(1) }))
+    Assertions.require(database.close())
+
+    // Reopen without creation authority: same rows, IDs and relations.
+    reopened: ready(path, false)
+    again: SqliteStore.create(reopened)
+    againCredentials: SqliteCredentials.create(reopened)
+    Assertions.require(again.identityByUsername("alice-new").id == 1)
+    Assertions.require(again.identityByUsername("bob").id == 2)
+    Assertions.require(again.identityById(1).bio == "bio")
+    Assertions.require(againCredentials.byId(1).subject == "subject-alice")
+    Assertions.require(againCredentials.byId(1).verifier == "verifier-alice")
+    Assertions.require(againCredentials.byId(1).generation == 1)
+    Assertions.require(again.find("first").createdAt == t1)
+    Assertions.require(again.find("first").favoritesCount == 1)
+    Assertions.require(again.find("second").tagList[0] == "c")
+    Assertions.require(again.commentsFor("first").size() == 2)
+    Assertions.require(again.isFollowingIdentity(2, 1))
+    Assertions.require(again.all().size() == 3)
+    nextComment: again.createComment(2, "first", "After reopen", t3)
+    Assertions.require(nextComment.value.id == 4)
+
+    // Credential replacement advances generation exactly once per commit.
+    reopened.transaction(() => {
+        againCredentials.replace(1, "verifier-two", 1)
+        { ok: true }
+    })
+    Assertions.require(againCredentials.byId(1).generation == 2)
+    Assertions.require(signals(() => {
+        reopened.transaction(() => {
+            againCredentials.replace(1, "verifier-stale", 1)
+            { ok: true }
+        })
+    }))
+    Assertions.require(againCredentials.byId(1).verifier == "verifier-two")
+
+    // Article deletion removes tags, comments and favorite edges.
+    Assertions.require(again.deleteArticle(2, "first").message == "not owned")
+    Assertions.require(again.deleteArticle(1, "first").ok)
+    Assertions.require(again.find("first") === null)
+    Assertions.require(again.commentsFor("first").size() == 0)
+    Assertions.require(again.favoriteSlugsForIdentity(2).size() == 0)
+    Assertions.require(reopened.rows("SELECT count(*) FROM article_tags WHERE article_slug = ?1", ["first"])[0][0] == 0)
+    Assertions.require(again.deleteArticle(1, "first").message == "not found")
+    Assertions.require(reopened.close())
+
+    // The same file opened again with creation authority is validated, not
+    // recreated: its data is preserved.
+    third: ready(path, true)
+    Assertions.require(SqliteStore.create(third).identityByUsername("bob").id == 2)
+    Assertions.require(third.close())
+    true
+}

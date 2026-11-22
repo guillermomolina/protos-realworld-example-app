@@ -1,0 +1,506 @@
+//! RootActor-owned SQLite Connection for the RealWorld application.
+//!
+//! This module is the only place that holds the native Connection. It opens an
+//! explicitly named database file, applies the fixed connection policy, creates
+//! or validates schema version 1 and runs synchronous application transactions.
+//! The repositories (SqliteStore, SqliteCredentials) receive copied rows only:
+//! Connection and Statement objects never leave this module or this Actor.
+//!
+//! Lifecycle states: "open" -> "configured" -> "ready" -> "closed". A COMMIT
+//! whose outcome is uncertain moves the database to "failed": every later read,
+//! write or transaction is refused, and the service must stop serving.
+//!
+//! Policy applied before any application transaction:
+//!   busyTimeout(1000)        fixed wait for qualifying lock contention only;
+//!   journal_mode=WAL         persistent database setting, verified as "wal";
+//!   synchronous=FULL         per-connection setting, verified as 2;
+//!   foreign_keys=ON          per-connection setting, verified as 1 outside a
+//!                            transaction (SQLite ignores it inside one).
+//!
+//! Every Statement is closed by `ensure` immediately after use, so no Statement
+//! is alive when COMMIT runs. Connection close also retires any remaining
+//! Statement and never commits an unfinished transaction.
+SQLite: import("std:sqlite")
+Arrays: import("std:collections/array")
+
+/// Schema version written to PRAGMA user_version by initialization.
+schemaVersion: 1
+
+/// Exact CREATE statements, stored by SQLite verbatim in sqlite_master. Sorted
+/// by object name, the order used by validation below. Text columns use the
+/// default BINARY collation: username/email comparison stays case-sensitive.
+schemaObjects: () => {
+    [
+        ["table", "article_tags", "article_tags",
+            "CREATE TABLE article_tags (article_slug TEXT NOT NULL REFERENCES articles(slug) ON DELETE CASCADE, position INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY (article_slug, position))"],
+        ["table", "articles", "articles",
+            "CREATE TABLE articles (slug TEXT NOT NULL PRIMARY KEY, author_id INTEGER NOT NULL REFERENCES users(id), title TEXT NOT NULL, description TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"],
+        ["table", "comments", "comments",
+            "CREATE TABLE comments (id INTEGER PRIMARY KEY AUTOINCREMENT, article_slug TEXT NOT NULL REFERENCES articles(slug) ON DELETE CASCADE, author_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"],
+        ["table", "credentials", "credentials",
+            "CREATE TABLE credentials (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, subject TEXT NOT NULL UNIQUE, verifier TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation >= 1))"],
+        ["table", "favorites", "favorites",
+            "CREATE TABLE favorites (user_id INTEGER NOT NULL REFERENCES users(id), article_slug TEXT NOT NULL REFERENCES articles(slug) ON DELETE CASCADE, PRIMARY KEY (user_id, article_slug))"],
+        ["table", "follows", "follows",
+            "CREATE TABLE follows (follower_id INTEGER NOT NULL REFERENCES users(id), followed_id INTEGER NOT NULL REFERENCES users(id), PRIMARY KEY (follower_id, followed_id), CHECK(follower_id != followed_id))"],
+        // Feed selection by author, comment listing by article, follower lists
+        // and favorite counts. Primary keys already cover the other lookups.
+        ["index", "idx_articles_author", "articles",
+            "CREATE INDEX idx_articles_author ON articles(author_id)"],
+        ["index", "idx_comments_article", "comments",
+            "CREATE INDEX idx_comments_article ON comments(article_slug)"],
+        ["index", "idx_favorites_article", "favorites",
+            "CREATE INDEX idx_favorites_article ON favorites(article_slug)"],
+        ["index", "idx_follows_followed", "follows",
+            "CREATE INDEX idx_follows_followed ON follows(followed_id)"],
+        ["table", "users", "users",
+            "CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, email TEXT NOT NULL UNIQUE, bio TEXT, image TEXT)"]
+    ]
+}
+
+/// PRAGMA table_info expectations: [column, declared type, notnull, pk index].
+schemaColumns: () => {
+    [
+        ["users", [["id", "INTEGER", 0, 1], ["username", "TEXT", 1, 0],
+            ["email", "TEXT", 1, 0], ["bio", "TEXT", 0, 0], ["image", "TEXT", 0, 0]]],
+        ["credentials", [["user_id", "INTEGER", 0, 1], ["subject", "TEXT", 1, 0],
+            ["verifier", "TEXT", 1, 0], ["generation", "INTEGER", 1, 0]]],
+        ["articles", [["slug", "TEXT", 1, 1], ["author_id", "INTEGER", 1, 0],
+            ["title", "TEXT", 1, 0], ["description", "TEXT", 1, 0], ["body", "TEXT", 1, 0],
+            ["created_at", "TEXT", 1, 0], ["updated_at", "TEXT", 1, 0]]],
+        ["article_tags", [["article_slug", "TEXT", 1, 1], ["position", "INTEGER", 1, 2],
+            ["name", "TEXT", 1, 0]]],
+        ["comments", [["id", "INTEGER", 0, 1], ["article_slug", "TEXT", 1, 0],
+            ["author_id", "INTEGER", 1, 0], ["body", "TEXT", 1, 0],
+            ["created_at", "TEXT", 1, 0], ["updated_at", "TEXT", 1, 0]]],
+        ["follows", [["follower_id", "INTEGER", 1, 1], ["followed_id", "INTEGER", 1, 2]]],
+        ["favorites", [["user_id", "INTEGER", 1, 1], ["article_slug", "TEXT", 1, 2]]]
+    ]
+}
+
+/// PRAGMA foreign_key_list expectations: [from, parent table, to, on_delete].
+schemaForeignKeys: () => {
+    [
+        ["users", []],
+        ["credentials", [["user_id", "users", "id", "CASCADE"]]],
+        ["articles", [["author_id", "users", "id", "NO ACTION"]]],
+        ["article_tags", [["article_slug", "articles", "slug", "CASCADE"]]],
+        ["comments", [["article_slug", "articles", "slug", "CASCADE"],
+            ["author_id", "users", "id", "NO ACTION"]]],
+        ["follows", [["follower_id", "users", "id", "NO ACTION"],
+            ["followed_id", "users", "id", "NO ACTION"]]],
+        ["favorites", [["user_id", "users", "id", "NO ACTION"],
+            ["article_slug", "articles", "slug", "CASCADE"]]]
+    ]
+}
+
+/// Single-column uniqueness the application relies on: [table, column].
+schemaUnique: () => {
+    [["users", "username"], ["users", "email"], ["credentials", "subject"]]
+}
+
+/// A database name must be an explicit, non-empty filename. In-memory and URI
+/// names are refused here, before any native call; there is no fallback.
+acceptablePath: (path) => {
+    answer: false
+    if(String.recognizes(path)) {
+        if((path != "") && (path != ":memory:")) {
+            octets: Encoding.UTF8.encode(path)
+            answer = true
+            for(octet in octets) {
+                if(octet == 0) { answer = false }
+            }
+            // Refuse SQLite URI filenames ("file:...").
+            if(octets.size() >= 5) {
+                if((octets[0] == 102) && (octets[1] == 105) && (octets[2] == 108) &&
+                   (octets[3] == 101) && (octets[4] == 58)) {
+                    answer = false
+                }
+            }
+        }
+    }
+    answer
+}
+
+/// Open an explicitly named database file. allowCreate must be exactly true
+/// for "readWriteCreate"; otherwise an absent file fails in "readWrite" mode.
+/// The returned object keeps the Connection private to this Actor.
+open: (path, allowCreate) => {
+    if(!acceptablePath(path)) { Error().signal() }
+    if(!((allowCreate === true) || (allowCreate === false))) { Error().signal() }
+    mode: "readWrite"
+    if(allowCreate) { mode = "readWriteCreate" }
+    custody(SQLite.openFile(path, mode), allowCreate)
+}
+
+custody: (connection, allowCreate) => {
+    state: "open"
+    openStatements: 0
+    transactionActive: false
+
+    requireState: (expected) => {
+        if(state != expected) { Error().signal() }
+        true
+    }
+
+    // Bind positional parameters, use the Statement, then close it on every
+    // exit. Closing happens before the caller continues, so a transaction body
+    // never leaves a live Statement behind when COMMIT is attempted.
+    withStatement: (sql, parameters, use) => {
+        if((state == "closed") || (state == "failed")) { Error().signal() }
+        statement: connection.prepare(sql)
+        if(statement === null) { Error().signal() }
+        openStatements = openStatements + 1
+        result: null
+        // The first failure (bind, step, callback) stays the observable Error;
+        // a later finalize failure propagates only when nothing failed before.
+        primary: null
+        (() => {
+            Error.handle(() => {
+                index: 1
+                for(value in parameters) {
+                    statement.bind(index, value)
+                    index = index + 1
+                }
+                result = use(statement)
+            }, (error) => {
+                primary = error
+                error.signal()
+            })
+        }).ensure(() => {
+            openStatements = openStatements - 1
+            Error.handle(() => statement.close().value(), (error) => {
+                if(primary === null) { error.signal() }
+            })
+        })
+        result
+    }
+
+    // Copied rows: each row is an ordinary Array, independent of native state.
+    query: (sql, parameters) => {
+        withStatement(sql, parameters, (statement) => {
+            rows: []
+            statement.each((row) => { rows = Arrays.append(rows, row) })
+            rows
+        })
+    }
+
+    run: (sql, parameters) => {
+        withStatement(sql, parameters, (statement) => {
+            more: statement.step()
+            while(more) { more = statement.step() }
+            null
+        })
+        query("SELECT changes()", [])[0][0]
+    }
+
+    scalar: (sql) => {
+        rows: query(sql, [])
+        answer: null
+        if(rows.size() > 0) { answer = rows[0][0] }
+        answer
+    }
+
+    sameText: (left, right) => {
+        (left !== null) && (right !== null) && (left == right)
+    }
+
+    // Release a transaction left open by a failure, preserving the caller's
+    // primary error. A failed rollback leaves the connection untrustworthy.
+    abandon: () => {
+        transactionActive = false
+        Error.handle(
+            () => {
+                if(connection.inTransaction()) { connection.rollback() }
+            },
+            (cleanup) => {
+                state = "failed"
+                cleanup
+            }
+        )
+        true
+    }
+
+    validateObjects: () => {
+        expected: schemaObjects()
+        actual: query("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE substr(name, 1, 7) != 'sqlite_' ORDER BY name", [])
+        matches: actual.size() == expected.size()
+        if(matches) {
+            for(index, 0, expected.size()) {
+                for(column, 0, 4) {
+                    if(!sameText(actual[index][column], expected[index][column])) {
+                        matches = false
+                    }
+                }
+            }
+        }
+        matches
+    }
+
+    validateColumns: () => {
+        matches: true
+        for(entry in schemaColumns()) {
+            actual: query("PRAGMA table_info(\"" + entry[0] + "\")", [])
+            wanted: entry[1]
+            if(actual.size() != wanted.size()) { matches = false } else {
+                for(index, 0, wanted.size()) {
+                    row: actual[index]
+                    column: wanted[index]
+                    if(!(sameText(row[1], column[0]) && sameText(row[2], column[1]) &&
+                         (row[3] == column[2]) && (row[5] == column[3]))) {
+                        matches = false
+                    }
+                }
+            }
+        }
+        matches
+    }
+
+    validateForeignKeys: () => {
+        matches: true
+        for(entry in schemaForeignKeys()) {
+            actual: query("PRAGMA foreign_key_list(\"" + entry[0] + "\")", [])
+            wanted: entry[1]
+            if(actual.size() != wanted.size()) { matches = false } else {
+                for(key in wanted) {
+                    present: false
+                    for(row in actual) {
+                        if(sameText(row[3], key[0]) && sameText(row[2], key[1]) &&
+                           sameText(row[4], key[2]) && sameText(row[6], key[3])) {
+                            present = true
+                        }
+                    }
+                    if(!present) { matches = false }
+                }
+            }
+        }
+        matches
+    }
+
+    validateUnique: () => {
+        matches: true
+        for(entry in schemaUnique()) {
+            present: false
+            for(index in query("PRAGMA index_list(\"" + entry[0] + "\")", [])) {
+                if((index[2] == 1) && (index[4] == 0)) {
+                    columns: query("PRAGMA index_info(\"" + index[1] + "\")", [])
+                    if((columns.size() == 1) && sameText(columns[0][2], entry[1])) {
+                        present = true
+                    }
+                }
+            }
+            if(!present) { matches = false }
+        }
+        matches
+    }
+
+    // A brand-new empty file receives the whole schema and its version in one
+    // transaction. Failure rolls everything back; nothing is partially created.
+    createSchema: () => {
+        connection.begin()
+        transactionActive = true
+        Error.handle(
+            () => {
+                for(object in schemaObjects()) { run(object[3], []) }
+                run("PRAGMA user_version=1", [])
+            },
+            (failure) => {
+                abandon()
+                failure.signal()
+            }
+        )
+        if(openStatements != 0) {
+            abandon()
+            Error().signal()
+        }
+        commitFailure: null
+        Error.handle(
+            () => { connection.commit() },
+            (failure) => {
+                commitFailure = failure
+                failure
+            }
+        )
+        transactionActive = false
+        if(commitFailure !== null) {
+            state = "failed"
+            Error.handle(
+                () => {
+                    if(connection.inTransaction()) { connection.rollback() }
+                },
+                (cleanup) => { cleanup }
+            )
+            commitFailure.signal()
+        }
+        true
+    }
+
+    database: {
+        /// Apply and verify the fixed connection policy. Answers null on
+        /// success, otherwise a fixed reason label without native details.
+        configure: () => {
+            requireState("open")
+            reason: null
+            connection.busyTimeout(1000)
+            journal: scalar("PRAGMA journal_mode=WAL")
+            if(!sameText(journal, "wal")) { reason = "journal_mode_not_wal" }
+            if(reason === null) {
+                run("PRAGMA synchronous=FULL", [])
+                if(scalar("PRAGMA synchronous") != 2) { reason = "synchronous_not_full" }
+            }
+            if(reason === null) {
+                if(connection.inTransaction()) { reason = "unexpected_open_transaction" } else {
+                    run("PRAGMA foreign_keys=ON", [])
+                    if(scalar("PRAGMA foreign_keys") != 1) { reason = "foreign_keys_not_enabled" }
+                }
+            }
+            if(reason === null) { state = "configured" }
+            reason
+        }
+
+        /// Create schema version 1 in an authorized, empty database, or
+        /// validate an existing one. Answers null when requests may be admitted,
+        /// otherwise a fixed reason label. Existing data is never deleted.
+        initialize: () => {
+            requireState("configured")
+            reason: null
+            version: scalar("PRAGMA user_version")
+            if(version == 0) {
+                if(scalar("SELECT count(*) FROM sqlite_master") != 0) {
+                    reason = "unrecognized_database_content"
+                } else {
+                    if(!allowCreate) { reason = "database_not_initialized" } else {
+                        createSchema()
+                        version = scalar("PRAGMA user_version")
+                    }
+                }
+            }
+            if((reason === null) && (version != schemaVersion)) {
+                reason = "schema_version_unsupported"
+            }
+            if(reason === null) {
+                if(!(validateObjects() && validateColumns() && validateForeignKeys() && validateUnique())) {
+                    reason = "schema_mismatch"
+                }
+            }
+            if(reason === null) {
+                integrity: query("PRAGMA integrity_check", [])
+                if(!((integrity.size() == 1) && sameText(integrity[0][0], "ok"))) {
+                    reason = "integrity_check_failed"
+                }
+            }
+            if(reason === null) {
+                if(query("PRAGMA foreign_key_check", []).size() != 0) {
+                    reason = "foreign_key_check_failed"
+                }
+            }
+            if(reason === null) { state = "ready" }
+            reason
+        }
+
+        /// Copied result rows for parameterized SQL. Never opens a write
+        /// transaction by itself.
+        rows: (sql, parameters) => {
+            requireState("ready")
+            query(sql, parameters)
+        }
+
+        /// Execute one parameterized statement; answers SQLite's change count.
+        execute: (sql, parameters) => {
+            requireState("ready")
+            run(sql, parameters)
+        }
+
+        /// Rowid assigned by the most recent INSERT on this Connection.
+        lastInsertId: () => {
+            requireState("ready")
+            scalar("SELECT last_insert_rowid()")
+        }
+
+        /// Run operation synchronously inside BEGIN ... COMMIT. The operation
+        /// answers a domain result with an ok slot: ok=true commits, anything
+        /// else rolls back. A signaled Error rolls back and propagates. The
+        /// result is returned only after COMMIT has been confirmed by SQLite.
+        /// Callers must not wait on a Future inside operation.
+        transaction: (operation) => {
+            requireState("ready")
+            if(transactionActive || connection.inTransaction()) { Error().signal() }
+            connection.begin()
+            transactionActive = true
+            outcome: null
+            Error.handle(
+                () => { outcome = operation() },
+                (failure) => {
+                    abandon()
+                    failure.signal()
+                }
+            )
+            if(openStatements != 0) {
+                abandon()
+                Error().signal()
+            }
+            if(outcome.ok) {
+                commitFailure: null
+                Error.handle(
+                    () => { connection.commit() },
+                    (failure) => {
+                        commitFailure = failure
+                        failure
+                    }
+                )
+                transactionActive = false
+                if(commitFailure !== null) {
+                    // SQLite may or may not have rolled back. Do not assume
+                    // either, never retry: release what remains and stop writes.
+                    state = "failed"
+                    Error.handle(
+                        () => {
+                            if(connection.inTransaction()) { connection.rollback() }
+                        },
+                        (cleanup) => { cleanup }
+                    )
+                    commitFailure.signal()
+                }
+            } else {
+                rolledBack: false
+                Error.handle(
+                    () => {
+                        connection.rollback()
+                        rolledBack = true
+                    },
+                    (failure) => { failure }
+                )
+                transactionActive = false
+                if(!rolledBack) {
+                    state = "failed"
+                    Error().signal()
+                }
+            }
+            outcome
+        }
+
+        /// True while a transaction opened by transaction() is running.
+        /// Repositories use it to join that transaction instead of nesting.
+        inTransaction: () => { transactionActive }
+
+        /// False after an uncertain COMMIT, a failed rollback or close.
+        usable: () => { state == "ready" }
+
+        /// Live Statements still in custody; zero between operations.
+        statementsInCustody: () => { openStatements }
+
+        /// Close the Connection and observe its terminal Future. Remaining
+        /// Statements are finalized by the Connection; an unfinished
+        /// transaction is rolled back by SQLite, never committed.
+        close: () => {
+            if(state != "closed") {
+                state = "closed"
+                transactionActive = false
+                connection.close().value()
+            }
+            true
+        }
+    }
+
+    database
+}

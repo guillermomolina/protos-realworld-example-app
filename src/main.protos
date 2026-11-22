@@ -1,9 +1,14 @@
 //! Native HTTP entry point for the RealWorld learning application.
 //!
-//! Run with:
-//!   protos --allow-network --allow-entropy --allow-clock --service=service src/main.protos
+//! Run with (see README for building the optional FFM provider):
+//!   REALWORLD_DB_PATH=realworld.db REALWORLD_JWT_KEY_BASE64URL=... \
+//!   protos --foreign-provider-path <protos-ffm-provider.jar> \
+//!       --allow-library sqlite3=libsqlite3.so.0 \
+//!       --allow-network --allow-entropy --allow-clock --service=service src/main.protos
+//! Add REALWORLD_DB_CREATE=1 only to initialize a database that does not exist.
 //!
-//! The RootActor owns Network authority and the single mutable MemoryStore.
+//! The RootActor owns Network authority and the single SQLite Connection, the
+//! only source of truth for accounts, credentials, content and relationships.
 //! Two Worker Actors accept connections through explicitly delegated
 //! TcpAcceptor capabilities. Workers request responses from the RootActor;
 //! they cannot access its store or inherit its Network authority.
@@ -12,7 +17,8 @@
 //! application's active sessions to two, without introducing shared state.
 //!
 //! Suggested reading order for someone new to the project:
-//!   main -> HttpWorker -> Api -> Auth -> AuthStore -> MemoryStore.
+//!   main -> HttpWorker -> Api -> Auth -> AuthStore -> SqliteStore
+//!   -> SqliteCredentials -> SqliteDatabase. MemoryStore remains a test fixture.
 //! Follow Articles/Comments/Users last to see how domain values become JSON.
 //!
 //! One request travels through these steps:
@@ -39,8 +45,11 @@ Logger: import("std:logging/logger")
 TextSink: import("std:logging/text_sink")
 ColorMode: import("std:text/color_mode")
 ColoredFormatter: import("std:logging/colored_formatter")
-Store: import("./app/MemoryStore.protos")
+SqliteDatabase: import("./app/SqliteDatabase.protos")
+SqliteStore: import("./app/SqliteStore.protos")
+SqliteCredentials: import("./app/SqliteCredentials.protos")
 Api: import("./app/Api.protos")
+Responses: import("./app/Responses.protos")
 HttpWorkers: import("./app/HttpWorkers.protos")
 Auth: import("./app/Auth.protos")
 Base64url: import("std:text/base64url")
@@ -64,8 +73,12 @@ service: () => {
         %{ "component": "realworld" }
     )
 
-    store: Store.create()
+    // SQLite custody stays in this Actor. Workers never receive the database,
+    // a Connection, a Statement or any repository built on them.
+    database: null
     handler: null
+    stopping: false
+    degraded: false
 
     // A GroupRef grants request/reply communication with this service
     // without granting Workers permission to stop the RootActor.
@@ -74,10 +87,29 @@ service: () => {
     listener: null
     host: null
 
+    // Close the Connection exactly once. Closing never commits: SQLite rolls
+    // back any unfinished transaction after finalizing remaining Statements.
+    releaseDatabase: () => {
+        if(database !== null) {
+            retired: database
+            database = null
+            Error.handle(
+                () => { retired.close() },
+                (failure) => {
+                    writer.writeLine("REALWORLD_SQLITE_CLOSE_FAILED=1").value()
+                    failure
+                }
+            )
+        }
+        null
+    }
+
     // Emit only a fixed application label, never the provider's exception,
-    // environment contents or key material. Startup must still fail closed.
+    // environment contents, database path, SQL or key material. Startup must
+    // still fail closed, and an opened database is closed before failing.
     failStartup: (reason) => {
         writer.writeLine("REALWORLD_HTTP_STARTUP_FAILED=" + reason).value()
+        releaseDatabase()
         Error().signal()
     }
     startupStep: (name, operation) => {
@@ -89,6 +121,7 @@ service: () => {
             () => { result = operation() },
             (failure) => {
                 writer.writeLine("REALWORLD_HTTP_STARTUP_FAILED=" + name).value()
+                releaseDatabase()
                 failure.signal()
             }
         )
@@ -99,9 +132,15 @@ service: () => {
         // The returned object's slots are the messages this Actor can handle.
         // send("start") below schedules startup; it does not call start inline.
         start: () => {
-            // Resolve explicit RootActor authorities before opening a listener.
+            // 1. Resolve explicit RootActor authorities before anything else.
             // This observation also fails startup if Clock is absent.
             startupStep("clock", () => { Instant(clock.epochNanoseconds()) })
+            // Resolve Entropy before readiness rather than waiting for the
+            // first registration. These bytes are not a replacement key.
+            entropyProbe: startupStep("entropy", () => { entropy.bytes(16).value() })
+            if(entropyProbe.size() != 16) { failStartup("invalid_entropy_result") }
+
+            // 2. Stable signing key supplied by the host, never stored in SQLite.
             encodedKey: startupStep("environment", () => {
                 process.environment().get("REALWORLD_JWT_KEY_BASE64URL")
             })
@@ -113,19 +152,42 @@ service: () => {
             if((key.size() < 32) || (key.size() > 4096)) {
                 failStartup("jwt_key_requires_32_to_4096_octets")
             }
-            // Resolve Entropy before readiness rather than waiting for the
-            // first registration. These bytes are not a replacement key.
-            entropyProbe: startupStep("entropy", () => { entropy.bytes(16).value() })
-            if(entropyProbe.size() != 16) { failStartup("invalid_entropy_result") }
-            // Never captured by a Worker or included in request/reply data.
+
+            // 3-4. Explicit database file; creation only when expressly asked.
+            path: startupStep("environment", () => {
+                process.environment().get("REALWORLD_DB_PATH")
+            })
+            if((path === null) || (path == "")) { failStartup("missing_REALWORLD_DB_PATH") }
+            if(!SqliteDatabase.acceptablePath(path)) { failStartup("invalid_REALWORLD_DB_PATH") }
+            createFlag: startupStep("environment", () => {
+                process.environment().get("REALWORLD_DB_CREATE")
+            })
+            allowCreate: (createFlag !== null) && (createFlag == "1")
+
+            // 5. Open through the host-authorized FFM provider and sqlite3.
+            database = startupStep("sqlite_open", () => {
+                SqliteDatabase.open(path, allowCreate)
+            })
+            // 6. WAL, synchronous=FULL, foreign keys and the busy timeout.
+            configured: startupStep("sqlite_configure", () => { database.configure() })
+            if(configured !== null) { failStartup("sqlite_" + configured) }
+            // 7. Create (only if authorized and empty) or validate version,
+            // structure, integrity and foreign keys before admitting requests.
+            initialized: startupStep("sqlite_schema", () => { database.initialize() })
+            if(initialized !== null) { failStartup("sqlite_" + initialized) }
+
+            // 8-10. Repositories, authentication and HTTP composition.
             // now is a zero-argument Closure, not a cached startup timestamp.
             // Auth invokes it whenever it needs the current trusted time.
-            handler = startupStep("authentication_setup", () => {
+            handler = startupStep("application_setup", () => {
+                store: SqliteStore.create(database)
+                credentials: SqliteCredentials.create(database)
                 authentication: Auth.create(store, entropy, key,
-                    () => { Instant(clock.epochNanoseconds()) })
+                    () => { Instant(clock.epochNanoseconds()) }, credentials)
                 Api.make(store, authentication)
             })
 
+            // 11. Listener.
             listener = startupStep("listen_127_0_0_1_3000", () => {
                 network.listenTcp(
                     ipVersion: 4,
@@ -134,24 +196,24 @@ service: () => {
                 ).value()
             })
 
-            // Keep Worker startup, service replies and lifetime ownership
+            // 12. Keep Worker startup, service replies and lifetime ownership
             // together, so drain can wait for admitted sessions to retire.
             host = startupStep("http_workers", () => {
                 HttpWorkers.start(listener, application, 2)
             })
 
-            // Announce readiness only after the listener exists and both
-            // Worker behaviors are initialized and scheduled to serve.
+            // 13. Announce readiness only after SQLite is verified, the
+            // listener exists and both Workers are scheduled to serve.
             log.info("http listener ready", %{
                 "address": "127.0.0.1"
                 "port": 3000
                 "workers": 2
+                "storage": "sqlite"
             })
             // Kept as a simple, stable readiness marker for CLI consumers.
             writer.writeLine(
                 "REALWORLD_HTTP_READY=127.0.0.1:3000"
             ).value()
-
             // A local console command requests explicit graceful drain. EOF
             // leaves the server running, as for an unattended service.
             // Ctrl-C remains a host termination, not this drain protocol.
@@ -191,7 +253,19 @@ service: () => {
         handle: (request) => {
             // This is where the Workers' request messages enter application code.
             // handler returns ordinary response data; it never writes a socket.
-            response: handler(request)
+            // An unusable database (uncertain COMMIT, failed rollback, closed)
+            // is never served as if it were reliable.
+            response: null
+            if((database === null) || !database.usable()) {
+                response = Responses.unavailable()
+            } else {
+                response = handler(request)
+            }
+            if(!degraded && !stopping && ((database === null) || !database.usable())) {
+                degraded = true
+                log.error("sqlite connection unusable; stopping service")
+                Actor.current().send("shutdown", "drain")
+            }
             // This records the generated response, not a completed TCP write.
             // Deliberately omit target/query, headers and body to avoid
             // logging credentials or other request content.
@@ -204,10 +278,22 @@ service: () => {
         // This behavior is not exposed through an HTTP management route.
         // The RootActor alone retains listener close and ActorRef.stop authority.
         shutdown: (mode) => {
-            log.info("http shutdown requested", %{ "mode": mode })
-            host.shutdown(mode).value()
-            log.info("http shutdown complete", %{ "mode": mode })
-            Actor.current().stop()
+            if(!stopping) {
+                stopping = true
+                log.info("http shutdown requested", %{ "mode": mode })
+                // Stop admission and let admitted requests finish first.
+                Error.handle(
+                    () => { host.shutdown(mode).value() },
+                    (failure) => {
+                        log.error("http shutdown incomplete", %{ "mode": mode })
+                        failure
+                    }
+                )
+                // Then close the Connection, observing its terminal Future.
+                releaseDatabase()
+                log.info("http shutdown complete", %{ "mode": mode })
+                Actor.current().stop()
+            }
             null
         }
 

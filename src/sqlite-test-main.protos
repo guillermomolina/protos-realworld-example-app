@@ -1,0 +1,21 @@
+//! SOURCE-root entry for the SQLite repository and security tests.
+//!
+//! Run with `make test-sqlite`, which supplies the optional FFM provider,
+//! --allow-library sqlite3=libsqlite3.so.0, Entropy, Clock and a fresh
+//! temporary directory as the only program argument. This entry is separate
+//! from src/test-main.protos so `make test` never needs the native provider.
+//! The entry lives in src/ so src/tests/ modules may import ../app/ sources.
+
+print("REALWORLD_SQLITE_TEST_ENTRY=START")
+programArguments: process.args()
+if(programArguments.size() != 1) { Error().signal() }
+directory: programArguments[0]
+
+print("REALWORLD_SQLITE_PERSISTENCE=START")
+import("./tests/sqlite-persistence.protos").run(directory)
+print("REALWORLD_SQLITE_PERSISTENCE=PASS")
+
+print("REALWORLD_SQLITE_SECURITY=START")
+import("./tests/sqlite-security.protos").run(entropy, clock, directory)
+print("REALWORLD_SQLITE_SECURITY=PASS")
+true

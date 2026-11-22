@@ -1,0 +1,224 @@
+//! Persistent authentication tests with the real Password (Argon2id) and JWT
+//! providers over a real SQLite database. Run through src/sqlite-test-main.protos.
+//!
+//! The literal signing key below is public test data, never a production key.
+//! A second raw std:sqlite Connection is used only by this fixture, to hold a
+//! write lock and observe that a database failure never admits an account.
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+JWT: import("std:auth/jwt")
+Instant: import("std:datetime/instant")
+SQLite: import("std:sqlite")
+SqliteDatabase: import("../app/SqliteDatabase.protos")
+SqliteStore: import("../app/SqliteStore.protos")
+SqliteCredentials: import("../app/SqliteCredentials.protos")
+Auth: import("../app/Auth.protos")
+Api: import("../app/Api.protos")
+
+run: (entropy, clock, directory) => {
+    path: directory + "/security.db"
+    key: Encoding.UTF8.encode("sqlite-security-public-test-key-32-bytes")
+    database: SqliteDatabase.open(path, true)
+    Assertions.require(database.configure() === null)
+    Assertions.require(database.initialize() === null)
+    store: SqliteStore.create(database)
+    credentials: SqliteCredentials.create(database)
+    // null: unlimited. Otherwise the number of further successful observations
+    // before the injected Clock fails, to place a failure at an exact step.
+    clockBudget: null
+    now: () => {
+        if(clockBudget !== null) {
+            if(clockBudget <= 0) { Error().signal() }
+            clockBudget = clockBudget - 1
+        }
+        Instant(clock.epochNanoseconds())
+    }
+    auth: Auth.create(store, entropy, key, now, credentials)
+    handler: Api.make(store, auth)
+
+    // A persistent repository, once requested, must really be supplied.
+    missing: false
+    Error.handle(
+        () => { Auth.create(store, entropy, key, now, null) },
+        (failure) => {
+            missing = true
+            failure
+        }
+    )
+    Assertions.require(missing)
+
+    call: (method, target, body, token, status) => {
+        headers: []
+        if(token !== null) {
+            headers = [["Authorization", Encoding.Latin1.encode("Token " + token)]]
+        }
+        bytes: Encoding.UTF8.encode("")
+        if(body !== null) { bytes = Encoding.UTF8.encode(JSON.encode(body)) }
+        response: handler({
+            method: method
+            target: Encoding.Latin1.encode(target)
+            headers: headers
+            body: bytes
+        })
+        Assertions.require(response.status == status)
+        result: null
+        if(status != 204) { result = JSON.parse(Encoding.UTF8.decode(response.body)).value }
+        result
+    }
+    user: (name, email, password) => {
+        JSON.object("user", JSON.object("username", JSON.string(name),
+            "email", JSON.string(email), "password", JSON.string(password)))
+    }
+    login: (email, password) => {
+        JSON.object("user", JSON.object("email", JSON.string(email), "password", JSON.string(password)))
+    }
+    update: (fields) => { JSON.object("user", JSON.object(...fields)) }
+    claims: (token) => { JWT.verify(token, key, Auth.policy(), now()).value }
+    publicOnly: (fields) => {
+        for(secret in ["id", "password", "verifier", "generation", "subject"]) {
+            Assertions.require(!fields.containsKey(secret))
+        }
+        true
+    }
+    credentialCount: () => { database.rows("SELECT count(*) FROM credentials", [])[0][0] }
+    userCount: () => { database.rows("SELECT count(*) FROM users", [])[0][0] }
+
+    // Complete registration: identity and credential rows are both present.
+    alice: call("POST", "/api/users", user("alice", "alice@example.test", "password one"), null, 201)["user"].value
+    publicOnly(alice)
+    aliceToken: alice["token"].value
+    aliceId: store.identityByUsername("alice").id
+    record: credentials.byId(aliceId)
+    Assertions.require(record.generation == 1)
+    Assertions.require(claims(aliceToken)["sub"].value == record.subject)
+    Assertions.require(claims(aliceToken)["generation"].value.coefficient == 1)
+    // The verifier is an Argon2id record, never the password, never public.
+    Assertions.require(record.verifier != "password one")
+    prefix: Encoding.UTF8.encode("protos-password-v1:nfc:$argon2id$")
+    stored: Encoding.UTF8.encode(record.verifier)
+    for(index, 0, prefix.size()) { Assertions.require(stored[index] == prefix[index]) }
+    identity: store.identityById(aliceId)
+    Assertions.require(!identity.hasSlot("verifier") && !identity.hasSlot("subject"))
+    subject: record.subject
+
+    // Duplicate username/email: 409, and no additional rows.
+    usersBefore: userCount()
+    call("POST", "/api/users", user("alice", "other@example.test", "password one"), null, 409)
+    call("POST", "/api/users", user("other", "alice@example.test", "password one"), null, 409)
+    Assertions.require(userCount() == usersBefore)
+    Assertions.require(credentialCount() == usersBefore)
+
+    // Login re-reads persistent copies: object identity is not required.
+    call("POST", "/api/users/login", login("alice@example.test", "password one"), null, 200)
+    call("POST", "/api/users/login", login("alice@example.test", "wrong password"), null, 401)
+
+    // Token issuance failure before commit leaves no partial account.
+    clockBudget = 0
+    call("POST", "/api/users", user("clock", "clock@example.test", "clock password"), null, 503)
+    clockBudget = null
+    Assertions.require(store.identityByUsername("clock") === null)
+    Assertions.require(userCount() == usersBefore)
+    Assertions.require(credentialCount() == usersBefore)
+
+    // Password change: generation advances once, old token is revoked.
+    changed: call("PUT", "/api/user", update(["password", JSON.string("password two")]), aliceToken, 200)["user"].value
+    publicOnly(changed)
+    newToken: changed["token"].value
+    Assertions.require(credentials.byId(aliceId).generation == 2)
+    Assertions.require(credentials.byId(aliceId).subject == subject)
+    Assertions.require(claims(newToken)["generation"].value.coefficient == 2)
+    Assertions.require(claims(newToken)["sub"].value == subject)
+    call("GET", "/api/user", null, aliceToken, 401)
+    call("GET", "/api/user", null, newToken, 200)
+    call("POST", "/api/users/login", login("alice@example.test", "password one"), null, 401)
+    call("POST", "/api/users/login", login("alice@example.test", "password two"), null, 200)
+
+    // Metadata and password commit together, or not at all.
+    bob: call("POST", "/api/users", user("bob", "bob@example.test", "bob password"), null, 201)["user"].value
+    call("PUT", "/api/user", update(["username", JSON.string("bob"),
+        "password", JSON.string("must not commit")]), newToken, 409)
+    Assertions.require(credentials.byId(aliceId).generation == 2)
+    Assertions.require(store.identityById(aliceId).username == "alice")
+    call("POST", "/api/users/login", login("alice@example.test", "password two"), null, 200)
+    both: call("PUT", "/api/user", update(["username", JSON.string("alice-new"),
+        "email", JSON.string("alice-new@example.test"),
+        "password", JSON.string("password three")]), newToken, 200)["user"].value
+    thirdToken: both["token"].value
+    Assertions.require(both["username"].value == "alice-new")
+    Assertions.require(credentials.byId(aliceId).generation == 3)
+    Assertions.require(store.identityById(aliceId).email == "alice-new@example.test")
+    call("GET", "/api/user", null, newToken, 401)
+    call("GET", "/api/user", null, thirdToken, 200)
+
+    // Metadata-only updates keep the generation and the current token valid.
+    metadata: call("PUT", "/api/user", update(["bio", JSON.string("hello")]), thirdToken, 200)["user"].value
+    Assertions.require(credentials.byId(aliceId).generation == 3)
+    Assertions.require(claims(metadata["token"].value)["generation"].value.coefficient == 3)
+    call("GET", "/api/user", null, thirdToken, 200)
+
+    // The update token is prepared before the commit. The request token
+    // verifies (one observation), then signing the new token fails after
+    // hashing: the password change must not have been committed.
+    clockBudget = 1
+    call("PUT", "/api/user", update(["password", JSON.string("password four")]), thirdToken, 503)
+    clockBudget = null
+    Assertions.require(credentials.byId(aliceId).generation == 3)
+    call("POST", "/api/users/login", login("alice-new@example.test", "password three"), null, 200)
+
+    // Two password changes suspended in hashing with the same expected
+    // generation: credentials are re-read afterwards, so exactly one commits.
+    request: (password) => {
+        {
+            method: "PUT"
+            target: Encoding.Latin1.encode("/api/user")
+            headers: [["Authorization", Encoding.Latin1.encode("Token " + thirdToken)]]
+            body: Encoding.UTF8.encode(JSON.encode(update(["password", JSON.string(password)])))
+        }
+    }
+    first: (() => { handler(request("concurrent one")).status }).future()
+    second: (() => { handler(request("concurrent two")).status }).future()
+    statuses: [first.value(), second.value()]
+    Assertions.require(((statuses[0] == 200) && (statuses[1] == 401)) ||
+        ((statuses[0] == 401) && (statuses[1] == 200)))
+    Assertions.require(credentials.byId(aliceId).generation == 4)
+    call("GET", "/api/user", null, thirdToken, 401)
+
+    // A database failure inside the admission transaction (another connection
+    // holds the write lock beyond busy_timeout) yields 503, never an account.
+    usersBefore = userCount()
+    locker: SQLite.openFile(path, "readWrite")
+    (() => {
+        locker.busyTimeout(0)
+        hold: locker.prepare("BEGIN IMMEDIATE")
+        (() => { hold.step() }).ensure(() => { hold.close().value() })
+        call("POST", "/api/users", user("locked", "locked@example.test", "locked password"), null, 503)
+        Assertions.require(database.usable())
+        locker.rollback()
+    }).ensure(() => { locker.close().value() })
+    Assertions.require(userCount() == usersBefore)
+    Assertions.require(credentialCount() == usersBefore)
+    Assertions.require(store.identityByUsername("locked") === null)
+    call("POST", "/api/users/login", login("locked@example.test", "locked password"), null, 401)
+
+    // After the failure the same registration succeeds normally.
+    call("POST", "/api/users", user("locked", "locked@example.test", "locked password"), null, 201)
+    Assertions.require(database.close())
+
+    // Revocation and subjects survive reopening the database.
+    reopened: SqliteDatabase.open(path, false)
+    Assertions.require(reopened.configure() === null)
+    Assertions.require(reopened.initialize() === null)
+    reopenedStore: SqliteStore.create(reopened)
+    reopenedCredentials: SqliteCredentials.create(reopened)
+    reopenedAuth: Auth.create(reopenedStore, entropy, key, now, reopenedCredentials)
+    resolve: (token) => {
+        reopenedAuth.resolve([["Authorization", Encoding.Latin1.encode("Token " + token)]]).state
+    }
+    Assertions.require(resolve(aliceToken) == "invalid")
+    Assertions.require(resolve(thirdToken) == "invalid")
+    Assertions.require(reopenedCredentials.byId(aliceId).subject == subject)
+    Assertions.require(reopenedCredentials.byId(aliceId).generation == 4)
+    Assertions.require(resolve(bob["token"].value) == "valid")
+    Assertions.require(reopened.close())
+    true
+}

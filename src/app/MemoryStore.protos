@@ -3,6 +3,8 @@
 //! State is captured by closures created inside create(). Each store
 //! instance owns its own article, profile, comment and favorite collections.
 //! There is no database or durable persistence; Auth owns security authority.
+//! This store is a fixture for the in-memory tests and examples. The production
+//! server uses SqliteStore; nothing synchronizes or migrates between the two.
 //! An isolated identity repository holds only non-secret account metadata.
 //! A separate follow graph and article-author bindings use stable IDs.
 //!

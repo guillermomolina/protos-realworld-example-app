@@ -8,7 +8,12 @@
 //!
 //! create returns Closures over records. Callers receive only the operations,
 //! not the retained Array. This is ordinary lexical scope, not a global database.
-//! All state disappears on restart; durable storage is a separate feature.
+//!
+//! The record backend is chosen once, at construction. Without a third argument
+//! records live in a private Array and disappear on restart (unit tests). With a
+//! persistent repository (SqliteCredentials) SQLite holds the only copy, and
+//! identity plus credential writes share one transaction. There is never a
+//! fallback from the persistent repository to memory during a request.
 //!
 //! .value() below observes a Future. While waiting, the current Actor turn may
 //! suspend and another message can change state. Re-read/check state after those
@@ -19,34 +24,71 @@ Arrays: import("std:collections/array")
 Identity: import("./IdentityStore.protos")
 Input: import("./RequestJson.protos")
 
-create: (identityStore, entropy) => {
+create: (identityStore, entropy, ...repositories) => {
+    if(repositories.size() > 1) { Error().signal() }
     records: []
-    byId: (id) => {
-        found: null
-        for(record in records) { if(record.id == id) { found = record } }
-        found
-    }
-    bySubject: (subject) => {
-        found: null
-        for(record in records) { if(record.subject == subject) { found = record } }
-        found
-    }
-    replace: (record, verifier) => {
+    memory: {
+        byId: (id) => {
+            found: null
+            for(record in records) { if(record.id == id) { found = record } }
+            found
+        }
+        bySubject: (subject) => {
+            found: null
+            for(record in records) { if(record.subject == subject) { found = record } }
+            found
+        }
+        insert: (id, subject, verifier, generation) => {
+            records = Arrays.append(records, {
+                id: id
+                subject: subject
+                verifier: verifier
+                generation: generation
+            })
+            true
+        }
         // Keep id/subject unchanged, replace the verifier and advance generation.
         // Old JWTs remain correctly signed but fail the generation comparison.
-        replacement: {
-            id: record.id
-            subject: record.subject
-            verifier: verifier
-            generation: record.generation + 1
+        replace: (record, verifier) => {
+            replacement: {
+                id: record.id
+                subject: record.subject
+                verifier: verifier
+                generation: record.generation + 1
+            }
+            records = Arrays.map(records, (entry) => {
+                result: entry
+                if(entry.id == record.id) { result = replacement }
+                result
+            })
+            true
         }
-        records = Arrays.map(records, (entry) => {
-            result: entry
-            if(entry.id == record.id) { result = replacement }
-            result
-        })
-        true
+        // Memory writes have no suspension point, so they are already atomic.
+        atomically: (operation) => { operation() }
+        // Retained records are replaced, never mutated: identity means "same".
+        same: (left, right) => { left === right }
     }
+    backend: memory
+    if(repositories.size() == 1) {
+        // An explicitly requested persistent repository must exist.
+        persistent: repositories[0]
+        if(persistent === null) { Error().signal() }
+        backend = {
+            byId: (id) => { persistent.byId(id) }
+            bySubject: (subject) => { persistent.bySubject(subject) }
+            insert: (id, subject, verifier, generation) => {
+                persistent.insert(id, subject, verifier, generation)
+            }
+            replace: (record, verifier) => {
+                persistent.replace(record.id, verifier, record.generation)
+            }
+            atomically: (operation) => { persistent.atomically(operation) }
+            // SQLite answers fresh copies: compare contents, never identity.
+            same: (left, right) => { persistent.same(left, right) }
+        }
+    }
+    byId: (id) => { backend.byId(id) }
+    bySubject: (subject) => { backend.bySubject(subject) }
     conflict: (id, username, email) => {
         failure: null
         usernameOwner: identityStore.identityByUsername(username)
@@ -94,24 +136,27 @@ create: (identityStore, entropy) => {
                     // Clock/JWT failures must occur before either repository
                     // commits. This callback performs synchronous issuance.
                     token: issueToken(subject, 1)
-                    // No Future waits between these writes. A failed hash,
-                    // uniqueness check or token issuance has written neither.
-                    outcome = identityStore.admitIdentity(username, email)
-                    if(outcome.ok) {
-                        records = Arrays.append(records, {
-                            id: outcome.value.id
-                            subject: subject
-                            verifier: verifier
-                            generation: 1
-                        })
-                        outcome = {
-                            ok: true
-                            value: outcome.value
-                            token: token
-                            field: null
-                            message: null
+                    // No Future waits from here until the commit completes.
+                    // Uniqueness is checked again inside the transaction; a
+                    // rejection or failure rolls back both identity and record.
+                    outcome = backend.atomically(() => {
+                        admission: conflict(null, username, email)
+                        if(admission === null) {
+                            if(bySubject(subject) !== null) { Error().signal() }
+                            admission = identityStore.admitIdentity(username, email)
+                            if(admission.ok) {
+                                backend.insert(admission.value.id, subject, verifier, 1)
+                                admission = {
+                                    ok: true
+                                    value: admission.value
+                                    token: token
+                                    field: null
+                                    message: null
+                                }
+                            }
                         }
-                    }
+                        admission
+                    })
                 }
             }
             outcome
@@ -133,11 +178,13 @@ create: (identityStore, entropy) => {
                             verified: Password.verify(password, retained.verifier).value()
                             // A concurrent replacement while verify yielded must not
                             // authenticate an obsolete password or a renamed email.
+                            // Re-read both records after the suspension.
                             current: identityStore.identityById(identity.id)
-                            // === checks that this is still the same retained
-                            // record, not a replacement installed during verify.
-                            if(verified && (byId(identity.id) === retained) &&
-                               (current.email == email)) {
+                            latest: byId(identity.id)
+                            // same() confirms that id, subject, verifier and
+                            // generation are unchanged since verification began.
+                            if(verified && (current !== null) && (current.id == identity.id) &&
+                               backend.same(retained, latest) && (current.email == email)) {
                                 outcome = Identity.accepted(current)
                             }
                         }
@@ -172,20 +219,32 @@ create: (identityStore, entropy) => {
                 } else {
                     verifier: Password.hash(password, entropy).value()
                     // Re-read after suspension, so concurrent replacements
-                    // each advance the retained generation.
-                    replace(byId(id), verifier)
-                    result = Identity.accepted(identityStore.identityById(id))
+                    // each advance the retained generation exactly once.
+                    result = backend.atomically(() => {
+                        record: byId(id)
+                        answer: Identity.rejected("user", "not found")
+                        if(record !== null) {
+                            backend.replace(record, verifier)
+                            answer = Identity.accepted(identityStore.identityById(id))
+                        }
+                        answer
+                    })
                 }
             }
             result
         }
-        // Validate and hash first, then replace metadata and credentials with
-        // no suspension between commits. No partial user/password updates.
-        updateAccount: (id, expectedGeneration, fields) => {
+        // Validate and hash first, then replace metadata and credentials in one
+        // transaction with no suspension inside it. No partial user/password
+        // updates. The optional issueToken(subject, generation) prepares the
+        // response token before the mutation, for the generation that the
+        // commit will establish; it is returned only after the commit.
+        updateAccount: (id, expectedGeneration, fields, ...issuers) => {
             // expectedGeneration comes from the verified request principal.
             // It prevents a request suspended in hashing from overwriting a
             // password changed by another turn. Omitted metadata is re-read
             // after suspension so unrelated newer edits are preserved.
+            issueToken: null
+            if(issuers.size() > 0) { issueToken = issuers[0] }
             record: byId(id)
             checked: Input.userFields(fields)
             result: Identity.rejected("token", "is invalid")
@@ -196,16 +255,41 @@ create: (identityStore, entropy) => {
                     verifier = Password.hash(fields["password"].value, entropy).value()
                 }
                 record = byId(id)
-                if(record.generation == expectedGeneration) {
+                if((record !== null) && (record.generation == expectedGeneration)) {
                     current: identityStore.identityById(id)
                     username: Input.textOr(fields, "username", current.username)
                     email: Input.textOr(fields, "email", current.email)
+                    bio: Input.textOr(fields, "bio", current.bio)
+                    image: Input.textOr(fields, "image", current.image)
                     result = conflict(id, username, email)
                     if(result === null) {
-                        result = identityStore.replaceIdentity(id, username, email,
-                            Input.textOr(fields, "bio", current.bio),
-                            Input.textOr(fields, "image", current.image))
-                        if(result.ok && (verifier !== null)) { replace(record, verifier) }
+                        token: null
+                        if(issueToken !== null) {
+                            nextGeneration: record.generation
+                            if(verifier !== null) { nextGeneration = record.generation + 1 }
+                            token = issueToken(record.subject, nextGeneration)
+                        }
+                        result = backend.atomically(() => {
+                            latest: byId(id)
+                            answer: Identity.rejected("token", "is invalid")
+                            if((latest !== null) && (latest.generation == expectedGeneration)) {
+                                answer = conflict(id, username, email)
+                                if(answer === null) {
+                                    answer = identityStore.replaceIdentity(id, username, email, bio, image)
+                                    if(answer.ok) {
+                                        if(verifier !== null) { backend.replace(latest, verifier) }
+                                        answer = {
+                                            ok: true
+                                            value: answer.value
+                                            token: token
+                                            field: null
+                                            message: null
+                                        }
+                                    }
+                                }
+                            }
+                            answer
+                        })
                     }
                 }
             }

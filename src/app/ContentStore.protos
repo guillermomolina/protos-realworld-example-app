@@ -72,6 +72,24 @@ commentCopy: (record, identities) => {
     }
 }
 
+/// Shared article field policy for every content repository. Answers null for
+/// acceptable fields, otherwise the rejection used by the stores.
+validFields: (title, description, body) => {
+    result: null
+    if(title == "") {
+        result = rejected("title", "can't be blank")
+    } else {
+        if(description == "") {
+            result = rejected("description", "can't be blank")
+        } else {
+            if(body == "") {
+                result = rejected("body", "can't be blank")
+            }
+        }
+    }
+    result
+}
+
 create: (identities) => {
     articles: []
     comments: []
@@ -97,21 +115,6 @@ create: (identities) => {
         found
     }
 
-    validFields: (title, description, body) => {
-        result: null
-        if(title == "") {
-            result = rejected("title", "can't be blank")
-        } else {
-            if(description == "") {
-                result = rejected("description", "can't be blank")
-            } else {
-                if(body == "") {
-                    result = rejected("body", "can't be blank")
-                }
-            }
-        }
-        result
-    }
 
     store: {
         articleOwnerId: (slug) => {

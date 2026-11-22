@@ -1,0 +1,9 @@
+//! SOURCE-root entry for the multi-process SQLite scenarios.
+//!
+//! Usage: protos <provider and library grants> --allow-entropy --allow-clock \
+//!   src/sqlite-process-main.protos <scenario> <database> [arguments...]
+//! Driven by src/tests/test-sqlite-processes.sh. The scenarios themselves are
+//! in src/tests/sqlite-process.protos; this entry only forwards its explicit
+//! process, Entropy and Clock authority to them.
+
+import("./tests/sqlite-process.protos").run(process.args(), process, entropy, clock)

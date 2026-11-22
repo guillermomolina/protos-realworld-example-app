@@ -61,6 +61,20 @@ nullable: (value) => {
     answer
 }
 
+/// Shared blank-name policy for every identity repository. Answers null when
+/// both names are present, otherwise the rejection used by the stores.
+requiredNames: (username, email) => {
+    outcome: null
+    if((username === null) || (username == "")) {
+        outcome = rejected("username", "can't be blank")
+    } else {
+        if((email === null) || (email == "")) {
+            outcome = rejected("email", "can't be blank")
+        }
+    }
+    outcome
+}
+
 /// Each invocation creates a completely independent in-memory identity store.
 create: () => {
     records: []
@@ -132,30 +146,24 @@ create: () => {
         /// Uniqueness is exact/case-sensitive. HTTP email/password policy is
         /// enforced by RequestJson/AuthStore before reaching this repository.
         addFixture: (username, email, bio, image) => {
-            outcome: null
-            if((username === null) || (username == "")) {
-                outcome = rejected("username", "can't be blank")
-            } else {
-                if((email === null) || (email == "")) {
-                    outcome = rejected("email", "can't be blank")
+            outcome: requiredNames(username, email)
+            if(outcome === null) {
+                if(byUsername(username) !== null) {
+                    outcome = rejected("username", "has already been taken")
                 } else {
-                    if(byUsername(username) !== null) {
-                        outcome = rejected("username", "has already been taken")
+                    if(byEmail(email) !== null) {
+                        outcome = rejected("email", "has already been taken")
                     } else {
-                        if(byEmail(email) !== null) {
-                            outcome = rejected("email", "has already been taken")
-                        } else {
-                            record: {
-                                id: nextId
-                                username: username
-                                email: email
-                                bio: nullable(bio)
-                                image: nullable(image)
-                            }
-                            records = Arrays.append(records, record)
-                            nextId = nextId + 1
-                            outcome = accepted(record)
+                        record: {
+                            id: nextId
+                            username: username
+                            email: email
+                            bio: nullable(bio)
+                            image: nullable(image)
                         }
+                        records = Arrays.append(records, record)
+                        nextId = nextId + 1
+                        outcome = accepted(record)
                     }
                 }
             }
@@ -168,38 +176,33 @@ create: () => {
             existing: byId(id)
             outcome: rejected("user", "not found")
             if(existing !== null) {
-                if((username === null) || (username == "")) {
-                    outcome = rejected("username", "can't be blank")
-                } else {
-                    if((email === null) || (email == "")) {
-                        outcome = rejected("email", "can't be blank")
+                outcome = requiredNames(username, email)
+                if(outcome === null) {
+                    usernameOwner: byUsername(username)
+                    emailOwner: byEmail(email)
+                    if((usernameOwner !== null) && (usernameOwner.id != id)) {
+                        outcome = rejected("username", "has already been taken")
                     } else {
-                        usernameOwner: byUsername(username)
-                        emailOwner: byEmail(email)
-                        if((usernameOwner !== null) && (usernameOwner.id != id)) {
-                            outcome = rejected("username", "has already been taken")
+                        if((emailOwner !== null) && (emailOwner.id != id)) {
+                            outcome = rejected("email", "has already been taken")
                         } else {
-                            if((emailOwner !== null) && (emailOwner.id != id)) {
-                                outcome = rejected("email", "has already been taken")
-                            } else {
-                                replacement: {
-                                    id: id
-                                    username: username
-                                    email: email
-                                    bio: nullable(bio)
-                                    image: nullable(image)
-                                }
-                                nextRecords: []
-                                for(record in records) {
-                                    if(record.id == id) {
-                                        nextRecords = Arrays.append(nextRecords, replacement)
-                                    } else {
-                                        nextRecords = Arrays.append(nextRecords, record)
-                                    }
-                                }
-                                records = nextRecords
-                                outcome = accepted(replacement)
+                            replacement: {
+                                id: id
+                                username: username
+                                email: email
+                                bio: nullable(bio)
+                                image: nullable(image)
                             }
+                            nextRecords: []
+                            for(record in records) {
+                                if(record.id == id) {
+                                    nextRecords = Arrays.append(nextRecords, replacement)
+                                } else {
+                                    nextRecords = Arrays.append(nextRecords, record)
+                                }
+                            }
+                            records = nextRecords
+                            outcome = accepted(replacement)
                         }
                     }
                 }

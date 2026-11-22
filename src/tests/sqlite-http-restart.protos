@@ -1,0 +1,123 @@
+//! Real TCP checks that the persistent server keeps its data across restarts.
+//!
+//! Usage (driven by test-sqlite-processes.sh, scenario http-restart):
+//!   protos --allow-network src/tests/sqlite-http-restart.protos before
+//!   (restart the server with the same REALWORLD_DB_PATH and JWT key)
+//!   protos --allow-network src/tests/sqlite-http-restart.protos after <old-token>
+//!
+//! "before" creates accounts, an article, a comment, a follow and a favorite,
+//! then changes alice's password. It prints the revoked pre-change token as
+//! SQLITE_HTTP_OLD_TOKEN=... for the controller; the token belongs to a
+//! disposable key generated for this test run only. "after" checks the same
+//! public endpoints against the restarted server and that the token stays
+//! revoked. Only the existing public HTTP protocol is used: this client never
+//! receives a database connection.
+Assertions: import("std:test/assertions")
+Client: import("std:http/client").Client
+IpAddress: import("std:network/ip_addresses").IpAddress
+IpEndpoint: import("std:network/ip_endpoints").IpEndpoint
+JSON: import("std:json/json")
+Arrays: import("std:collections/array")
+
+loopback: IpAddress(4, 2130706433)
+
+readBody: (response) => {
+    bytes: Encoding.Latin1.encode("")
+    chunk: response.body.read(4096).value()
+    while(chunk !== null) {
+        for(octet in chunk) { bytes.add(octet) }
+        chunk = response.body.read(4096).value()
+    }
+    Encoding.UTF8.decode(bytes)
+}
+
+exchange: (method, target, body, token, status) => {
+    connection: network.connectTcp(IpEndpoint(loopback, 3000)).value()
+    headers: [["Host", Encoding.Latin1.encode("127.0.0.1")],
+        ["Content-Type", Encoding.Latin1.encode("application/json")]]
+    if(token !== null) {
+        headers = Arrays.append(headers,
+            ["Authorization", Encoding.Latin1.encode("Token " + token)])
+    }
+    bytes: null
+    if(body !== null) { bytes = Encoding.UTF8.encode(JSON.encode(body)) }
+    result: null
+    Client.exchangeOne.owning(connection, {
+        method: method
+        target: Encoding.Latin1.encode(target)
+        headers: headers
+        body: bytes
+    }, (response) => {
+        Assertions.require(response.status == status)
+        text: readBody(response)
+        if(status == 204) { Assertions.require(text == "") } else { result = JSON.parse(text).value }
+        true
+    }, null).value()
+    result
+}
+
+user: (name, email, password) => {
+    JSON.object("user", JSON.object("username", JSON.string(name),
+        "email", JSON.string(email), "password", JSON.string(password)))
+}
+login: (email, password) => {
+    JSON.object("user", JSON.object("email", JSON.string(email), "password", JSON.string(password)))
+}
+token: (email, password) => {
+    exchange("POST", "/api/users/login", login(email, password), null, 200)["user"].value["token"].value
+}
+
+programArguments: process.args()
+Assertions.require(programArguments.size() >= 1)
+phase: programArguments[0]
+path: "/api/articles/restart-article"
+
+if(phase == "before") {
+    exchange("POST", "/api/users", user("restart-alice", "restart-alice@example.test", "restart password one"), null, 201)
+    exchange("POST", "/api/users", user("restart-bob", "restart-bob@example.test", "restart password bob"), null, 201)
+    aliceToken: token("restart-alice@example.test", "restart password one")
+    bobToken: token("restart-bob@example.test", "restart password bob")
+    created: exchange("POST", "/api/articles", JSON.object("article", JSON.object(
+        "title", JSON.string("Restart article"), "description", JSON.string("Durable"),
+        "body", JSON.string("Survives restarts"),
+        "tagList", JSON.array(JSON.string("durable")))), aliceToken, 201)["article"].value
+    Assertions.require(created["slug"].value == "restart-article")
+    exchange("POST", path + "/comments", JSON.object("comment", JSON.object(
+        "body", JSON.string("Persistent comment"))), bobToken, 201)
+    exchange("POST", "/api/profiles/restart-alice/follow", null, bobToken, 200)
+    exchange("POST", path + "/favorite", null, bobToken, 200)
+    exchange("PUT", "/api/user", JSON.object("user", JSON.object(
+        "password", JSON.string("restart password two"))), aliceToken, 200)
+    exchange("GET", "/api/user", null, aliceToken, 401)
+    print("SQLITE_HTTP_OLD_TOKEN=" + aliceToken)
+    print("SQLITE_HTTP_BEFORE=PASS")
+}
+
+if(phase == "after") {
+    Assertions.require(programArguments.size() == 2)
+    oldToken: programArguments[1]
+    // The password changed before the restart: the old token stays revoked.
+    exchange("GET", "/api/user", null, oldToken, 401)
+    exchange("POST", "/api/users/login", login("restart-alice@example.test", "restart password one"), null, 401)
+    aliceToken: token("restart-alice@example.test", "restart password two")
+    bobToken: token("restart-bob@example.test", "restart password bob")
+    account: exchange("GET", "/api/user", null, aliceToken, 200)["user"].value
+    Assertions.require(account["username"].value == "restart-alice")
+    article: exchange("GET", path, null, bobToken, 200)["article"].value
+    Assertions.require(article["body"].value == "Survives restarts")
+    Assertions.require(article["favorited"].value)
+    Assertions.require(article["favoritesCount"].value.coefficient == 1)
+    Assertions.require(article["tagList"].value[0].value == "durable")
+    Assertions.require(article["author"].value["following"].value)
+    comments: exchange("GET", path + "/comments", null, null, 200)["comments"].value
+    Assertions.require(comments.size() == 1)
+    Assertions.require(comments[0].value["author"].value["username"].value == "restart-bob")
+    profile: exchange("GET", "/api/profiles/restart-alice", null, bobToken, 200)["profile"].value
+    Assertions.require(profile["following"].value)
+    feed: exchange("GET", "/api/articles/feed", null, bobToken, 200)
+    Assertions.require(feed["articlesCount"].value.coefficient == 1)
+    tags: exchange("GET", "/api/tags", null, null, 200)["tags"].value
+    Assertions.require(tags.size() == 1)
+    print("SQLITE_HTTP_AFTER=PASS")
+}
+true

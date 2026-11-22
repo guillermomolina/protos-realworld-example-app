@@ -1,0 +1,304 @@
+//! Scenarios for tests that need several independent Protos OS processes.
+//!
+//! Entry: src/sqlite-process-main.protos <scenario> <database> [arguments...]
+//! (the entry lives in src/ so that this module may import ../app/ sources).
+//! test-sqlite-processes.sh orchestrates the scenarios and checks exit codes.
+//!
+//! Every scenario prints a fixed SQLITE_PROCESS_* marker only after its checks
+//! have completed. Scenarios named hold-* print a marker at a precise point and
+//! then block reading one line from stdin. That blocking read is the test-only
+//! synchronization point at which the controller sends SIGKILL or a release
+//! line; production code contains no such hook or delay.
+//!
+//! The literal signing key is public test data, never a production key.
+Assertions: import("std:test/assertions")
+JSON: import("std:json/json")
+JWT: import("std:auth/jwt")
+Instant: import("std:datetime/instant")
+SQLite: import("std:sqlite")
+SqliteDatabase: import("../app/SqliteDatabase.protos")
+SqliteStore: import("../app/SqliteStore.protos")
+SqliteCredentials: import("../app/SqliteCredentials.protos")
+Auth: import("../app/Auth.protos")
+Api: import("../app/Api.protos")
+Identities: import("../app/IdentityStore.protos")
+
+testKey: () => { Encoding.UTF8.encode("sqlite-process-public-test-key-32-bytes") }
+
+/// args: [scenario, database, ...]. host is the entry's process object.
+run: (args, host, entropy, clock) => {
+    writer: TextWriter(host.stdout(), host.stdoutEncoding())
+    marker: (text) => { writer.writeLine(text).value() }
+    waitForController: () => {
+        TextReader(host.stdin(), host.stdinEncoding()).readLine().value()
+    }
+    if(args.size() < 2) { Error().signal() }
+    scenario: args[0]
+    path: args[1]
+    now: () => { Instant(clock.epochNanoseconds()) }
+
+    openReady: (allowCreate) => {
+        database: SqliteDatabase.open(path, allowCreate)
+        Assertions.require(database.configure() === null)
+        Assertions.require(database.initialize() === null)
+        database
+    }
+    application: (database) => {
+        store: SqliteStore.create(database)
+        credentials: SqliteCredentials.create(database)
+        auth: Auth.create(store, entropy, testKey(), now, credentials)
+        {
+            store: store
+            credentials: credentials
+            auth: auth
+            handler: Api.make(store, auth)
+        }
+    }
+    call: (handler, method, target, body, token, status) => {
+        headers: []
+        if(token !== null) {
+            headers = [["Authorization", Encoding.Latin1.encode("Token " + token)]]
+        }
+        bytes: Encoding.UTF8.encode("")
+        if(body !== null) { bytes = Encoding.UTF8.encode(JSON.encode(body)) }
+        response: handler({
+            method: method
+            target: Encoding.Latin1.encode(target)
+            headers: headers
+            body: bytes
+        })
+        Assertions.require(response.status == status)
+        result: null
+        if(status != 204) { result = JSON.parse(Encoding.UTF8.decode(response.body)).value }
+        result
+    }
+    user: (name, email, password) => {
+        JSON.object("user", JSON.object("username", JSON.string(name),
+            "email", JSON.string(email), "password", JSON.string(password)))
+    }
+    login: (email, password) => {
+        JSON.object("user", JSON.object("email", JSON.string(email), "password", JSON.string(password)))
+    }
+    // Same claim layout that Auth issues, for a chosen subject/generation.
+    tokenFor: (subject, generation) => {
+        observed: now()
+        issued: Auth.seconds(observed)
+        JWT.issue(JSON.object(
+            "iss", JSON.string("protos-realworld"),
+            "aud", JSON.string("protos-realworld"),
+            "sub", JSON.string(subject),
+            "iat", JSON.number(issued, 0),
+            "exp", JSON.number(issued + 3600, 0),
+            "generation", JSON.number(generation, 0)
+        ), testKey(), Auth.policy(), observed)
+    }
+    rawExecute: (connection, sql) => {
+        statement: connection.prepare(sql)
+        (() => {
+            more: statement.step()
+            while(more) { more = statement.step() }
+        }).ensure(() => { statement.close().value() })
+        true
+    }
+
+    // Process A: create the schema and commit a complete data set.
+    if(scenario == "init") {
+        database: openReady(true)
+        app: application(database)
+        call(app.handler, "POST", "/api/users", user("alice", "alice@example.test", "process password one"), null, 201)
+        bob: call(app.handler, "POST", "/api/users", user("bob", "bob@example.test", "process password bob"), null, 201)["user"].value
+        alice: call(app.handler, "POST", "/api/users/login", login("alice@example.test", "process password one"), null, 200)["user"].value
+        aliceToken: alice["token"].value
+        bobToken: bob["token"].value
+        call(app.handler, "POST", "/api/articles", JSON.object("article", JSON.object(
+            "title", JSON.string("Process article"), "description", JSON.string("Persisted"),
+            "body", JSON.string("Across processes"),
+            "tagList", JSON.array(JSON.string("a"), JSON.string("b")))), aliceToken, 201)
+        call(app.handler, "POST", "/api/articles/process-article/comments", JSON.object("comment",
+            JSON.object("body", JSON.string("From bob"))), bobToken, 201)
+        call(app.handler, "POST", "/api/profiles/alice/follow", null, bobToken, 200)
+        call(app.handler, "POST", "/api/articles/process-article/favorite", null, bobToken, 200)
+        call(app.handler, "PUT", "/api/user", JSON.object("user", JSON.object(
+            "password", JSON.string("process password two"))), aliceToken, 200)
+        Assertions.require(database.close())
+        marker("SQLITE_PROCESS_INIT=OK")
+    }
+
+    // Process B: an independent process reads back every committed record.
+    if(scenario == "verify") {
+        database: openReady(false)
+        app: application(database)
+        store: app.store
+        Assertions.require(store.identityByUsername("alice").id == 1)
+        Assertions.require(store.identityByUsername("bob").id == 2)
+        article: store.find("process-article")
+        Assertions.require(article.favoritesCount == 1)
+        Assertions.require(article.tagList.size() == 2)
+        Assertions.require(article.tagList[0] == "a")
+        Assertions.require(article.author.username == "alice")
+        comments: store.commentsFor("process-article")
+        Assertions.require(comments.size() == 1)
+        Assertions.require(comments[0].author.username == "bob")
+        Assertions.require(store.isFollowingIdentity(2, 1))
+        Assertions.require(store.isFavoritedByIdentity(2, "process-article"))
+        Assertions.require(app.credentials.byId(1).generation == 2)
+        Assertions.require(app.credentials.byId(2).generation == 1)
+        call(app.handler, "POST", "/api/users/login", login("alice@example.test", "process password two"), null, 200)
+        call(app.handler, "POST", "/api/users/login", login("alice@example.test", "process password one"), null, 401)
+        Assertions.require(database.close())
+        marker("SQLITE_PROCESS_VERIFY=OK")
+    }
+
+    // A generation-1 token for alice stays revoked after the restart.
+    if(scenario == "revocation") {
+        database: openReady(false)
+        app: application(database)
+        subject: app.credentials.byId(1).subject
+        resolve: (token) => {
+            app.auth.resolve([["Authorization", Encoding.Latin1.encode("Token " + token)]]).state
+        }
+        Assertions.require(resolve(tokenFor(subject, 1)) == "invalid")
+        Assertions.require(resolve(tokenFor(subject, 2)) == "valid")
+        Assertions.require(database.close())
+        marker("SQLITE_PROCESS_REVOCATION=OK")
+    }
+
+    // Process C: write inside an open transaction, then wait to be killed.
+    if(scenario == "hold-uncommitted") {
+        database: openReady(false)
+        store: SqliteStore.create(database)
+        database.transaction(() => {
+            Assertions.require(store.admitIdentity("uncommitted", "uncommitted@example.test").ok)
+            marker("SQLITE_PROCESS_UNCOMMITTED_READY=1")
+            waitForController()
+            Identities.rejected("test", "released without commit")
+        })
+        database.close()
+        marker("SQLITE_PROCESS_UNCOMMITTED_RELEASED=1")
+    }
+
+    // Commit, report the confirmed commit, then wait to be killed.
+    if(scenario == "hold-committed") {
+        database: openReady(false)
+        store: SqliteStore.create(database)
+        Assertions.require(store.admitIdentity("committed", "committed@example.test").ok)
+        marker("SQLITE_PROCESS_COMMITTED=1")
+        waitForController()
+        database.close()
+    }
+
+    // Process D: the killed writers left only what they had committed.
+    if(scenario == "check-recovered") {
+        database: openReady(false)
+        store: SqliteStore.create(database)
+        Assertions.require(store.identityByUsername("uncommitted") === null)
+        Assertions.require(store.identityByEmail("uncommitted@example.test") === null)
+        Assertions.require(store.identityByUsername("committed") !== null)
+        Assertions.require(store.identityByUsername("alice").id == 1)
+        Assertions.require(database.close())
+        marker("SQLITE_PROCESS_RECOVERED=OK")
+    }
+
+    // Hold the write lock until the controller releases it; then roll back.
+    if(scenario == "hold-lock") {
+        database: openReady(false)
+        store: SqliteStore.create(database)
+        outcome: database.transaction(() => {
+            Assertions.require(store.admitIdentity("lock-holder", "lock-holder@example.test").ok)
+            marker("SQLITE_PROCESS_LOCK_HELD=1")
+            waitForController()
+            Identities.rejected("test", "released without commit")
+        })
+        Assertions.require(!outcome.ok)
+        Assertions.require(store.identityByUsername("lock-holder") === null)
+        Assertions.require(database.close())
+        marker("SQLITE_PROCESS_LOCK_RELEASED=OK")
+    }
+
+    // While another process holds the lock, the write fails with SQLITE_BUSY
+    // as an operational error, not a commit. SQLite may wait for the busy
+    // timeout or answer BUSY at once to avoid a deadlock, so no duration is
+    // asserted; the controller bounds the run with timeout.
+    if(scenario == "contend-lock") {
+        database: openReady(false)
+        store: SqliteStore.create(database)
+        failure: null
+        Error.handle(
+            () => { store.admitIdentity("contender", "contender@example.test") },
+            (error) => {
+                failure = error
+                error
+            }
+        )
+        Assertions.require(failure !== null)
+        Assertions.require(failure.parent() === SQLite.SQLiteError)
+        Assertions.require(failure.code == 5)
+        Assertions.require(database.usable())
+        Assertions.require(store.identityByUsername("contender") === null)
+        Assertions.require(database.close())
+        marker("SQLITE_PROCESS_BUSY_OBSERVED=OK")
+    }
+
+    // Fixture-only preparation of incompatible databases, via raw std:sqlite.
+    if(scenario == "set-future-version") {
+        database: openReady(true)
+        database.execute("PRAGMA user_version=2", [])
+        Assertions.require(database.close())
+        marker("SQLITE_PROCESS_PREPARED=future_version")
+    }
+    if(scenario == "foreign-content") {
+        connection: SQLite.openFile(path, "readWriteCreate")
+        (() => {
+            rawExecute(connection, "CREATE TABLE foreign_data (value TEXT)")
+            rawExecute(connection, "INSERT INTO foreign_data (value) VALUES ('keep me')")
+        }).ensure(() => { connection.close().value() })
+        marker("SQLITE_PROCESS_PREPARED=foreign_content")
+    }
+    if(scenario == "schema-mismatch") {
+        connection: SQLite.openFile(path, "readWriteCreate")
+        (() => {
+            rawExecute(connection, "CREATE TABLE users (id INTEGER PRIMARY KEY)")
+            rawExecute(connection, "PRAGMA user_version=1")
+        }).ensure(() => { connection.close().value() })
+        marker("SQLITE_PROCESS_PREPARED=schema_mismatch")
+    }
+    if(scenario == "check-foreign-preserved") {
+        connection: SQLite.openFile(path, "readOnly")
+        (() => {
+            statement: connection.prepare("SELECT value FROM foreign_data")
+            (() => {
+                Assertions.require(statement.step())
+                Assertions.require(statement.column(0) == "keep me")
+                Assertions.require(!statement.step())
+            }).ensure(() => { statement.close().value() })
+        }).ensure(() => { connection.close().value() })
+        marker("SQLITE_PROCESS_FOREIGN_PRESERVED=OK")
+    }
+
+    // args: [expect-reject, database, expectedReason, createFlag]. A native
+    // failure (for example a corrupt file) is reported as native_failure.
+    if(scenario == "expect-reject") {
+        if(args.size() < 4) { Error().signal() }
+        expected: args[2]
+        reason: null
+        database: null
+        Error.handle(
+            () => {
+                database = SqliteDatabase.open(path, args[3] == "1")
+                reason = database.configure()
+                if(reason === null) { reason = database.initialize() }
+            },
+            (error) => {
+                reason = "native_failure"
+                error
+            }
+        )
+        if(database !== null) {
+            Assertions.require(!database.usable())
+            Error.handle(() => { database.close() }, (error) => { error })
+        }
+        Assertions.require(reason == expected)
+        marker("SQLITE_PROCESS_REJECTED=" + reason)
+    }
+    true
+}
